@@ -68,7 +68,10 @@ dr-kernel-a800/
 ├── summary/
 │   ├── results_table.md/.csv  ← 总表（两批次并列，未解题标注"未解出"）
 │   └── best_solutions/        ← 终局复评有效解（7 个，文件头含来源采样/轮次/reward）
-├── tasks/<benchmark>/<题名>/          ← stts 批次原始产物（30 题）
+├── tasks/<benchmark>/<题名>/          ← stts 批次原始产物（30 题；每题仅保留
+│                                最优轨迹的轮目录，其余 7 条轨迹存
+│                                state.json 摘要——pass@1 可复核，
+│                                非最优轨迹无原始回复）
 │   ├── prompt.txt / state.json / summary.json / best_solution.py / final/
 │   └── s<k>t<n>/              ← 每轮：response.txt（模型原话，内含完整 ModelNew 代码）/ solution.py（+run 包装）/
 │                                 evaluation.json（per-workload 明细）/ evaluation.log
