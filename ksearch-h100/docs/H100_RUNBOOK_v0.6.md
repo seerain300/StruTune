@@ -109,3 +109,31 @@ KSEARCH_TASK_GPU 出生即钉死 CUDA_VISIBLE_DEVICES，父/子进程只可能�
 
 六次故障共同根因：父进程直接做 GPU 工作的任务在卡间漂移（阈值误判→死锁→
 偏斜→错位→累计→竞态皆为漂移的补丁连锁）。绑定后漂移在结构上不存在。
+
+## 8. 收官期事故补记（2026-09-23，FI 三题续跑期间）
+
+1. **假 DONE 复发**：gqa_paged_prefill 以 rc=0 退出并写 DONE，实际 96/100 轮
+   （RESUME 给的 9 轮预算中 4 次 WM refine 重试未产出评测）。处置：删 DONE 标记
+   单题补跑至 106。规则不变：**DONE ≠ 100 轮，重启前必须 grep -c "Round summary"
+   核实**。附带发现 floor-5 规则副作用：done_evals=100 时补拉又给 5 轮
+   （mla_paged_prefill 被拉到 105 轮，手动停+标 DONE），预算=top-up 时应设 0。
+2. **双 campaign 互斥死锁**：同一张卡上的任务被两个 campaign 实例分别拉起时，
+   二者的 KSEARCH_OWNER_TAG 不同，污染检测器互判对方为陌生租户，评测窗口互相
+   丢弃、无限重试（gqa+mla_prefill 在卡4 互相卡死 1 小时零进展）。**铁律：同卡
+   任务必须同一 campaign 实例拉起**；单题补跑用 --tasks 单题在同实例内排队即可。
+3. **kill 不彻底的孤儿**：kill bash 包装壳后 python 本体（ksearch-token-run.py）
+   变孤儿继续跑，与新进程混写同一 run 目录（轮次双胞胎文件）+ 烧 token（34 分钟
+   2.5 万输出 token，输入全命中缓存）。**杀任务必须 bash 壳 + python 本体按 PID
+   逐一确认死亡**。
+4. **同卡评测窗口的自踩竞态**：stranger_ok 先查 compute-apps 再查总显存，两次
+   快照间自家评测 worker 新建上下文 >1GB 会被误判"不可见陌生占用"→ 窗口被自己
+   踩死。缓解：KSEARCH_INVISIBLE_ALLOW_MB=6000；根治：跨卡分离任务（不同卡的任务
+   在污染检测里天然互不可见）。
+5. **nohup 随 shell 退出被杀**：交互 shell 里 `nohup ... &` 拉起的 campaign 在
+   shell 退出后被杀（任务进程莫名消失的元凶之一）。长期进程必须
+   `setsid nohup ... < /dev/null &`。
+6. **归档上传 reset --soft 陷阱实测**：在 ksearch-h100/ 内部 git init 会把归档
+   内容当仓库根，add -A 时远程其他实验线全被标 D（守卫拦截）。正确做法：上层
+   目录 init（顶层只有单一实验子目录）→ fetch → reset --soft → 守卫查 D 标记
+   → add 子目录。本次推送 a166c448，远程抽查 9 顶层项 + best_solutions 21 文件
+   与本地一致。
