@@ -1,0 +1,2 @@
+# solution=GPT-5.6-Sol_gqa_paged_prefill_causal_h32_kv8_d128_ps1_triton_optimized_r1 score=-1.0 passed=False
+I’m inspecting the current implementation to make the narrow fast-path compaction while preserving the validated wrapper and kernel behavior.

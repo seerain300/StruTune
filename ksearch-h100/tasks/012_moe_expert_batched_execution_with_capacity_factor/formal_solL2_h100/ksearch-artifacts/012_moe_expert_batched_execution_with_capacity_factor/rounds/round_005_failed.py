@@ -1,0 +1,377 @@
+# solution=GPT-5.6-Sol_012_moe_expert_batched_execution_with_capacity_factor_triton_optimized_r5 score=-1.0 passed=False
+I’m narrowing this to the remaining hot-path launch choices. The implementation already incorporates the validated metadata layout and 128-column reduction tile, so I’ll make a conservative occupancy adjustment in the reduction launch while preserving the exact admission and accumulation semantics.I’m checking the repository version before editing so the change lands in the actual current implementation and does not disturb unrelated work.import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _sorted_boundary_starts_counts_kernel(
+    sorted_experts,
+    expert_starts,
+    expert_counts,
+    NUM_ASSIGNMENTS: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    experts = tl.arange(0, BLOCK_SIZE)
+    expert_mask = experts < NUM_EXPERTS
+
+    start_low = tl.zeros((BLOCK_SIZE,), dtype=tl.int32)
+    start_high = tl.full(
+        (BLOCK_SIZE,),
+        NUM_ASSIGNMENTS,
+        dtype=tl.int32,
+    )
+    end_low = tl.zeros((BLOCK_SIZE,), dtype=tl.int32)
+    end_high = tl.full(
+        (BLOCK_SIZE,),
+        NUM_ASSIGNMENTS,
+        dtype=tl.int32,
+    )
+
+    for _ in range(SEARCH_STEPS):
+        start_mid = (start_low + start_high) // 2
+        start_value = tl.load(
+            sorted_experts + start_mid,
+            mask=start_mid < NUM_ASSIGNMENTS,
+            other=NUM_EXPERTS,
+        )
+        start_go_right = start_value < experts
+        start_low = tl.where(start_go_right, start_mid + 1, start_low)
+        start_high = tl.where(start_go_right, start_high, start_mid)
+
+        end_mid = (end_low + end_high) // 2
+        end_value = tl.load(
+            sorted_experts + end_mid,
+            mask=end_mid < NUM_ASSIGNMENTS,
+            other=NUM_EXPERTS,
+        )
+        end_go_right = end_value < (experts + 1)
+        end_low = tl.where(end_go_right, end_mid + 1, end_low)
+        end_high = tl.where(end_go_right, end_high, end_mid)
+
+    tl.store(expert_starts + experts, start_low, mask=expert_mask)
+    tl.store(
+        expert_counts + experts,
+        end_low - start_low,
+        mask=expert_mask,
+    )
+
+
+@triton.jit
+def _build_admission_ranks_kernel(
+    sorted_experts,
+    sorted_indices,
+    expert_starts,
+    packed_metadata,
+    NUM_ASSIGNMENTS: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    positions = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = positions < NUM_ASSIGNMENTS
+
+    experts = tl.load(sorted_experts + positions, mask=mask, other=0)
+    assignments = tl.load(sorted_indices + positions, mask=mask, other=0)
+    starts = tl.load(expert_starts + experts, mask=mask, other=0)
+
+    ranks = positions - starts
+    admitted = ranks < CAPACITY
+    packed = (experts * CAPACITY + ranks).to(tl.int32)
+    packed = tl.where(admitted, packed, -1)
+
+    tl.store(
+        packed_metadata + assignments,
+        packed,
+        mask=mask,
+    )
+
+
+@triton.jit
+def _pack_expert_inputs_kernel(
+    hidden_states,
+    sorted_indices,
+    expert_starts,
+    expert_counts,
+    expert_inputs,
+    hidden_stride_t,
+    hidden_stride_h,
+    input_stride_e,
+    input_stride_c,
+    input_stride_h,
+    CAPACITY: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    expert = tl.program_id(0)
+    row_block = tl.program_id(1)
+    col_block = tl.program_id(2)
+
+    rows = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    start = tl.load(expert_starts + expert)
+    count = tl.load(expert_counts + expert)
+
+    row_mask = rows < CAPACITY
+    admitted = row_mask & (rows < count)
+    col_mask = cols < HIDDEN_SIZE
+
+    assignments = tl.load(
+        sorted_indices + start + rows,
+        mask=admitted,
+        other=0,
+    )
+    tokens = assignments // TOP_K
+
+    values = tl.load(
+        hidden_states
+        + tokens[:, None] * hidden_stride_t
+        + cols[None, :] * hidden_stride_h,
+        mask=admitted[:, None] & col_mask[None, :],
+        other=0.0,
+    )
+
+    tl.store(
+        expert_inputs
+        + expert * input_stride_e
+        + rows[:, None] * input_stride_c
+        + cols[None, :] * input_stride_h,
+        values,
+        mask=row_mask[:, None] & col_mask[None, :],
+    )
+
+
+@triton.jit
+def _swiglu_kernel(
+    gate,
+    up,
+    output,
+    NUM_ELEMENTS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < NUM_ELEMENTS
+
+    gate_value = tl.load(
+        gate + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    up_value = tl.load(
+        up + offsets,
+        mask=mask,
+        other=0.0,
+    )
+
+    sigmoid_value = 1.0 / (1.0 + tl.exp(-gate_value))
+    silu_value = (gate_value * sigmoid_value).to(tl.bfloat16)
+    activated = silu_value * up_value
+
+    tl.store(output + offsets, activated, mask=mask)
+
+
+@triton.jit
+def _token_major_reduce_kernel(
+    expert_outputs,
+    routing_weights,
+    packed_metadata,
+    output,
+    expert_output_stride_c,
+    expert_output_stride_h,
+    routing_stride_t,
+    routing_stride_k,
+    output_stride_t,
+    output_stride_h,
+    HIDDEN_SIZE: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    token = tl.program_id(0)
+    col_block = tl.program_id(1)
+
+    cols = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    col_mask = cols < HIDDEN_SIZE
+    result = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for route in range(TOP_K):
+        assignment = token * TOP_K + route
+        packed = tl.load(packed_metadata + assignment)
+        admitted = packed >= 0
+        packed_safe = tl.maximum(packed, 0)
+
+        routing_weight = tl.load(
+            routing_weights
+            + token * routing_stride_t
+            + route * routing_stride_k
+        )
+
+        value = tl.load(
+            expert_outputs
+            + packed_safe * expert_output_stride_c
+            + cols * expert_output_stride_h,
+            mask=admitted & col_mask,
+            other=0.0,
+        )
+
+        contribution = (value * routing_weight).to(tl.bfloat16)
+        result += contribution.to(tl.float32)
+
+    tl.store(
+        output
+        + token * output_stride_t
+        + cols * output_stride_h,
+        result.to(tl.bfloat16),
+        mask=col_mask,
+    )
+
+
+@torch.no_grad()
+def run(
+    hidden_states: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    expert_gate_weights: torch.Tensor,
+    expert_up_weights: torch.Tensor,
+    expert_down_weights: torch.Tensor,
+):
+    num_tokens, hidden_size = hidden_states.shape
+    num_experts, _, intermediate_size = expert_gate_weights.shape
+    top_k = selected_experts.shape[1]
+    num_assignments = num_tokens * top_k
+
+    capacity = max(
+        int((num_assignments / num_experts) * 1.25),
+        1,
+    )
+
+    flat_experts = selected_experts.reshape(-1)
+    sorted_experts, sorted_indices = flat_experts.sort(stable=True)
+
+    expert_starts = torch.empty(
+        num_experts,
+        dtype=torch.int32,
+        device=hidden_states.device,
+    )
+    expert_counts = torch.empty_like(expert_starts)
+
+    boundary_block = triton.next_power_of_2(num_experts)
+    search_steps = (num_assignments + 1).bit_length()
+
+    _sorted_boundary_starts_counts_kernel[(1,)](
+        sorted_experts,
+        expert_starts,
+        expert_counts,
+        NUM_ASSIGNMENTS=num_assignments,
+        NUM_EXPERTS=num_experts,
+        SEARCH_STEPS=search_steps,
+        BLOCK_SIZE=boundary_block,
+        num_warps=4,
+    )
+
+    packed_metadata = torch.empty(
+        num_assignments,
+        dtype=torch.int32,
+        device=hidden_states.device,
+    )
+
+    rank_block = 512
+    _build_admission_ranks_kernel[
+        (triton.cdiv(num_assignments, rank_block),)
+    ](
+        sorted_experts,
+        sorted_indices,
+        expert_starts,
+        packed_metadata,
+        NUM_ASSIGNMENTS=num_assignments,
+        CAPACITY=capacity,
+        BLOCK_SIZE=rank_block,
+        num_warps=4,
+    )
+
+    expert_inputs = torch.empty(
+        (num_experts, capacity, hidden_size),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+
+    pack_block_m = 32
+    pack_block_n = 256
+    pack_grid = (
+        num_experts,
+        triton.cdiv(capacity, pack_block_m),
+        triton.cdiv(hidden_size, pack_block_n),
+    )
+
+    _pack_expert_inputs_kernel[pack_grid](
+        hidden_states,
+        sorted_indices,
+        expert_starts,
+        expert_counts,
+        expert_inputs,
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        expert_inputs.stride(0),
+        expert_inputs.stride(1),
+        expert_inputs.stride(2),
+        CAPACITY=capacity,
+        HIDDEN_SIZE=hidden_size,
+        TOP_K=top_k,
+        BLOCK_M=pack_block_m,
+        BLOCK_N=pack_block_n,
+        num_warps=8,
+    )
+
+    gate_out = torch.bmm(expert_inputs, expert_gate_weights)
+    up_out = torch.bmm(expert_inputs, expert_up_weights)
+
+    activated = torch.empty_like(gate_out)
+    activation_elements = num_experts * capacity * intermediate_size
+    activation_block = 4096
+
+    _swiglu_kernel[
+        (triton.cdiv(activation_elements, activation_block),)
+    ](
+        gate_out,
+        up_out,
+        activated,
+        NUM_ELEMENTS=activation_elements,
+        BLOCK_SIZE=activation_block,
+        num_warps=8,
+    )
+
+    expert_outputs = torch.bmm(activated, expert_down_weights)
+
+    output = torch.empty(
+        (num_tokens, hidden_size),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+
+    reduce_block_n = 128
+    reduce_grid = (
+        num_tokens,
+        triton.cdiv(hidden_size, reduce_block_n),
+    )
+
+    _token_major_reduce_kernel[reduce_grid](
+        expert_outputs,
+        routing_weights,
+        packed_metadata,
+        output,
+        expert_outputs.stride(1),
+        expert_outputs.stride(2),
+        routing_weights.stride(0),
+        routing_weights.stride(1),
+        output.stride(0),
+        output.stride(1),
+        HIDDEN_SIZE=hidden_size,
+        TOP_K=top_k,
+        BLOCK_N=reduce_block_n,
+        num_warps=8,
+    )
+
+    return output

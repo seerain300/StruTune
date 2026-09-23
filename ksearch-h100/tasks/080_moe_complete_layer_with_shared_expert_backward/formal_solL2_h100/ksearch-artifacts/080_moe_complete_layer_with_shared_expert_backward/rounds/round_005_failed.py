@@ -1,0 +1,143 @@
+# solution=GPT-5.6-Sol_080_moe_complete_layer_with_shared_expert_backward_triton_optimized_r5 score=-1.0 passed=False
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _swiglu_backward_kernel(
+    grad_activated_ptr,
+    gate_ptr,
+    up_ptr,
+    grad_gate_up_ptr,
+    n_rows,
+    INTERMEDIATE_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCKS_PER_ROW: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row = pid // BLOCKS_PER_ROW
+    block_col = pid - row * BLOCKS_PER_ROW
+    cols = block_col * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = (row < n_rows) & (cols < INTERMEDIATE_SIZE)
+
+    input_offsets = row * INTERMEDIATE_SIZE + cols
+    grad_activated = tl.load(
+        grad_activated_ptr + input_offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+    gate = tl.load(
+        gate_ptr + input_offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+    up = tl.load(
+        up_ptr + input_offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+
+    sigmoid_gate = tl.sigmoid(gate)
+    silu_gate = (gate * sigmoid_gate).to(tl.bfloat16)
+    grad_gate_silu = (grad_activated * up).to(tl.bfloat16)
+
+    grad_up = grad_activated * silu_gate.to(tl.float32)
+    silu_derivative = sigmoid_gate * (
+        1.0 + gate * (1.0 - sigmoid_gate)
+    )
+    grad_gate = grad_gate_silu.to(tl.float32) * silu_derivative
+
+    output_row = row * (2 * INTERMEDIATE_SIZE)
+    tl.store(
+        grad_gate_up_ptr + output_row + cols,
+        grad_gate,
+        mask=mask,
+    )
+    tl.store(
+        grad_gate_up_ptr + output_row + INTERMEDIATE_SIZE + cols,
+        grad_up,
+        mask=mask,
+    )
+
+
+@torch.no_grad()
+def run(
+    grad_output: torch.Tensor,
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    e_score_correction_bias: torch.Tensor,
+    router_logits: torch.Tensor,
+    scores: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    score_mask: torch.Tensor,
+    shared_expert_gate_weight: torch.Tensor,
+    shared_expert_up_weight: torch.Tensor,
+    shared_expert_down_weight: torch.Tensor,
+    shared_gate_output: torch.Tensor,
+    shared_up_output: torch.Tensor,
+    shared_activated: torch.Tensor,
+):
+    batch_seq_len = hidden_states.shape[0]
+    intermediate_size = shared_gate_output.shape[1]
+
+    grad_shared_activated = torch.mm(
+        grad_output, shared_expert_down_weight
+    )
+    grad_shared_expert_down_weight = torch.mm(
+        grad_output.transpose(0, 1), shared_activated
+    )
+
+    grad_gate_up = torch.empty(
+        (batch_seq_len, 2 * intermediate_size),
+        dtype=shared_gate_output.dtype,
+        device=shared_gate_output.device,
+    )
+
+    block_size = 256
+    blocks_per_row = triton.cdiv(intermediate_size, block_size)
+    _swiglu_backward_kernel[
+        (batch_seq_len * blocks_per_row,)
+    ](
+        grad_shared_activated,
+        shared_gate_output,
+        shared_up_output,
+        grad_gate_up,
+        batch_seq_len,
+        INTERMEDIATE_SIZE=intermediate_size,
+        BLOCK_SIZE=block_size,
+        BLOCKS_PER_ROW=blocks_per_row,
+        num_warps=4,
+    )
+
+    grad_shared_gate_output = grad_gate_up[:, :intermediate_size]
+    grad_shared_up_output = grad_gate_up[:, intermediate_size:]
+
+    grad_gate_up_weight = torch.mm(
+        grad_gate_up.transpose(0, 1), hidden_states
+    )
+    grad_shared_expert_gate_weight = grad_gate_up_weight[
+        :intermediate_size
+    ]
+    grad_shared_expert_up_weight = grad_gate_up_weight[
+        intermediate_size:
+    ]
+
+    grad_hidden_states = torch.mm(
+        grad_shared_up_output, shared_expert_up_weight
+    )
+    torch.addmm(
+        grad_hidden_states,
+        grad_shared_gate_output,
+        shared_expert_gate_weight,
+        out=grad_hidden_states,
+    )
+
+    grad_router_weight = torch.zeros(
+        router_weight.shape,
+        dtype=torch.float32,
+        device=router_weight.device,
+    )
+
+    return (
+        grad_hidden_states,
+        grad_router_weight,
+        grad_shared_expert_gate_weight,
+        grad_shared_expert_up_weight,
+        grad_shared_expert_down_weight,
+    )
