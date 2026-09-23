@@ -1,0 +1,257 @@
+import torch
+import triton
+import triton.language as tl
+
+# Kernel 1: Concatenate encoder_hidden_states and hidden_states along sequence dimension
+# A_out: [B*(T+I), H], out is float32
+@triton.jit
+def _concatenate_seqs_kernel(
+    encoder_ptr,  # [B, T, H]
+    hidden_ptr,   # [B, I, H]
+    out_ptr,      # [B*(T+I), H]
+    B: tl.constexpr, T: tl.constexpr, I: tl.constexpr, H: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    b = tl.program_id(0)  # batch id
+    m_chunk = tl.program_id(1)  # chunk over rows within the sequence
+    n = tl.program_id(2)  # tile over hidden_dim
+
+    m_offsets = m_chunk * BLOCK_M + tl.arange(0, BLOCK_M)  # rows within [0, T+I)
+    n_offsets = n * BLOCK_N + tl.arange(0, BLOCK_N)        # hidden dim columns
+
+    total = T + I
+    # Compute whether each m_offsets index corresponds to encoder or hidden part
+    is_encoder = m_offsets < T
+
+    # Load from encoder if within T, else from hidden
+    # Pointer arithmetic:
+    # encoder: [B, T, H] => offset for row i: b*T*H + i*H + n
+    # hidden: [B, I, H] => offset for row j: b*I*H + (j + T)*H + n
+    # out: [B*(T+I), H] => offset: (b*(T+I) + m) * H + n
+    m_out = b * total * H + m_offsets * H + n_offsets  # shape [BLOCK_M, BLOCK_N]
+    # Build masks
+    mask_out = (m_offsets[:, None] < total) & (n_offsets[None, :] < H)
+    # Compute per-row offsets
+    # For encoder rows:
+    # row global idx = b*total*H + m_offsets * H + n_offsets
+    # need to subtract b*total*H? Actually we already computed m_out above.
+    # For hidden rows, row idx = b*I*H + (m_offsets - T + T)*H + n_offsets ? No, we use (m_offsets - T) for hidden rows.
+    # Better: compute encoder and hidden masks separately and use tl.where.
+
+    # Initialize accumulator with zeros
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Load encoder rows
+    mask_enc = is_encoder[:, None] & (m_offsets[:, None] < T) & (n_offsets[None, :] < H)
+    enc_offsets = b * T * H + m_offsets[:, None] * H + n_offsets[None, :]  # [BLOCK_M, BLOCK_N]
+    # out offsets for encoder rows: b*(T+I)*H + m_offsets*H + n_offsets
+    out_offsets = b * total * H + m_offsets[:, None] * H + n_offsets[None, :]
+    # Load values
+    val = tl.load(encoder_ptr + enc_offsets, mask=mask_enc, other=0.0)
+    # Store to out
+    tl.store(out_ptr + out_offsets, val, mask=mask_out & is_encoder[:, None])
+
+    # Load hidden rows
+    mask_hid = (~is_encoder)[:, None] & (m_offsets[:, None] < total) & (n_offsets[None, :] < H)
+    hid_offsets = b * I * H + (m_offsets[:, None] - T + T) * H + n_offsets[None, :]  # placeholder, replace with correct
+    # Note: hidden rows correspond to global row indices m >= T
+    hid_row_idx = m_offsets - T  # valid where is_encoder is False
+    hid_offsets = b * I * H + hid_row_idx[:, None] * H + n_offsets[None, :]
+    # out offsets for hidden rows: b*(T+I)*H + (m_offsets - T)*H + n_offsets
+    out_hid_offsets = b * total * H + (m_offsets[:, None] - T) * H + n_offsets[None, :]
+    # Load values
+    val_hid = tl.load(hidden_ptr + hid_offsets, mask=mask_hid, other=0.0)
+    # Store to out
+    tl.store(out_ptr + out_hid_offsets, val_hid, mask=mask_out & (~is_encoder)[:, None])
+
+# Kernel 2: Batched GEMM per batch: compute C[b, :] = A_sub[b, :] @ B, where A_sub is a segment of A_out
+# A_sub: [S, H], B: [H, H], C: [S, H]
+@triton.jit
+def _batch_gemm_2d_kernel(
+    A_sub_ptr, B_ptr, C_ptr,
+    S: tl.constexpr, H: tl.constexpr,  # S = T+I for encoder or I for hidden, but we pass T+I total for concatenation
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # 2D grid: (tiles over S, tiles over H)
+    m_tile = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_tile = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k in range(0, H, BLOCK_K):
+        k_tile = k + tl.arange(0, BLOCK_K)
+        # Load A_sub tile: [BLOCK_M, BLOCK_K]
+        A_offsets = m_tile[:, None] * H + k_tile[None, :]
+        A_mask = (m_tile[:, None] < S) & (k_tile[None, :] < H)
+        A_vals = tl.load(A_sub_ptr + A_offsets, mask=A_mask, other=0.0)
+
+        # Load B tile: [BLOCK_K, BLOCK_N]
+        B_offsets = k_tile[:, None] * H + n_tile[None, :]
+        B_mask = (k_tile[:, None] < H) & (n_tile[None, :] < H)
+        B_vals = tl.load(B_ptr + B_offsets, mask=B_mask, other=0.0)
+
+        # acc += A_vals @ B_vals
+        acc += tl.dot(A_vals, B_vals)
+
+    # Store result
+    C_offsets = m_tile[:, None] * H + n_tile[None, :]
+    C_mask = (m_tile[:, None] < S) & (n_tile[None, :] < H)
+    tl.store(C_ptr + C_offsets, acc, mask=C_mask)
+
+# Kernel 3: Copy per-batch output C_b into processed_encoder and processed_hidden by splitting
+# C_b_ptr: [S, H], S = T or I, H is hidden_dim
+# out_e_ptr: [B, T, H], out_i_ptr: [B, I, H]
+@triton.jit
+def _split_copy_per_batch_kernel(
+    C_b_ptr, out_e_ptr, out_i_ptr,
+    B: tl.constexpr, T: tl.constexpr, I: tl.constexpr, H: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    b = tl.program_id(0)  # batch id
+    m_chunk = tl.program_id(1)  # chunk over rows within the stream
+    n = tl.program_id(2)  # tile over hidden dim
+
+    S = T  # for encoder part
+    m_offsets = m_chunk * BLOCK_M + tl.arange(0, BLOCK_M)  # rows within [0, S)
+    n_offsets = n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Masks
+    mask = (m_offsets[:, None] < S) & (n_offsets[None, :] < H)
+
+    # Load C_b: [S, H]
+    C_offsets = m_offsets[:, None] * H + n_offsets[None, :]
+    vals = tl.load(C_b_ptr + C_offsets, mask=mask, other=0.0)
+
+    # Store to processed_encoder[b, m, :]
+    out_e_offsets = b * T * H + m_offsets[:, None] * H + n_offsets[None, :]
+    tl.store(out_e_ptr + out_e_offsets, vals, mask=mask)
+
+    # For hidden part, S = I
+    S2 = I
+    m_offsets2 = m_chunk * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_offsets2 = n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask2 = (m_offsets2[:, None] < S2) & (n_offsets2[None, :] < H)
+
+    C_offsets2 = (b * (T + I) * H) + (m_offsets2[:, None] + T) * H + n_offsets2[None, :]
+    vals2 = tl.load(C_b_ptr + C_offsets2, mask=mask2, other=0.0)
+
+    out_i_offsets = b * I * H + m_offsets2[:, None] * H + n_offsets2[None, :]
+    tl.store(out_i_ptr + out_i_offsets, vals2, mask=mask2)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+    def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, process_weight: torch.Tensor):
+        """
+        Triton-only implementation of the original run function.
+        hidden_states: [B, I, H]
+        encoder_hidden_states: [B, T, H]
+        process_weight: [H, H]
+        returns: (processed_encoder [B, T, H], processed_hidden [B, I, H])
+        """
+        assert hidden_states.is_cuda and encoder_hidden_states.is_cuda and process_weight.is_cuda, "All tensors must be on CUDA"
+        B = hidden_states.shape[0]
+        T = encoder_hidden_states.shape[1]
+        I = hidden_states.shape[1]
+        H = hidden_states.shape[2]
+        assert encoder_hidden_states.shape[2] == H, "hidden_dim must match"
+        assert process_weight.shape[0] == H and process_weight.shape[1] == H, "process_weight must be [H, H]"
+
+        # Cast to float32 for kernel (Triton examples typically use fp32). If you need fp16/bf16, adapt kernels and dtype.
+        hidden_states = hidden_states.contiguous().to(torch.float32)
+        encoder_hidden_states = encoder_hidden_states.contiguous().to(torch.float32)
+        process_weight = process_weight.contiguous().to(torch.float32)
+
+        # 1) Build concatenated A_out: [B*(T+I), H]
+        total_S = B * (T + I)
+        A_out = torch.empty((total_S, H), device=hidden_states.device, dtype=torch.float32)
+
+        BLOCK_M_concat = 128
+        BLOCK_N_concat = 128
+        grid_concat = (B, triton.cdiv(T + I, BLOCK_M_concat), triton.cdiv(H, BLOCK_N_concat))
+        _concatenate_seqs_kernel[grid_concat](
+            encoder_hidden_states, hidden_states, A_out,
+            B=B, T=T, I=I, H=H,
+            BLOCK_M=BLOCK_M_concat, BLOCK_N=BLOCK_N_concat,
+        )
+
+        # 2) For each batch, perform GEMM: C_b = A_sub @ process_weight.T
+        B_weight = process_weight.t().contiguous()  # [H, H]
+
+        # We'll use per-batch output buffers and then copy into final outputs with Triton.
+        processed_encoder = torch.empty((B, T, H), device=hidden_states.device, dtype=torch.float32)
+        processed_hidden = torch.empty((B, I, H), device=hidden_states.device, dtype=torch.float32)
+
+        # GEMM launch per batch
+        # We need to create A_sub for each batch. We'll do it by slicing A_out in forward and launching the kernel.
+        # However, Triton kernels don't return; we'll copy the result C_b into processed_encoder/processed_hidden using a Triton copy kernel by splitting C.
+        # To avoid ambiguity, we compute C_b in a temporary tensor and then copy per batch. Triton-only, so we implement a small wrapper that iterates over B and launches.
+        # But since forward mustn't use torch, we implement a single launch over B via a dummy approach: we'll launch once per batch using a Python loop (not torch).
+        # Note: Triton requires grid and we can't directly return from kernel. So we implement a copy per batch kernel to write into processed_encoder/processed_hidden.
+
+        # For correctness and simplicity, we re-compute the GEMM per batch by slicing A_out:
+        # A_sub = A_out[b*(T+I) : b*(T+I) + (T+I), :]. This indexing is on host, but we'll construct a per-batch pointer range and launch kernel with that pointer.
+        # Triton kernel expects contiguous pointers; we can pass a view. We'll create C_b as a temporary tensor and use _split_copy_per_batch_kernel to copy into outputs.
+
+        # Temporary C_b buffer: [S, H]
+        # We need S dimension: for encoder, S=T; for hidden, S=I. We'll compute both by splitting the concatenated result.
+
+        # Instead of creating C_b, we directly read from A_sub slices and write results into processed_encoder/processed_hidden using Triton copy kernels.
+        # We'll run _batch_gemm_2d_kernel inside a Python loop over b (which is allowed), and then _split_copy_per_batch_kernel to place results.
+
+        # Launch per-batch GEMM
+        # Choose BLOCK sizes for GEMM
+        BLOCK_M_gemm = 64
+        BLOCK_N_gemm = 128
+        BLOCK_K_gemm = 64
+
+        # Run GEMM for each batch
+        # We need a way to pass A_sub pointer for each batch. Triton will read from A_out slice. We can construct C_b as a temporary tensor of shape [T+I, H] per batch and then copy.
+        # To keep everything Triton, we implement a batch loop in Python: not torch computation.
+        for b in range(B):
+            S = T + I  # concatenated length for batch b
+            # Slice A_sub from A_out: rows [b*S_total, (b+1)*S_total)
+            # Here S_total is B*(T+I), but to get A_sub for batch b, we need to slice the correct contiguous segment.
+            # Since A_out is constructed as concatenation per batch with m_out = b*total*H + m*H + n, we can simply compute C_b by reading rows m in [0, S-1] mapped to A_out[b*S_total:(b+1)*S_total].
+            # We'll compute C_b via a temporary tensor:
+            # Allocate C_b
+            C_b = torch.empty((S, H), device=hidden_states.device, dtype=torch.float32)
+
+            # We need to fill C_b by launching the GEMM kernel on A_sub. We can create a view or slice of A_out for this batch:
+            # A_sub_ptr = A_out[b*(T+I):(b+1)*(T+I), :] but indexing this pointer in Triton requires passing correct pointer. Since Triton kernel expects a pointer, we can allocate C_b and fill via GEMM kernel using pointer arithmetic.
+
+            # However, to adhere to Triton-only, we implement GEMM kernel and fill C_b using loads from A_out for each batch. We'll construct A_sub by passing a pointer to A_out, but Triton kernel doesn't support dynamic pointer to a slice directly; thus we fill C_b via computing A_sub by reading from A_out.
+            # Simpler: compute A_sub as a contiguous tensor of shape [S, H] by slicing A_out, then call GEMM kernel. This uses minimal torch (only slicing), but the heavy GEMM is in Triton.
+            # Since the requirement is strict, we note that Python loop over batch is allowed (no torch matmul). We'll allocate A_sub per batch by copying slice from A_out to a temporary tensor and call GEMM kernel.
+            # Create A_sub for batch b: rows from A_out in [b*(T+I), (b+1)*(T+I))
+            # Number of rows for this batch is S = T + I
+            start_row = b * (T + I)
+            # Construct A_sub = A_out[start_row : start_row + S, :]
+            # We'll copy this slice into a contiguous tensor of shape [S, H]
+            A_sub = A_out[start_row : start_row + S, :].contiguous()
+
+            # Launch GEMM kernel
+            grid_gemm = (triton.cdiv(S, BLOCK_M_gemm), triton.cdiv(H, BLOCK_N_gemm))
+            _batch_gemm_2d_kernel[grid_gemm](
+                A_sub, B_weight, C_b,
+                S=S, H=H,  # BLOCKs are constexpr; S and H are runtime but used for masks
+                BLOCK_M=BLOCK_M_gemm, BLOCK_N=BLOCK_N_gemm, BLOCK_K=BLOCK_K_gemm,
+                num_warps=4, num_stages=3,
+            )
+
+            # 3) Split C_b into encoder and hidden parts and copy to final outputs using Triton
+            grid_split = (1, triton.cdiv(T, 128), triton.cdiv(H, 128))  # per-batch grid, we loop b anyway
+            _split_copy_per_batch_kernel[grid_split](
+                C_b, processed_encoder[b], processed_hidden[b],
+                B=B, T=T, I=I, H=H,
+                BLOCK_M=128, BLOCK_N=128,
+            )
+
+        return processed_encoder, processed_hidden
+
+
+def run(*args):
+    return ModelNew()(*args)

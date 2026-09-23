@@ -1,0 +1,123 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def concat_linear_split_kernel(
+    encoder_ptr,     # [B, T, H], float32
+    hidden_ptr,      # [B, I, H], float32
+    weight_ptr,      # [H, H], float32 (this is process_weight, used as W^T in matmul)
+    out_ptr,         # [B, T+I, H], float32
+    B: tl.int32, T: tl.int32, I: tl.int32, H: tl.int32,
+    stride_e_n: tl.int32, stride_e_s: tl.int32, stride_e_h: tl.int32,
+    stride_h_n: tl.int32, stride_h_s: tl.int32, stride_h_h: tl.int32,
+    stride_w_h: tl.int32, stride_w_k: tl.int32,
+    stride_out_n: tl.int32, stride_out_s: tl.int32, stride_out_h: tl.int32,
+    total_seq: tl.int32,
+    tiles_h: tl.int32,
+    BLOCK_K: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    n = tl.program_id(0)
+    s = tl.program_id(1)
+    tile_h = tl.program_id(2)
+
+    # Compute H tile range
+    h_start = tile_h * BLOCK_H
+    offs_h = h_start + tl.arange(0, BLOCK_H)
+    mask_h = offs_h < H
+
+    # Decide source: first T rows come from encoder, remaining from hidden
+    src_encoder = s < T
+
+    # Compute input pointer and load the input row into registers (vector of length BLOCK_K)
+    # We iterate K (input features) in tiles of BLOCK_K.
+    # Initialize accumulator for the output vector
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+
+    # Loop over K tiles
+    for k_start in range(0, H, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < H
+
+        # Load the input vector for this sequence position
+        if src_encoder:
+            in_row_ptr = encoder_ptr + n * stride_e_n + s * stride_e_s + offs_k * stride_e_h
+        else:
+            in_row_ptr = hidden_ptr + n * stride_h_n + (s - T) * stride_h_s + offs_k * stride_h_h
+        in_vec = tl.load(in_row_ptr, mask=mask_k, other=0.0)  # shape [BLOCK_K], float32
+
+        # Load weight^T rows: weight is [H, H], W^T[k, h] = weight[h, k]
+        # We need weight[h, k] for each h in offs_h and k in offs_k.
+        # Build pointers for [BLOCK_H, BLOCK_K]
+        w_ptrs = weight_ptr + offs_h[:, None] * stride_w_h + offs_k[None, :] * stride_w_k
+        mask_w = (mask_h[:, None]) & (mask_k[None, :])
+        w_tile = tl.load(w_ptrs, mask=mask_w, other=0.0)  # [BLOCK_H, BLOCK_K], float32
+
+        # Accumulate dot products: sum over K tile
+        acc += tl.sum(w_tile * in_vec[None, :], axis=1)  # [BLOCK_H]
+
+    # Store the accumulated output vector to out[n, s, :]
+    out_row_ptr = out_ptr + n * stride_out_n + s * stride_out_s + offs_h * stride_out_h
+    mask_store = mask_h
+    tl.store(out_row_ptr, acc, mask=mask_store)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, process_weight: torch.Tensor):
+        """
+        Triton-optimized version of the original run function:
+        - Concatenate encoder_hidden_states and hidden_states along sequence dimension
+        - Apply linear projection with process_weight.T
+        - Split back into separate encoder and image streams
+        """
+        # Enforce float32 and contiguity for stable numerics and simple strides
+        # Note: The original code uses float32 by default; we ensure float32 here.
+        encoder_hidden_states = encoder_hidden_states.contiguous().to(torch.float32)
+        hidden_states = hidden_states.contiguous().to(torch.float32)
+        process_weight = process_weight.contiguous().to(torch.float32)
+
+        B, T, H = encoder_hidden_states.shape
+        I = hidden_states.shape[1]
+        total_seq = T + I
+
+        # Allocate output [B, T+I, H] (contiguous)
+        processed_concat = torch.empty((B, total_seq, H), device=encoder_hidden_states.device, dtype=torch.float32)
+
+        # Prepare strides
+        stride_e_n, stride_e_s, stride_e_h = encoder_hidden_states.stride(0), encoder_hidden_states.stride(1), encoder_hidden_states.stride(2)
+        stride_h_n, stride_h_s, stride_h_h = hidden_states.stride(0), hidden_states.stride(1), hidden_states.stride(2)
+        stride_w_h, stride_w_k = process_weight.stride(0), process_weight.stride(1)  # [H, H]
+        stride_out_n, stride_out_s, stride_out_h = processed_concat.stride(0), processed_concat.stride(1), processed_concat.stride(2)
+
+        # Choose tile sizes
+        BLOCK_H = 128  # tile over output H
+        BLOCK_K = 128  # tile over input features (H)
+
+        tiles_h = (H + BLOCK_H - 1) // BLOCK_H
+        grid = (B, total_seq, tiles_h)
+
+        # Launch Triton kernel: it computes out[n, s, :] for all n, s
+        concat_linear_split_kernel[grid](
+            encoder_hidden_states, hidden_states, process_weight, processed_concat,
+            B, T, I, H,
+            stride_e_n, stride_e_s, stride_e_h,
+            stride_h_n, stride_h_s, stride_h_h,
+            stride_w_h, stride_w_k,
+            stride_out_n, stride_out_s, stride_out_h,
+            total_seq,
+            tiles_h,
+            BLOCK_K=BLOCK_K, BLOCK_H=BLOCK_H,
+            num_warps=8,
+            num_stages=2,
+        )
+
+        # Split outputs into encoder and hidden streams
+        processed_encoder = processed_concat[:, :T, :]
+        processed_hidden = processed_concat[:, T:, :]
+
+        return processed_encoder, processed_hidden
+
+
+def run(*args):
+    return ModelNew()(*args)

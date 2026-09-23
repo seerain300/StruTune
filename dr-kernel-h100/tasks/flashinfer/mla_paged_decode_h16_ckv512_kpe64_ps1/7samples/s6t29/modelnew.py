@@ -1,0 +1,219 @@
+import math
+import torch
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+# Triton kernel 1: Compute logits_scaled for a single (batch, head) across tokens
+# Input:
+#   qn_ptr: [Hc] float32
+#   qp_ptr: [Hp] float32
+#   Kc_ptr: [L, Hc] float32
+#   Kp_ptr: [L, Hp] float32
+#   out_logit_ptr: [L] float32
+#   sm_scale: float32
+#   L: int (number of tokens)
+#   Hc: int (cache dim for q_nope)
+#   Hp: int (cache dim for q_pe)
+# Launch: one program per (b, h), grid = (1,)
+@triton.jit
+def matmul_add_row_chunks_kernel(
+    qn_ptr, qp_ptr, Kc_ptr, Kp_ptr, out_logit_ptr,
+    sm_scale, L: tl.constexpr, Hc: tl.constexpr, Hp: tl.constexpr,
+    BLOCK_K: tl.constexpr
+):
+    # Single program computes logits for all tokens
+    # We iterate over tokens in chunks of BLOCK_K
+    for k_start in range(0, L, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < L
+
+        # Load qn and qp as vectors
+        qn = tl.load(qn_ptr)  # [Hc]
+        qp = tl.load(qp_ptr)  # [Hp]
+
+        # Accumulate two matmuls over D=Hc for qn and D=Hp for qp
+        sum_qn = 0.0
+        sum_qp = 0.0
+
+        # Reduction over Hc
+        for h in range(0, Hc):
+            kc_chunk = tl.load(Kc_ptr + offs_k * Hc + h, mask=mask_k, other=0.0)  # [BLOCK_K]
+            sum_qn += kc_chunk * qn[h]
+
+        # Reduction over Hp
+        for p in range(0, Hp):
+            kp_chunk = tl.load(Kp_ptr + offs_k * Hp + p, mask=mask_k, other=0.0)  # [BLOCK_K]
+            sum_qp += kp_chunk * qp[p]
+
+        sum_out = sum_qn + sum_qp
+        sum_out = sum_out * sm_scale
+
+        # Store logits for this chunk
+        tl.store(out_logit_ptr + offs_k, sum_out, mask=mask_k)
+
+
+# Triton kernel 2: Compute row-wise softmax (attention) and lse for a single (batch, head) over tokens
+# Input:
+#   logits_ptr: [L] float32
+#   attn_ptr: [L] float32 (will store attention weights)
+#   lse_ptr: scalar (float32) to store logsumexp / log(2)
+#   L: int (number of tokens)
+# Launch: one program, grid = (1,)
+@triton.jit
+def softmax_logsumexp_row_kernel(
+    logits_ptr, attn_ptr, lse_ptr, L: tl.constexpr
+):
+    # Pass 1: compute max
+    row_max = -float('inf')
+    for k in range(0, L):
+        val = tl.load(logits_ptr + k)
+        row_max = tl.maximum(row_max, val)
+
+    # Pass 2: compute sum of exp(logits - row_max)
+    sum_exp = 0.0
+    for k in range(0, L):
+        val = tl.load(logits_ptr + k)
+        sum_exp += tl.exp(val - row_max)
+
+    # Write softmax to attn_ptr
+    for k in range(0, L):
+        val = tl.load(logits_ptr + k)
+        attn = tl.exp(val - row_max) / sum_exp
+        tl.store(attn_ptr + k, attn)
+
+    # Compute lse = log(sum_exp) / log(2)
+    lse = tl.log(sum_exp) / 1.4426950408889634  # 1 / ln(2)
+    tl.store(lse_ptr, lse)
+
+
+# Triton kernel 3: Compute out_row = attn @ Kc for a single head, output columns in chunks
+# Input:
+#   attn_ptr: [L] float32 (attention weights)
+#   Kc_ptr: [L, Hc] float32
+#   out_row_ptr: [Hc] float32
+#   Hc: int
+#   L: int
+#   BLOCK_N: int
+# Launch: grid over output columns (ceil_div(Hc, BLOCK_N))
+@triton.jit
+def matvec_row_kernel(
+    attn_ptr, Kc_ptr, out_row_ptr,
+    Hc: tl.constexpr, L: tl.constexpr, BLOCK_N: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < Hc
+
+    acc = 0.0  # scalar accumulation for this chunk
+    # Reduction over tokens
+    for k in range(0, L):
+        attn_k = tl.load(attn_ptr + k)
+        kc_col = tl.load(Kc_ptr + k * Hc + offs_n, mask=mask_n, other=0.0)  # [BLOCK_N]
+        acc += attn_k * kc_col
+
+    tl.store(out_row_ptr + offs_n, acc, mask=mask_n)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale):
+        # Assume q_nope: [B, 16, 512], q_pe: [B, 16, 64], ckv_cache: [P, 1, 512], kpe_cache: [P, 1, 64]
+        device = q_nope.device
+        B, num_qo_heads, Hc = q_nope.shape
+        _, _, Hp = q_pe.shape
+        P, _, _ = ckv_cache.shape
+        _, _, _ = kpe_cache.shape
+
+        # Compute tok_idx per batch element
+        tok_idx = []
+        for b in range(B):
+            start = int(kv_indptr[b].item())
+            end = int(kv_indptr[b + 1].item())
+            tok_idx.append(kv_indices[start:end])
+        # Convert list to tensor
+        tok_idx = torch.stack([torch.tensor(idx, dtype=torch.long, device=device) for idx in tok_idx], dim=0)  # [B, L]
+
+        # Gather Kc_all and Kp_all from caches (squeeze the 1-sized segment dim)
+        Kc_all = ckv_cache.squeeze(1).to(torch.float32)  # [P, Hc]
+        Kp_all = kpe_cache.squeeze(1).to(torch.float32)  # [P, Hp]
+
+        # Prepare output
+        output = torch.empty((B, num_qo_heads, Hc), dtype=torch.float32, device=device)
+        lse = torch.empty((B, num_qo_heads), dtype=torch.float32, device=device)
+
+        # For each batch element b and head h
+        for b in range(B):
+            L_tokens = tok_idx[b].numel()
+            Kc = Kc_all[tok_idx[b]]  # [L_tokens, Hc]
+            Kp = Kp_all[tok_idx[b]]  # [L_tokens, Hp]
+
+            # qn and qp per head
+            for h in range(num_qo_heads):
+                qn = q_nope[b, h].to(torch.float32).contiguous()  # [Hc]
+                qp = q_pe[b, h].to(torch.float32).contiguous()    # [Hp]
+
+                # Allocate logits buffer
+                logits = torch.empty((L_tokens,), dtype=torch.float32, device=device)
+
+                # Kernel 1: compute logits_scaled
+                BLOCK_K = 32  # small chunk; masks handle tail
+                matmul_add_row_chunks_kernel[(1,)](
+                    qn, qp, Kc, Kp, logits,
+                    sm_scale, L_tokens, Hc, Hp,
+                    BLOCK_K=BLOCK_K,
+                    num_warps=4, num_stages=2
+                )
+
+                # Kernel 2: softmax + lse
+                attn = torch.empty((L_tokens,), dtype=torch.float32, device=device)
+                lse[b, h] = torch.empty((), dtype=torch.float32, device=device)  # dummy, will be overwritten by Triton
+                softmax_logsumexp_row_kernel[(1,)](
+                    logits, attn, lse[b, h],
+                    L_tokens,
+                    num_warps=1, num_stages=1
+                )
+
+                # Kernel 3: out_row = attn @ Kc
+                out_row = torch.empty((Hc,), dtype=torch.float32, device=device)
+                BLOCK_N = 128
+                grid = (triton.cdiv(Hc, BLOCK_N),)
+                matvec_row_kernel[grid](
+                    attn, Kc, out_row,
+                    Hc, L_tokens, BLOCK_N,
+                    num_warps=2, num_stages=2
+                )
+
+                # Store output
+                output[b, h, :] = out_row
+
+        # Cast to bfloat16 to match original
+        output = output.to(torch.bfloat16)
+        return output, lse
+
+
+# Original helper functions and get_inputs remain. Ensure tensors are on CUDA.
+def get_inputs():
+    device = 'cuda'
+    q_nope = torch.randn([1, 16, 512], dtype=torch.bfloat16, device=device)
+    q_pe = torch.randn([1, 16, 64], dtype=torch.bfloat16, device=device)
+    ckv_cache = torch.randn([989669, 1, 512], dtype=torch.bfloat16, device=device)
+    kpe_cache = torch.randn([989669, 1, 64], dtype=torch.bfloat16, device=device)
+    _n = 1; _t = 8
+    _lens = torch.full((_n,), _t // _n, dtype=torch.int32)
+    _lens[: _t % _n] += 1
+    kv_indptr = torch.cat([torch.zeros(1, dtype=torch.int32), torch.cumsum(_lens, 0)]).to(torch.int32).to(device)
+    kv_indices = torch.randint(0, 989669, [8], dtype=torch.int32).to(device)
+    sm_scale = 1.0
+    return [q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale]
+
+
+def fused_operator(tensor_0, tensor_1, tensor_2, tensor_3, tensor_4, tensor_5, tensor_6):
+    return ModelNew().forward(tensor_0, tensor_1, tensor_2, tensor_3, tensor_4, tensor_5, tensor_6)

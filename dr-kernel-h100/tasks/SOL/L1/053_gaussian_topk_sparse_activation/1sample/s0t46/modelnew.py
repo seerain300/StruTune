@@ -1,0 +1,227 @@
+import torch
+import torch.nn.functional as F
+import math
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+# Triton kernel: reduce sum and sumsq across K for each (b, s) row
+if TRITON_AVAILABLE:
+    @triton.jit
+    def _reduce_sum_sumsq_kernel_2d(
+        x_ptr,           # *const float32
+        mean_out_ptr,    # *float32 (size P)
+        sumsq_out_ptr,   # *float32 (size P)
+        B, S, K,         # int32
+        stride_b, stride_s, stride_k,  # int32
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)  # batch index
+        pid_s = tl.program_id(1)  # seq index
+
+        # Base pointer for this row
+        base = pid_b * stride_b + pid_s * stride_s
+
+        # Accumulators in fp32
+        sum_val = tl.zeros((), dtype=tl.float32)
+        sumsq_val = tl.zeros((), dtype=tl.float32)
+
+        # Tile over K
+        for kk in range(0, K, BLOCK_K):
+            offs = kk + tl.arange(0, BLOCK_K)
+            mask = offs < K
+            x = tl.load(x_ptr + base + offs * stride_k, mask=mask, other=0.0)
+            # Reduce within the tile
+            sum_val += tl.sum(x, axis=0)
+            sumsq_val += tl.sum(x * x, axis=0)
+
+        # Compute mean and sumsq (mean over K, sumsq over K)
+        mean = sum_val / K
+        sumsq = sumsq_val / K  # per-element sum of squares across K
+
+        # Write per-row scalars
+        pid = pid_b * S + pid_s
+        tl.store(mean_out_ptr + pid, mean)
+        tl.store(sumsq_out_ptr + pid, sumsq)
+
+
+    @triton.jit
+    def _apply_threshold_relu_kernel_2d(
+        x_ptr,           # *const float32
+        out_ptr,         # *float32 (size P*K, linear)
+        mean_in_ptr,     # *const float32 (size P)
+        sumsq_in_ptr,    # *const float32 (size P)
+        B, S, K,         # int32
+        stride_b, stride_s, stride_k,   # int32 (for x)
+        z_score,          # float32 scalar
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_s = tl.program_id(1)
+        pid = pid_b * S + pid_s
+
+        mean = tl.load(mean_in_ptr + pid)
+        sumsq = tl.load(sumsq_in_ptr + pid)
+        # std = sqrt(max(var, 0)) where var = sumsq - mean^2
+        var = sumsq - mean * mean
+        var = tl.maximum(var, 0.0)
+        std = tl.sqrt(var)
+
+        # threshold factor per row
+        m = mean + std * z_score
+
+        base = pid_b * stride_b + pid_s * stride_s
+
+        # Write output: y = max(0, x - m), across K
+        for kk in range(0, K, BLOCK_K):
+            offs = kk + tl.arange(0, BLOCK_K)
+            mask = offs < K
+            x = tl.load(x_ptr + base + offs * stride_k, mask=mask, other=0.0)
+            y = x - m
+            # ReLU
+            y = tl.maximum(y, 0.0)
+            # Store linearly into out_ptr[pid*K + kk + i]
+            out_idx = pid * K + kk + tl.arange(0, BLOCK_K)
+            tl.store(out_ptr + out_idx, y, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, target_sparsity: float = 0.9):
+        super().__init__()
+        # Precompute z-score for target_sparsity = 0.9
+        self.z_score = float(self._ndtri(torch.tensor(target_sparsity, dtype=torch.float32)))
+        # Kernel tuning parameters
+        self.block_k = 256
+        self.num_warps_reduce = 4
+        self.num_warps_elem = 4
+
+    @staticmethod
+    def _ndtri(p: torch.Tensor) -> torch.Tensor:
+        """Inverse of the standard normal CDF (quantile function).
+        Uses Abramowitz and Stegun approximation (formula 26.2.23).
+        This is a rational approximation that works well for p in (0, 1).
+        """
+        # Constants for the approximation
+        a1 = -3.969683028665376e+01
+        a2 = 2.209460984245205e+02
+        a3 = -2.759285104469687e+02
+        a4 = 1.383577518672690e+02
+        a5 = -3.066479806614716e+01
+        a6 = 2.506628277459239e+00
+
+        b1 = -5.447609879822406e+01
+        b2 = 1.615858368580409e+02
+        b3 = -1.556989798598866e+02
+        b4 = 6.680131188771972e+01
+        b5 = -1.328068155288572e+01
+
+        c1 = -7.784894002430293e-03
+        c2 = -3.223964580411365e-01
+        c3 = -2.400758277161838e+00
+        c4 = -2.549732539343734e+00
+        c5 = 4.374664141464968e+00
+        c6 = 2.938163982698783e+00
+
+        d1 = 7.784695709041462e-03
+        d2 = 3.224671290700398e-01
+        d3 = 2.445134137142996e+00
+        d4 = 3.754408661907416e+00
+
+        p_low = 0.02425
+        p_high = 1.0 - p_low
+
+        result = torch.zeros_like(p)
+
+        # Lower region
+        mask_low = p < p_low
+        if mask_low.any():
+            q = torch.sqrt(-2.0 * torch.log(p[mask_low]))
+            result[mask_low] = (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / \
+                               (((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0))
+
+        # Central region
+        mask_mid = (p >= p_low) & (p <= p_high)
+        if mask_mid.any():
+            q = p[mask_mid] - 0.5
+            r = q * q
+            result[mask_mid] = (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q / \
+                               (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0)
+
+        # Upper region
+        mask_high = p > p_high
+        if mask_high.any():
+            q = torch.sqrt(-2.0 * torch.log(1.0 - p[mask_high]))
+            result[mask_high] = -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / \
+                                ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+
+        return result
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # If Triton not available or not on CUDA, fall back to PyTorch computation
+        if (not TRITON_AVAILABLE) or (not x.is_cuda):
+            # Compute in float32 for stability
+            inputs_f32 = x.to(torch.float32)
+            B, S, K = inputs_f32.shape
+            # Compute per-row mean and sum of squares in float32
+            # mean over K, sumsq over K (population variance)
+            sum_all = torch.sum(inputs_f32, dim=-1, keepdim=True)  # [B, S, 1]
+            sumsq_all = torch.sum(inputs_f32 * inputs_f32, dim=-1, keepdim=True)
+            mean = sum_all / K
+            sumsq = sumsq_all / K
+            var = sumsq - mean * mean
+            var = torch.clamp(var, min=0.0)
+            std = torch.sqrt(var)
+            # z = inverse_normal_cdf(target_sparsity)
+            z = self._ndtri(torch.tensor(self.z_score, dtype=torch.float32)).item()
+            # threshold per row
+            threshold = mean + std * z  # [B, S, 1]
+            # Apply ReLU on (x - threshold)
+            out_f32 = F.relu(inputs_f32 - threshold)
+            return out_f32.to(torch.bfloat16)
+
+        # Triton path: assume x is [B, S, K], contiguous, on CUDA
+        x = x.contiguous()
+        B, S, K = x.shape
+        # Per-row buffers (fp32), size P = B*S
+        P = B * S
+        mean_row = torch.empty(P, dtype=torch.float32, device=x.device)
+        sumsq_row = torch.empty(P, dtype=torch.float32, device=x.device)
+
+        # Launch reduction kernel: one program per (b, s) row
+        grid = (B, S)
+        _reduce_sum_sumsq_kernel_2d[grid](
+            x,
+            mean_row,
+            sumsq_row,
+            B, S, K,
+            x.stride(0), x.stride(1), x.stride(2),
+            self.block_k,
+            num_warps=self.num_warps_reduce,
+            num_stages=2,
+        )
+
+        # Allocate 1D output buffer (fp32) and launch elementwise kernel
+        out_fp32 = torch.empty(B * S * K, dtype=torch.float32, device=x.device)
+
+        _apply_threshold_relu_kernel_2d[grid](
+            x,
+            out_fp32,
+            mean_row,
+            sumsq_row,
+            B, S, K,
+            x.stride(0), x.stride(1), x.stride(2),
+            float(self.z_score),  # scalar float
+            self.block_k,
+            num_warps=self.num_warps_elem,
+            num_stages=2,
+        )
+
+        # Reshape output to [B, S, K]
+        out_fp32 = out_fp32.view(B, S, K)
+        # Return in bfloat16 to match original behavior
+        return out_fp32.to(torch.bfloat16)

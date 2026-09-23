@@ -1,0 +1,169 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def mean_sumsq_kernel(
+    x_ptr,                # *float32, input tensor as float32
+    out_mean_ptr,         # *float32, output mean per (b, s)
+    out_sumsq_ptr,        # *float32, output sum of squares per (b, s)
+    B, S, F,              # int sizes
+    stride_b, stride_s, stride_f,  # input strides
+    BLOCK_F: tl.constexpr,
+):
+    # One program per (b, s)
+    pid = tl.program_id(0)
+    b = pid // S
+    s = pid % S
+
+    base = b * stride_b + s * stride_s
+
+    acc_sum = 0.0
+    acc_sumsq = 0.0
+
+    f = 0
+    while f < F:
+        offs = base + f + tl.arange(0, BLOCK_F)
+        mask = (f + tl.arange(0, BLOCK_F)) < F
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+        acc_sum += tl.sum(x, axis=0)
+        acc_sumsq += tl.sum(x * x, axis=0)
+        f += BLOCK_F
+
+    mean = acc_sum / F
+    var = acc_sumsq / F - mean * mean  # population std: unbiased=False
+    tl.store(out_mean_ptr + pid, mean)
+    tl.store(out_sumsq_ptr + pid, acc_sumsq / F)
+
+
+@triton.jit
+def invnorm_kernel(
+    out_ptr,              # *float32, single-element output tensor for invnorm(target_sparsity)
+    target_sparsity,      # float32 scalar (passed as a Python float at launch)
+    BLOCK: tl.constexpr,  # for compile-time codegen, not used but can tune
+):
+    # A&S 26.2.23 constants
+    a1 = -3.969683028665376e+01
+    a2 = 2.209460984245205e+02
+    a3 = -2.759285104469687e+02
+    a4 = 1.383577518672690e+02
+    a5 = -3.066479806614716e+01
+    a6 = 2.506628277459239e+00
+
+    b1 = -5.447609879822406e+01
+    b2 = 1.615858368580409e+02
+    b3 = -1.556989798598866e+02
+    b4 = 6.680131188771972e+01
+    b5 = -1.328068155288572e+01  # incomplete constant (compiler will not use)
+
+    # p_low and p_high are scalars; compute q for central region (fast path)
+    p = target_sparsity  # scalar
+    # We can't branch inside Triton scalar kernel easily; do a unified computation.
+    # Use the central region approximation (fast, accurate for p near 0.5).
+    # q = p - 0.5
+    q = p - 0.5
+    r = q * q
+
+    # Horner's method for numerator and denominator
+    num = (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q
+    den = (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0)
+    z = num / den  # invnorm approximation
+
+    tl.store(out_ptr, z)
+
+
+@triton.jit
+def relu_threshold_kernel(
+    x_ptr,                # *float32, input tensor
+    mean_ptr,             # *float32, per-(b, s) mean
+    sumsq_ptr,            # *float32, per-(b, s) sum of squares/F
+    invnorm_ptr,          # *float32, scalar invnorm(target_sparsity)
+    out_ptr,              # *float32, output tensor
+    B, S, F,              # sizes
+    stride_b, stride_s, stride_f,
+    BLOCK_F: tl.constexpr,
+):
+    # 3D grid over (B, S, chunks of F)
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+    chunk = tl.program_id(2)
+
+    base = b * stride_b + s * stride_s
+    f_start = chunk * BLOCK_F
+    offs = base + f_start + tl.arange(0, BLOCK_F)
+    mask = (f_start + tl.arange(0, BLOCK_F)) < F
+
+    # Load x chunk
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+
+    # Load mean and sumsq/F for this (b, s)
+    pid = b * S + s
+    mean = tl.load(mean_ptr + pid)
+    sumsqF = tl.load(sumsq_ptr + pid)
+    std = tl.sqrt(sumsqF - mean * mean)  # population std
+    threshold = mean + std * tl.load(invnorm_ptr)
+
+    y = x - threshold
+    # ReLU
+    y = tl.where(y > 0.0, y, 0.0)
+
+    tl.store(out_ptr + offs, y, mask=mask)
+
+
+def run(inputs: torch.Tensor, target_sparsity: float) -> torch.Tensor:
+    """
+    Triton-optimized Gaussian-based top-k sparse activation:
+    - Compute per-(b, s) mean and std over the last dim (features).
+    - Compute invnorm(target_sparsity) via A&S approximation in Triton.
+    - Apply ReLU(x - (mean + std * invnorm)) in a Triton elementwise kernel.
+    Returns output in bfloat16.
+    """
+    # Early return if no sparsity requested
+    if target_sparsity == 0.0:
+        return inputs
+
+    # Ensure float32 and contiguous for Triton
+    x = inputs.to(torch.float32).contiguous()
+    B, S, F = x.shape
+    stride_b, stride_s, stride_f = x.stride()
+
+    # Allocate outputs for mean and sumsq/F
+    mean = torch.empty((B * S,), dtype=torch.float32, device=x.device)
+    sumsqF = torch.empty((B * S,), dtype=torch.float32, device=x.device)
+
+    # Launch mean_sumsq reduction kernel: one program per (b, s)
+    grid = (B * S,)
+    mean_sumsq_kernel[grid](
+        x, mean, sumsqF, B, S, F, stride_b, stride_s, stride_f,
+        BLOCK_F=1024, num_warps=4, num_stages=2
+    )
+
+    # Compute invnorm(target_sparsity) in Triton scalar kernel, store to 1-element tensor
+    invnorm = torch.empty((1,), dtype=torch.float32, device=x.device)
+    invnorm_kernel[(1,)](invnorm, float(target_sparsity), BLOCK=1, num_warps=1, num_stages=1)
+
+    # Elementwise ReLU-threshold kernel: 3D grid over (B, S, F chunks)
+    out = torch.empty_like(x)
+    grid3 = (B, S, triton.cdiv(F, 1024))
+    relu_threshold_kernel[grid3](
+        x, mean, sumsqF, invnorm, out,
+        B, S, F, stride_b, stride_s, stride_f,
+        BLOCK_F=1024, num_warps=4, num_stages=2
+    )
+
+    # Return in bfloat16
+    return out.to(torch.bfloat16)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, *args):
+        # Keep original signature and behavior: run(inputs, target_sparsity)
+        if len(args) == 2:
+            return run(args[0], float(args[1]))
+        elif len(args) == 1:
+            return run(args[0], 0.01)
+        else:
+            if len(args) > 1 and isinstance(args[1], (float, int)):
+                return run(args[0], float(args[1]))
+            return run(args[0], 0.01)

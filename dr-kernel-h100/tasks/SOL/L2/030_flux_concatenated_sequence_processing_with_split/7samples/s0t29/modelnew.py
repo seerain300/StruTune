@@ -1,0 +1,178 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def concat_seq_dim1_kernel(
+    out_ptr,          # *fp32, output A: [B, M, K], M = T + I
+    in1_ptr,          # *fp32, encoder_hidden_states: [B, T, K]
+    in2_ptr,          # *fp32, hidden_states: [B, I, K]
+    B: tl.constexpr, T: tl.constexpr, I: tl.constexpr, K: tl.constexpr,
+    OUT_s0, OUT_s1, OUT_s2,
+    IN1_s0, IN1_s1, IN1_s2,
+    IN2_s0, IN2_s1, IN2_s2,
+    BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Grid: (B, tiles over M, tiles over K)
+    b = tl.program_id(0)
+    m_block = tl.program_id(1)
+    k_block = tl.program_id(2)
+
+    m_offsets = m_block * BLOCK_M + tl.arange(0, BLOCK_M)  # concatenated sequence indices
+    k_offsets = k_block * BLOCK_K + tl.arange(0, BLOCK_K)  # hidden_dim indices
+
+    M = T + I
+    mask_m = m_offsets < M
+    mask_k = k_offsets < K
+
+    # Determine if this m corresponds to encoder (x1) or image (x2)
+    is_encoder = m_offsets < T
+
+    # Base offsets for b
+    out_base = b * OUT_s0
+
+    for k_idx in range(0, BLOCK_K):
+        k = k_offsets[k_idx]
+        if not mask_k[k_idx]:
+            break
+        # For encoder rows
+        x1_row = out_base + m_offsets * OUT_s1 + k * OUT_s2
+        # For image rows (shift by T)
+        x2_row = out_base + (m_offsets - T) * OUT_s1 + k * OUT_s2  # valid only when is_encoder is False
+
+        # Row pointers for source tensors
+        # All computations done for b only; b index is already in out_base
+        x1_ptrs = in1_ptr + b * IN1_s0 + m_offsets * IN1_s1 + k * IN1_s2
+        x2_ptrs = in2_ptr + b * IN2_s0 + (m_offsets - T) * IN2_s1 + k * IN2_s2
+
+        # Load from appropriate source based on is_encoder
+        # Note: Triton supports masked loads with masks per lane
+        val = tl.load(x1_ptrs, mask=(mask_m & (m_offsets < T)), other=0.0)
+        # For m >= T, use x2; for m < T, we already loaded from x1. For lanes where is_encoder is True, x2_ptrs is invalid.
+        # We avoid double loading by computing with is_encoder as a lane-wise mask and selecting via where.
+        use_x2 = (m_offsets >= T) & mask_m
+        # Construct x2 values for lanes where use_x2 is True; otherwise 0
+        val2 = tl.load(x2_ptrs, mask=use_x2, other=0.0)
+        # Combine
+        val = tl.where(use_x2, val2, val)
+
+        # Store to output
+        tl.store(out_ptr + x1_row, val, mask=mask_m)
+
+
+@triton.jit
+def batched_matmul_kernel(
+    out_ptr,          # *fp32, C: [B, M, K]
+    in_ptr,           # *fp32, A: [B, M, K]
+    wt_ptr,           # *fp32, W^T: [K, K] (we pass process_weight.T here)
+    B: tl.constexpr, M: tl.constexpr, K: tl.constexpr,
+    C_s0, C_s1, C_s2,
+    A_s0, A_s1, A_s2,
+    WT_s0, WT_s1,     # W^T is [K, K], so only 2 strides
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Grid: (B, tiles over M, tiles over N)
+    b = tl.program_id(0)
+    m_block = tl.program_id(1)
+    n_block = tl.program_id(2)
+
+    m_offsets = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_offsets = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    k_offsets = tl.arange(0, BLOCK_K)  # inner reduction tile
+
+    mask_m = m_offsets < M
+    mask_n = n_offsets < K
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k_start in range(0, K, BLOCK_K):
+        k_idx = k_start + k_offsets
+        mask_k = k_idx < K
+
+        # Load A[b, m, k]
+        a_ptrs = in_ptr + b * A_s0 + m_offsets[:, None] * A_s1 + k_idx[None, :] * A_s2
+        a = tl.load(a_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+
+        # Load W^T[k, n] which is [K, K]
+        wt_ptrs = wt_ptr + k_idx[:, None] * WT_s0 + n_offsets[None, :] * WT_s1
+        wt = tl.load(wt_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+
+        # Accumulate
+        acc += tl.dot(a, wt)
+
+    # Store results to C[b, m, n]
+    c_ptrs = out_ptr + b * C_s0 + m_offsets[:, None] * C_s1 + n_offsets[None, :] * C_s2
+    tl.store(c_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
+
+
+class ModelNew(torch.nn.Module):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        process_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Triton-only implementation:
+        1) Concatenate encoder_hidden_states and hidden_states along sequence dim (T -> M = T + I) in Triton.
+        2) Compute C = A @ process_weight.T in Triton (batched matmul).
+        3) Split C back into encoder and hidden streams and return.
+        """
+        # Ensure tensors are on CUDA for Triton
+        assert hidden_states.is_cuda and encoder_hidden_states.is_cuda and process_weight.is_cuda, "Inputs must be CUDA tensors."
+        # Shapes
+        B = hidden_states.shape[0]
+        T = encoder_hidden_states.shape[1]
+        I = hidden_states.shape[1]
+        K = encoder_hidden_states.shape[2]
+        assert hidden_states.shape[2] == K and encoder_hidden_states.shape[2] == K, "Hidden dims must match."
+
+        # Allocate A: [B, M, K]
+        M = T + I
+        A = torch.empty((B, M, K), device=hidden_states.device, dtype=torch.float32)
+        C = torch.empty((B, M, K), device=hidden_states.device, dtype=torch.float32)
+
+        # Launch concat kernel: A = [B, T+I, K] = concat(encoder_hidden_states, hidden_states, dim=1)
+        BLOCK_M = 128
+        BLOCK_K = 64
+        grid_concat = (B, triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_K))
+        concat_seq_dim1_kernel[grid_concat](
+            A, encoder_hidden_states, hidden_states,
+            B, T, I, K,
+            A.stride(0), A.stride(1), A.stride(2),
+            encoder_hidden_states.stride(0), encoder_hidden_states.stride(1), encoder_hidden_states.stride(2),
+            hidden_states.stride(0), hidden_states.stride(1), hidden_states.stride(2),
+            BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K,
+            num_warps=4, num_stages=2,
+        )
+
+        # Ensure process_weight is float32 and transpose (W^T is [K, K])
+        Wt = process_weight.t().to(torch.float32)
+
+        # Launch batched matmul kernel: C = A @ Wt
+        BLOCK_M_G = 64
+        BLOCK_N_G = 64
+        BLOCK_K_G = 64
+        grid_gemm = (B, triton.cdiv(M, BLOCK_M_G), triton.cdiv(K, BLOCK_N_G))
+        batched_matmul_kernel[grid_gemm](
+            C, A, Wt,
+            B, M, K,
+            C.stride(0), C.stride(1), C.stride(2),
+            A.stride(0), A.stride(1), A.stride(2),
+            Wt.stride(0), Wt.stride(1),
+            BLOCK_M=BLOCK_M_G, BLOCK_N=BLOCK_N_G, BLOCK_K=BLOCK_K_G,
+            num_warps=4, num_stages=2,
+        )
+
+        # Split outputs
+        processed_encoder = C[:, :T, :]
+        processed_hidden = C[:, T:, :]
+
+        # Cast back to original dtypes (match inputs)
+        processed_encoder = processed_encoder.to(encoder_hidden_states.dtype)
+        processed_hidden = processed_hidden.to(hidden_states.dtype)
+
+        return processed_encoder, processed_hidden

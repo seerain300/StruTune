@@ -1,0 +1,223 @@
+import math
+import torch
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+# Kernel: Compute logits vector for a single (b, h)
+# Inputs:
+#   qn_ptr: [Hc] float32 (one row from q_nope)
+#   qp_ptr: [Hp] float32 (one row from q_pe)
+#   Kc_ptr: [L, Hc] float32
+#   Kp_ptr: [L, Hp] float32
+#   L: int (runtime) number of tokens
+#   Hc: int (runtime)
+#   Hp: int (runtime)
+#   sm_scale: float32
+# Output:
+#   out_ptr: [L] float32 logits
+@triton.jit
+def matmul_add_row_kernel(
+    qn_ptr, qp_ptr, Kc_ptr, Kp_ptr, out_ptr,
+    L: tl.int32, Hc: tl.int32, Hp: tl.int32, sm_scale: tl.float32,
+    BLOCK_L: tl.constexpr
+):
+    # We process tokens in chunks of BLOCK_L
+    for l_start in tl.static_range(0, L, BLOCK_L):
+        l_offsets = l_start + tl.arange(0, BLOCK_L)  # [BLOCK_L]
+        mask_l = l_offsets < L
+
+        # Initialize accumulators for this chunk
+        acc1 = tl.zeros([BLOCK_L], dtype=tl.float32)  # for qn @ Kc.T
+        acc2 = tl.zeros([BLOCK_L], dtype=tl.float32)  # for qp @ Kp.T
+
+        # Reduce over Hc (columns of Kc)
+        for k in tl.static_range(0, Hc, 1):
+            # load qn[k] and vector of Kc[l_offsets, k]
+            qn_k = tl.load(qn_ptr + k)
+            Kc_col = tl.load(Kc_ptr + l_offsets * Hc + k, mask=mask_l, other=0.0)
+            acc1 += qn_k * Kc_col
+
+        # Reduce over Hp (columns of Kp)
+        for p in tl.static_range(0, Hp, 1):
+            qp_p = tl.load(qp_ptr + p)
+            Kp_col = tl.load(Kp_ptr + l_offsets * Hp + p, mask=mask_l, other=0.0)
+            acc2 += qp_p * Kp_col
+
+        # Combine and scale
+        logits_chunk = acc1 + acc2
+        logits_chunk = logits_chunk * sm_scale
+        # Store only valid l_offsets
+        tl.store(out_ptr + l_offsets, logits_chunk, mask=mask_l)
+
+
+# Kernel: Compute row-wise logsumexp and write lse for a single (b, h)
+# Input:
+#   x_ptr: [L] float32 logits
+#   L: int
+# Output:
+#   lse_ptr: [1] float32 (lse = log(sum(exp(x))) / log(2))
+@triton.jit
+def softmax_logsumexp_row_kernel(x_ptr, lse_ptr, L: tl.int32, BLOCK_L: tl.constexpr):
+    # Pass 1: compute max
+    m = tl.full((), -1e20, tl.float32)
+    for l_start in tl.static_range(0, L, BLOCK_L):
+        l_offsets = l_start + tl.arange(0, BLOCK_L)
+        mask_l = l_offsets < L
+        x_chunk = tl.load(x_ptr + l_offsets, mask=mask_l, other=-1e20)
+        # Reduce max within chunk
+        chunk_max = tl.max(x_chunk, axis=0)  # scalar
+        m = tl.maximum(m, chunk_max)
+
+    # Pass 2: compute sum(exp(x - m))
+    s = tl.full((), 0.0, tl.float32)
+    for l_start in tl.static_range(0, L, BLOCK_L):
+        l_offsets = l_start + tl.arange(0, BLOCK_L)
+        mask_l = l_offsets < L
+        x_chunk = tl.load(x_ptr + l_offsets, mask=mask_l, other=-1e20)
+        e_chunk = tl.exp(x_chunk - m)
+        s += tl.sum(e_chunk, axis=0)  # scalar
+
+    lse_val = tl.log(s) / tl.log(2.0)
+    # lse_ptr is a single-element tensor
+    tl.store(lse_ptr, lse_val)
+
+
+# Kernel: Compute out_row = softmax(x) @ Kc for one head, store into out_row[0:Hc]
+# Input:
+#   x_ptr: [L] float32 logits
+#   Kc_ptr: [L, Hc] float32
+#   L: int
+#   Hc: int
+# Output:
+#   out_row_ptr: [Hc] float32
+@triton.jit
+def matvec_row_kernel(x_ptr, Kc_ptr, out_row_ptr, L: tl.int32, Hc: tl.int32, BLOCK_L: tl.constexpr):
+    # We'll produce a 1xHc output vector by accumulating chunks of size BLOCK_L
+    # Initialize accumulator
+    acc = tl.zeros([Hc], dtype=tl.float32)
+
+    # First, compute normalization constants for softmax: max and sum
+    m = tl.full((), -1e20, tl.float32)
+    for l_start in tl.static_range(0, L, BLOCK_L):
+        l_offsets = l_start + tl.arange(0, BLOCK_L)
+        mask_l = l_offsets < L
+        x_chunk = tl.load(x_ptr + l_offsets, mask=mask_l, other=-1e20)
+        chunk_max = tl.max(x_chunk, axis=0)
+        m = tl.maximum(m, chunk_max)
+
+    s = tl.full((), 0.0, tl.float32)
+    for l_start in tl.static_range(0, L, BLOCK_L):
+        l_offsets = l_start + tl.arange(0, BLOCK_L)
+        mask_l = l_offsets < L
+        x_chunk = tl.load(x_ptr + l_offsets, mask=mask_l, other=-1e20)
+        e_chunk = tl.exp(x_chunk - m)
+        s += tl.sum(e_chunk, axis=0)
+
+    # Now accumulate out_row = sum_l exp(x[l] - m) * Kc[l, :]
+    for l_start in tl.static_range(0, L, BLOCK_L):
+        l_offsets = l_start + tl.arange(0, BLOCK_L)
+        mask_l = l_offsets < L
+        # Load x_chunk and compute attn
+        x_chunk = tl.load(x_ptr + l_offsets, mask=mask_l, other=-1e20)
+        attn_chunk = tl.exp(x_chunk - m) / s  # [BLOCK_L]
+        # Load Kc_chunk as [BLOCK_L, Hc]
+        Kc_chunk = tl.load(Kc_ptr + l_offsets[:, None] * Hc + tl.arange(0, Hc)[None, :], mask=mask_l[:, None], other=0.0)
+        # Accumulate: acc += sum over l of attn_chunk[l] * Kc_chunk[l, :]
+        # We need to sum across the l dimension of chunk (size BLOCK_L)
+        # For each column j in [0..Hc-1], acc[j] += sum_l attn_chunk[l] * Kc_chunk[l, j]
+        for j in tl.static_range(0, Hc, 1):
+            col_j = Kc_chunk[:, j]  # [BLOCK_L]
+            acc[j] += tl.sum(attn_chunk * col_j, axis=0)
+
+    # Store the result
+    # out_row_ptr is a 1xHc tensor (we pass a tensor of shape (1, Hc) but Triton will treat it as 1D)
+    for j in tl.static_range(0, Hc, 1):
+        tl.store(out_row_ptr + j, acc[j])
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale):
+        # Extract shapes
+        batch_size = q_nope.shape[0]
+        num_qo_heads = q_nope.shape[1]
+        head_dim_ckv = q_nope.shape[2]
+        head_dim_kpe = q_pe.shape[2]
+        device = q_nope.device
+
+        # Prepare Kc_all and Kp_all by squeezing the cache's segment dimension and casting to float32
+        Kc_all = ckv_cache.squeeze(1).to(torch.float32).contiguous()  # [num_pages, Hc]
+        Kp_all = kpe_cache.squeeze(1).to(torch.float32).contiguous()  # [num_pages, Hp]
+
+        # Output buffers
+        output = torch.empty((batch_size, num_qo_heads, head_dim_ckv), dtype=torch.float32, device=device)  # will be cast to bfloat16
+        lse = torch.empty((batch_size, num_qo_heads), dtype=torch.float32, device=device)
+
+        # Constants
+        BLOCK_L = 128  # process logits in chunks
+
+        for b in range(batch_size):
+            # Compute token indices for this batch
+            start = int(kv_indptr[b].item())
+            end = int(kv_indptr[b + 1].item())
+            L_tokens = end - start
+            if L_tokens <= 0:
+                # No tokens for this batch element
+                lse[b, :] = 0.0
+                continue
+
+            tok_idx = kv_indices[start:end].to(torch.int32).contiguous()  # [L_tokens]
+
+            # Gather Kc and Kp for this batch
+            Kc = Kc_all[tok_idx]  # [L_tokens, Hc]
+            Kp = Kp_all[tok_idx]  # [L_tokens, Hp]
+            Kc = Kc.to(torch.float32).contiguous()
+            Kp = Kp.to(torch.float32).contiguous()
+
+            # Prepare per-head vectors
+            # q_nope and q_pe are [batch, heads, dim]. We want a single head per iteration.
+            # Create qn and qp as 1D vectors: for head h, qn = q_nope[b, h, :], qp = q_pe[b, h, :]
+            # We'll loop over h.
+            for h in range(num_qo_heads):
+                # Get qn and qp for this head
+                qn = q_nope[b, h].to(torch.float32).contiguous()  # [Hc]
+                qp = q_pe[b, h].to(torch.float32).contiguous()   # [Hp]
+
+                # Allocate logits buffer
+                logits = torch.empty(L_tokens, dtype=torch.float32, device=device)
+
+                # Kernel 1: compute logits for this (b, h)
+                matmul_add_row_kernel[(1,)](
+                    qn, qp, Kc, Kp, logits,
+                    L_tokens, head_dim_ckv, head_dim_kpe, float(sm_scale),
+                    BLOCK_L=BLOCK_L
+                )
+
+                # Kernel 2: compute lse for this (b, h)
+                lse_b_h = torch.empty(1, dtype=torch.float32, device=device)  # single-element tensor for lse
+                softmax_logsumexp_row_kernel[(1,)](
+                    logits, lse_b_h, L_tokens,
+                    BLOCK_L=BLOCK_L
+                )
+                lse[b, h] = lse_b_h[0]
+
+                # Kernel 3: compute output[b, h, :]
+                out_row = torch.empty(head_dim_ckv, dtype=torch.float32, device=device)  # 1xHc vector
+                matvec_row_kernel[(1,)](
+                    logits, Kc, out_row,
+                    L_tokens, head_dim_ckv,
+                    BLOCK_L=BLOCK_L
+                )
+                output[b, h, :] = out_row
+
+        # Cast output to bfloat16 as in the original example
+        return output.to(torch.bfloat16), lse
+
+
+def run(*args):
+    return ModelNew()(*args)

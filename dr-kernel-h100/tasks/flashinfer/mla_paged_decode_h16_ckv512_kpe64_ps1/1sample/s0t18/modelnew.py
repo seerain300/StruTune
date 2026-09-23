@@ -1,0 +1,219 @@
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def lse_nope_kernel(
+    qn_ptr,      # *fp32, [N]
+    Kc_ptr,      # *fp32, [TOTAL_PAGES, N]
+    tok_idx_ptr, # *int32, [M_total]
+    lse_ptr,     # *fp32, scalar (0-dim)
+    N,           # int32
+    M_total,     # int32
+    sm_scale,    # fp32
+    BLOCK_M: tl.constexpr
+):
+    # Compute LogSumExp of dot(qn, Kc[tok]) scaled by sm_scale over tokens
+    row_max = -float("inf")
+    sum_exp = 0.0
+
+    m = 0
+    while m < M_total:
+        # Process in chunks
+        for mm in range(BLOCK_M):
+            idx = m + mm
+            if idx >= M_total:
+                break
+            tok = tl.load(tok_idx_ptr + idx)  # int32
+            kc_row = tl.load(Kc_ptr + tok * N + tl.arange(0, N), mask=True, other=0.0)  # [N]
+            dot = tl.sum(qn_ptr * kc_row)  # scalar
+            logits_scaled = dot * sm_scale
+            # Update row-wise max and sum_exp
+            row_max = tl.maximum(row_max, logits_scaled)
+            sum_exp += tl.exp(logits_scaled - row_max)
+        m += BLOCK_M
+
+    lse_val = tl.log(sum_exp) / math.log(2.0)
+    tl.store(lse_ptr, lse_val)
+
+
+@triton.jit
+def output_kpe_kernel(
+    qp_ptr,      # *fp32, [Kp_dim]
+    Kp_ptr,      # *fp32, [TOTAL_PAGES, Kp_dim]
+    tok_idx_ptr, # *int32, [M_total]
+    lse_ptr,     # *fp32, scalar (0-dim)
+    out_ptr,     # *fp32, [N]
+    N,           # int32
+    Kp_dim,      # int32
+    M_total,     # int32
+    sm_scale,    # fp32
+    BLOCK_M: tl.constexpr
+):
+    # Accumulate output vector: y = sum_m exp((dot(qp, Kp[m]) * sm_scale - lse) / M_total) * Kp[m, :]
+    lse_val = tl.load(lse_ptr)  # scalar
+    y = tl.zeros([N], dtype=tl.float32)
+
+    m = 0
+    while m < M_total:
+        for mm in range(BLOCK_M):
+            idx = m + mm
+            if idx >= M_total:
+                break
+            tok = tl.load(tok_idx_ptr + idx)  # int32
+            kp_row = tl.load(Kp_ptr + tok * Kp_dim + tl.arange(0, Kp_dim), mask=True, other=0.0)  # [Kp_dim]
+            dot = tl.sum(qp_ptr * kp_row)  # scalar
+            logits_scaled = dot * sm_scale
+            attn = tl.exp(logits_scaled - lse_val)  # scalar
+            # attn is scalar; scale by 1/M_total
+            scale = attn / M_total
+            # y += scale * Kp[m, :]
+            y += scale * kp_row
+        m += BLOCK_M
+
+    tl.store(out_ptr, y)
+
+
+@triton.jit
+def lse_and_output_fused_kernel(
+    qn_ptr,      # *fp32, [N]
+    qp_ptr,      # *fp32, [Kp_dim]
+    Kc_ptr,      # *fp32, [TOTAL_PAGES, N]
+    Kp_ptr,      # *fp32, [TOTAL_PAGES, Kp_dim]
+    tok_idx_ptr, # *int32, [M_total]
+    lse_ptr,     # *fp32, scalar (0-dim)
+    out_ptr,     # *fp32, [N]
+    N,           # int32
+    Kp_dim,      # int32
+    M_total,     # int32
+    sm_scale,    # fp32
+    BLOCK_M: tl.constexpr
+):
+    # First pass: compute lse
+    row_max = -float("inf")
+    sum_exp = 0.0
+
+    m = 0
+    while m < M_total:
+        for mm in range(BLOCK_M):
+            idx = m + mm
+            if idx >= M_total:
+                break
+            tok = tl.load(tok_idx_ptr + idx)  # int32
+            kc_row = tl.load(Kc_ptr + tok * N + tl.arange(0, N), mask=True, other=0.0)  # [N]
+            dot = tl.sum(qn_ptr * kc_row)  # scalar
+            logits_scaled = dot * sm_scale
+            row_max = tl.maximum(row_max, logits_scaled)
+            sum_exp += tl.exp(logits_scaled - row_max)
+        m += BLOCK_M
+
+    lse_val = tl.log(sum_exp) / math.log(2.0)
+    tl.store(lse_ptr, lse_val)
+
+    # Second pass: compute output vector
+    m = 0
+    y = tl.zeros([N], dtype=tl.float32)
+    while m < M_total:
+        for mm in range(BLOCK_M):
+            idx = m + mm
+            if idx >= M_total:
+                break
+            tok = tl.load(tok_idx_ptr + idx)  # int32
+            kp_row = tl.load(Kp_ptr + tok * Kp_dim + tl.arange(0, Kp_dim), mask=True, other=0.0)  # [Kp_dim]
+            dot = tl.sum(qp_ptr * kp_row)  # scalar
+            logits_scaled = dot * sm_scale
+            attn = tl.exp(logits_scaled - lse_val)  # scalar
+            scale = attn / M_total
+            y += scale * kp_row
+        m += BLOCK_M
+
+    tl.store(out_ptr, y)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, block_m=128):
+        super().__init__()
+        self.block_m = block_m
+
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale=1.0):
+        # Shapes
+        B, H, N = q_nope.shape
+        _, _, Kp_dim = q_pe.shape
+        num_pages = ckv_cache.shape[0]
+        device = q_nope.device
+
+        # Cast inputs to fp32 and make contiguous
+        qn = q_nope.to(torch.float32).contiguous()   # [B, H, N]
+        qp = q_pe.to(torch.float32).contiguous()     # [B, H, Kp_dim]
+        Kc = ckv_cache.to(torch.float32).contiguous()  # [num_pages, N]
+        Kp = kpe_cache.to(torch.float32).contiguous()  # [num_pages, Kp_dim]
+
+        # Compute M_total per batch: number of tokens used for this batch
+        # kv_indptr[b] = starting index; kv_indptr[b+1] = ending index
+        # tok_idx = kv_indices[start:end]
+        M_total_list = []
+        for b_idx in range(B):
+            start = int(kv_indptr[b_idx].item())
+            end = int(kv_indptr[b_idx + 1].item())
+            M_total_list.append(end - start)
+            if end - start == 0:
+                # No tokens for this batch element
+                lse_b = torch.full((1,), -float("inf"), dtype=torch.float32, device=device)
+                y = torch.zeros((N,), dtype=torch.float32, device=device)
+                # Store per head: we don't have h yet, but we return a [B, H] tensor
+                # We'll fill lse with -inf for all heads
+                lse_all = torch.full((H,), -float("inf"), dtype=torch.float32, device=device)
+                output = torch.zeros((B, H, N), dtype=torch.bfloat16, device=device)
+                # Assign y to all heads
+                for h_idx in range(H):
+                    output[b_idx, h_idx] = y.to(torch.bfloat16)
+                return output, lse_all
+
+        # Allocate output and lse tensors
+        output_fp32 = torch.empty((B, H, N), dtype=torch.float32, device=device)
+        lse = torch.full((B, H), -float("inf"), dtype=torch.float32, device=device)
+
+        # For each batch b and each head h
+        for b_idx in range(B):
+            M_total = M_total_list[b_idx]
+            start = int(kv_indptr[b_idx].item())
+            end = int(kv_indptr[b_idx + 1].item())
+            tok_idx = kv_indices[start:end].to(torch.int32).contiguous()  # [M_total]
+
+            # Per-head qn/h
+            qn_h = qn[b_idx]  # [H, N]
+            for h_idx in range(H):
+                # Output vector for this (b,h)
+                y = torch.empty((N,), dtype=torch.float32, device=device)
+
+                # Launch Triton kernels: compute lse and output
+                lse_scalar = torch.empty((), dtype=torch.float32, device=device)  # scalar (0-dim)
+
+                # Compute lse using nope
+                lse_nope_kernel[(1,)](
+                    qn_h[h_idx],                # *fp32 [N]
+                    Kc,                         # *fp32 [num_pages, N]
+                    tok_idx,                    # *int32 [M_total]
+                    lse_scalar,                 # *fp32 scalar
+                    N, M_total, self.sm_scale, self.block_m,
+                )
+
+                # Compute output using kpe
+                output_kpe_kernel[(1,)](
+                    qp[b_idx, h_idx],           # *fp32 [Kp_dim]
+                    Kp,                         # *fp32 [num_pages, Kp_dim]
+                    tok_idx,                    # *int32 [M_total]
+                    lse_scalar,                 # *fp32 scalar
+                    y,                          # *fp32 [N]
+                    N, Kp_dim, M_total, self.sm_scale, self.block_m,
+                )
+
+                # Save output and lse
+                output_fp32[b_idx, h_idx] = y
+                lse[b_idx, h_idx] = lse_scalar.item()
+
+        # Cast output to bfloat16 to match original function's output dtype
+        output_bf16 = output_fp32.to(torch.bfloat16)
+        return output_bf16, lse
