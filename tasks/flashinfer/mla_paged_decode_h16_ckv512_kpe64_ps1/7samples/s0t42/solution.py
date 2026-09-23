@@ -1,0 +1,204 @@
+import math
+import torch
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+# Triton kernels required by the computation
+if TRITON_AVAILABLE:
+    @triton.jit
+    def lse_base2_and_output_kernel(
+        qnh_ptr,          # *f32, [512]
+        qph_ptr,          # *f32, [64]
+        Kc_ptr,           # *f32, [num_tokens, 512]
+        Kp_ptr,           # *f32, [num_tokens, 64]
+        out_vec_ptr,      # *f32, [512] — output per head
+        lse_ptr,          # *f32, scalar — logsumexp base2 of logits_scaled
+        L_TOKENS: tl.constexpr,   # number of tokens to process
+        sm_scale: tl.constexpr,   # scaling factor
+    ):
+        # We process one (b, h) in a single program instance, grid=(1,)
+        # Compute logits_scaled for all tokens, then lse (base-2) and output.
+        # Use vectorized accumulation across tokens to avoid Python loops in Triton.
+
+        # Create vector of token indices for vectorized loads
+        # Triton supports tl.arange; build indices 0..L_TOKENS-1
+        # For each token, compute row pointers and dot products.
+        # We'll build vectors for qnh, Kc_row, Kp_row and reduce.
+        # Initialize
+        m = tl.full((), -float("inf"), tl.float32)  # running max for numerical stability
+        s = tl.zeros((), tl.float32)               # running sum of exp(logits_scaled - m * sm_scale)
+        total_sum = tl.zeros((), tl.float32)      # sum of exp(logits_scaled - m * sm_scale) for normalization
+
+        # Accumulator for output vector
+        out = tl.zeros((512,), tl.float32)
+
+        # Vectorized processing across tokens
+        for t in range(L_TOKENS):
+            # Row pointers
+            Kc_row_ptr = Kc_ptr + t * 512
+            Kp_row_ptr = Kp_ptr + t * 64
+
+            # Dot products: qnh @ Kc_row and qph @ Kp_row
+            acc1 = tl.zeros((), tl.float32)
+            acc2 = tl.zeros((), tl.float32)
+            for i in range(0, 512, 1):
+                acc1 += tl.load(qnh_ptr + i) * tl.load(Kc_row_ptr + i)
+            for j in range(0, 64, 1):
+                acc2 += tl.load(qph_ptr + j) * tl.load(Kp_row_ptr + j)
+
+            logits_t = acc1 + acc2  # scalar
+            logits_scaled_t = logits_t * sm_scale
+
+            # Update max and sum for logsumexp
+            m = tl.maximum(m, logits_scaled_t)
+            s += tl.exp(logits_scaled_t - m * sm_scale)
+            total_sum += tl.exp(logits_scaled_t - m * sm_scale)
+
+        # Compute lse in base-2
+        lse_val = (m + tl.log(s) / tl.log(2.0))
+        # Store lse
+        tl.store(lse_ptr, lse_val)
+
+        # Recompute attn and output: out = sum_t attn[t] * Kc_selected[t, :]
+        # We need each attn[t] = exp(logits_scaled[t] - m) / total_sum
+        for t in range(L_TOKENS):
+            Kc_row_ptr = Kc_ptr + t * 512
+            Kp_row_ptr = Kp_ptr + t * 64
+            acc1 = tl.zeros((), tl.float32)
+            acc2 = tl.zeros((), tl.float32)
+            for i in range(0, 512, 1):
+                acc1 += tl.load(qnh_ptr + i) * tl.load(Kc_row_ptr + i)
+            for j in range(0, 64, 1):
+                acc2 += tl.load(qph_ptr + j) * tl.load(Kp_row_ptr + j)
+
+            logits_t = acc1 + acc2
+            attn_t = tl.exp(logits_t - m) / total_sum  # scalar
+
+            # Multiply Kc_selected row by attn_t and accumulate into out
+            for i in range(0, 512, 1):
+                out[i] += attn_t * tl.load(Kc_ptr + t * 512 + i)
+
+        # Store out vector
+        # out is vector of length 512, store element-wise
+        # Triton doesn't support direct vector store without indices; loop to store:
+        for i in range(512):
+            tl.store(out_vec_ptr + i, out[i])
+
+    @triton.jit
+    def select_rows_kernel(
+        src_ptr,          # *f32, [N, D], assumed laid out as [num_tokens, D]
+        indices_ptr,      # *i32, [M]
+        out_ptr,          # *f32, [M, D], contiguous
+        D: tl.constexpr,  # dimension (e.g., 512 or 64)
+        M: tl.constexpr,  # number of rows to select
+    ):
+        # One program per selected row; grid=(M,)
+        pid = tl.program_id(0)
+        idx = tl.load(indices_ptr + pid)  # int32 index
+        # Compute base offset in src and copy row into out
+        src_row_ptr = src_ptr + idx * D
+        out_row_ptr = out_ptr + pid * D
+        for j in range(0, D, 1):
+            val = tl.load(src_row_ptr + j)
+            tl.store(out_row_ptr + j, val)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale):
+        # Ensure inputs are on CUDA and float32 for compute
+        device = q_nope.device
+        q_nope = q_nope.to(torch.float32)
+        q_pe = q_pe.to(torch.float32)
+        ckv_cache = ckv_cache.to(torch.float32)  # [num_pages, 1, 512]
+        kpe_cache = kpe_cache.to(torch.float32)  # [num_pages, 1, 64]
+        kv_indptr = kv_indptr.to(torch.int32)
+        kv_indices = kv_indices.to(torch.int32)
+
+        batch_size = q_nope.shape[0]
+        num_qo_heads = q_nope.shape[1]
+        head_dim_ckv = q_nope.shape[2]
+        assert head_dim_ckv == 512
+        head_dim_kpe = q_pe.shape[-1]
+        assert head_dim_kpe == 64
+
+        # Output and lse buffers (float32 for compute; cast later)
+        output = torch.zeros(
+            (batch_size, num_qo_heads, head_dim_ckv), dtype=torch.float32, device=device
+        )
+        lse = torch.full((batch_size, num_qo_heads), -float("inf"), dtype=torch.float32, device=device)
+
+        # We will process one (b, h) per Triton program to simplify indexing
+        # Note: If b+1 >= len(kv_indptr), there is no KV cache for this batch element; skip it.
+        for b in range(batch_size):
+            if b + 1 >= kv_indptr.numel():
+                # No KV cache entries for this batch element
+                continue
+            # Extract start/end pointers from kv_indptr[b], kv_indptr[b+1]
+            # num_tokens = kv_indptr[b+1] - kv_indptr[b]
+            num_tokens = int(kv_indptr[b + 1].item()) - int(kv_indptr[b].item())
+            if num_tokens <= 0:
+                # No KV entries for this batch element
+                continue
+
+            # Select Kc rows and Kp rows
+            # ckv_cache is [num_pages, 1, 512]; flatten to [num_pages, 512]
+            Kc_all = ckv_cache.squeeze(1)            # [num_pages, 512]
+            Kp_all = kpe_cache.squeeze(1)           # [num_pages, 64]
+            # Gather selected rows using Triton kernel; allocate out buffers
+            Kc_selected = torch.empty((num_tokens, 512), dtype=torch.float32, device=device)
+            Kp_selected = torch.empty((num_tokens, 64), dtype=torch.float32, device=device)
+
+            # Launch select_rows_kernel for Kc
+            grid_kc = (num_tokens,)
+            select_rows_kernel[grid_kc](
+                Kc_all, kv_indices[kv_indptr[b]: kv_indptr[b + 1]], Kc_selected,
+                D=512, M=num_tokens
+            )
+            # Launch select_rows_kernel for Kp
+            grid_kp = (num_tokens,)
+            select_rows_kernel[grid_kp](
+                Kp_all, kv_indices[kv_indptr[b]: kv_indptr[b + 1]], Kp_selected,
+                D=64, M=num_tokens
+            )
+
+            # Process each head h = 0..num_qo_heads-1
+            for h in range(num_qo_heads):
+                qnh = q_nope[b, h, :]                # [512]
+                qph = q_pe[b, h, :]                  # [64]
+
+                # Launch Triton kernel to compute lse and output for this (b, h)
+                grid = (1,)
+                out_vec = torch.empty((head_dim_ckv,), dtype=torch.float32, device=device)  # [512]
+                lse_val = torch.empty((), dtype=torch.float32, device=device)               # scalar
+                # Pass L_TOKENS and sm_scale as constexpr (meta) to enable static loops
+                lse_base2_and_output_kernel[grid](
+                    qnh, qph, Kc_selected, Kp_selected, out_vec, lse_val,
+                    L_TOKENS=num_tokens, sm_scale=float(sm_scale)
+                )
+
+                output[b, h, :] = out_vec
+                lse[b, h] = lse_val
+
+        # Cast output to bfloat16 to match original signature
+        output_bf16 = output.to(torch.bfloat16)
+        return output_bf16, lse
+
+
+# Optional: get_inputs and fused_operator for the evaluator interface
+def get_inputs():
+    # The evaluator provides its own inputs; this function can be left as-is or omitted.
+    pass
+
+def fused_operator(tensor_0, tensor_1, tensor_2, tensor_3, tensor_4, tensor_5, tensor_6):
+    # Entry point required by the evaluator to run ModelNew
+    return ModelNew().forward(tensor_0, tensor_1, tensor_2, tensor_3, tensor_4, tensor_5, tensor_6)
+
+
+def run(*args):
+    return ModelNew()(*args)

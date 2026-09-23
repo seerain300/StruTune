@@ -1,0 +1,176 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _concatenate_sequences_kernel(
+    encoder_ptr, hidden_ptr, out_ptr,
+    B, T, I, H,
+    stride_e_b, stride_e_t, stride_e_h,
+    stride_h_b, stride_h_i, stride_h_h,
+    stride_o_b, stride_o_l, stride_o_h,
+    BLOCK_L: tl.constexpr,
+):
+    # One program per batch
+    b = tl.program_id(0)
+
+    # Iterate over concatenated sequence length
+    for l in range(0, T + I):
+        # Determine source: encoder if l < T, else hidden at l - T
+        src = 0 if (l < T) else 1
+
+        # Compute pointers for encoder/hidden row
+        if src == 0:
+            row_ptr = encoder_ptr + b * stride_e_b + l * stride_e_t
+        else:
+            row_ptr = hidden_ptr + b * stride_h_b + (l - T) * stride_h_i
+
+        # Load row values (all H elements)
+        h_idx = tl.arange(0, H)  # H is a scalar runtime value; Triton handles vector range
+        vals = tl.load(row_ptr + h_idx * stride_e_h if src == 0 else h_idx * stride_h_h)
+
+        # Store into output
+        out_row_ptr = out_ptr + b * stride_o_b + l * stride_o_l
+        tl.store(out_row_ptr + h_idx * stride_o_h, vals)
+
+
+@triton.jit
+def _batched_matmul_kernel(
+    A_ptr, Wt_ptr, C_ptr,
+    M, K, N,  # here N == H, but we keep general; actually output is [M, N]
+    stride_A_m, stride_A_k,
+    stride_Wt_k, stride_Wt_n,
+    stride_C_m, stride_C_n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # 2D launch: pid_m for rows, pid_n for cols
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        k_offsets = k + tl.arange(0, BLOCK_K)
+
+        # Load A tile: [BLOCK_M, BLOCK_K]
+        a_ptrs = A_ptr + m_offsets[:, None] * stride_A_m + k_offsets[None, :] * stride_A_k
+        a = tl.load(a_ptrs, mask=(m_offsets[:, None] < M) & (k_offsets[None, :] < K), other=0.0)
+
+        # Load W^T tile: [BLOCK_K, BLOCK_N], W^T is [K, N] (K=H, N=H)
+        wt_ptrs = Wt_ptr + k_offsets[:, None] * stride_Wt_k + n_offsets[None, :] * stride_Wt_n
+        wt = tl.load(wt_ptrs, mask=(k_offsets[:, None] < K) & (n_offsets[None, :] < N), other=0.0)
+
+        # Accumulate
+        acc += tl.dot(a, wt)
+
+    # Write result tile to C
+    c_ptrs = C_ptr + m_offsets[:, None] * stride_C_m + n_offsets[None, :] * stride_C_n
+    tl.store(c_ptrs, acc, mask=(m_offsets[:, None] < M) & (n_offsets[None, :] < N))
+
+
+@triton.jit
+def _split_streams_kernel(
+    C_ptr, out_encoder_ptr, out_hidden_ptr,
+    B, T, I, N,  # N == H
+    stride_C_m, stride_C_n,
+    stride_e_b, stride_e_t, stride_e_n,
+    stride_h_b, stride_h_i, stride_h_n,
+    BLOCK_H: tl.constexpr,
+):
+    # One program per batch
+    b = tl.program_id(0)
+
+    # Process encoder part: rows 0..T-1
+    for l in range(0, T):
+        c_row_ptr = C_ptr + b * stride_C_m + l * stride_C_n
+        e_row_ptr = out_encoder_ptr + b * stride_e_b + l * stride_e_t
+        # copy all N columns
+        n_idx = tl.arange(0, BLOCK_H)  # BLOCK_H should be >= N; we'll choose 256 to cover typical H
+        vals = tl.load(c_row_ptr + n_idx * stride_C_n, mask=n_idx < N, other=0.0)
+        tl.store(e_row_ptr + n_idx * stride_e_n, vals, mask=n_idx < N)
+
+    # Process hidden part: rows T..T+I-1
+    for l in range(0, I):
+        c_row_ptr = C_ptr + b * stride_C_m + (T + l) * stride_C_n
+        h_row_ptr = out_hidden_ptr + b * stride_h_b + l * stride_h_i
+        n_idx = tl.arange(0, BLOCK_H)
+        vals = tl.load(c_row_ptr + n_idx * stride_C_n, mask=n_idx < N, other=0.0)
+        tl.store(h_row_ptr + n_idx * stride_h_n, vals, mask=n_idx < N)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor,
+                encoder_hidden_states: torch.Tensor,
+                process_weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Triton-only implementation:
+          1) Concatenate encoder_hidden_states and hidden_states along sequence dimension.
+          2) Apply linear projection via Triton GEMM (right-multiply by process_weight.T).
+          3) Split back into separate streams.
+        """
+        assert hidden_states.is_cuda and encoder_hidden_states.is_cuda and process_weight.is_cuda, \
+            "All inputs must be on CUDA for Triton kernels."
+
+        B, T, H = encoder_hidden_states.shape
+        B2, I, H2 = hidden_states.shape
+        assert B == B2 and H == H2, "Batch and hidden_dim must match."
+
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+
+        # 1) Concatenate: out_cat [B, T+I, H]
+        out_cat = torch.empty((B, T + I, H), dtype=dtype, device=device)
+        # Ensure contiguous for simple strides
+        encoder = encoder_hidden_states.contiguous()
+        hidden = hidden_states.contiguous()
+
+        _concatenate_sequences_kernel[(B,)](
+            encoder, hidden, out_cat,
+            B, T, I, H,
+            *encoder.stride(),
+            *hidden.stride(),
+            *out_cat.stride(),
+            BLOCK_L=256,  # loop bound; H is handled in kernel via range
+            num_warps=1, num_stages=1,
+        )
+
+        # 2) GEMM: C = out_cat @ process_weight.T  => C shape [B*(T+I), H]
+        M = B * (T + I)
+        Wt = process_weight.transpose(0, 1).contiguous()  # [H, H]
+        C = torch.empty((M, H), dtype=torch.float32, device=device)  # accumulate in fp32
+        grid_m = triton.cdiv(M, 64)
+        grid_n = triton.cdiv(H, 64)
+        _batched_matmul_kernel[(grid_m, grid_n)](
+            out_cat, Wt, C,
+            M, H, H,
+            *out_cat.stride(),  # A stride: (row stride, col stride)
+            Wt.stride(0), Wt.stride(1),
+            *C.stride(),
+            BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+            num_warps=4, num_stages=2,
+        )
+
+        # 3) Split into encoder and hidden streams: [B, T, H], [B, I, H]
+        processed_encoder = torch.empty((B, T, H), dtype=torch.float32, device=device)
+        processed_hidden = torch.empty((B, I, H), dtype=torch.float32, device=device)
+
+        _split_streams_kernel[(B,)](
+            C, processed_encoder, processed_hidden,
+            B, T, I, H,
+            *C.stride(), *processed_encoder.stride(), *processed_hidden.stride(),
+            BLOCK_H=256,
+            num_warps=1, num_stages=1,
+        )
+
+        # Cast back to original dtype if needed
+        if dtype != torch.float32:
+            processed_encoder = processed_encoder.to(dtype)
+            processed_hidden = processed_hidden.to(dtype)
+
+        return processed_encoder, processed_hidden

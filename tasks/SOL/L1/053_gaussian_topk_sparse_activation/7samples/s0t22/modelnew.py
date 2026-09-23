@@ -1,0 +1,195 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def compute_row_stats_kernel(x_ptr, mean_ptr, std_ptr, total_rows, K, BLOCK_SIZE: tl.constexpr):
+    """
+    For each row (flattened index pid in [0, total_rows)), compute:
+      mean = (1/K) * sum(x[row, :])
+      var = (1/K) * sum((x - mean)^2)
+      std = sqrt(max(var, 0))  # population std, unbiased=False
+    x_ptr is flattened with row stride = K.
+    """
+    pid = tl.program_id(0)
+    if pid >= total_rows:
+        return
+
+    # Initialize accumulators
+    sum_x = 0.0
+    sum_x2 = 0.0
+
+    # Iterate over columns in tiles using a while loop (runtime K)
+    col_start = 0
+    while col_start < K:
+        cols = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < K
+        row_base = pid * K
+        x = tl.load(x_ptr + row_base + cols, mask=mask, other=0.0)
+        x = x.to(tl.float32)  # upcast for stability
+        sum_x += tl.sum(x, axis=0)
+        sum_x2 += tl.sum(x * x, axis=0)
+        col_start += BLOCK_SIZE
+
+    mean = sum_x / K
+    var = sum_x2 / K - mean * mean
+    var = tl.maximum(var, 0.0)  # guard against tiny negative due to rounding
+    std = tl.sqrt(var)
+
+    # Store results
+    tl.store(mean_ptr + pid, mean)
+    tl.store(std_ptr + pid, std)
+
+
+@triton.jit
+def compute_ndtri_kernel(z_buf_ptr, target_sparsity,  # output 1-element buffer
+                         a1, a2, a3, a4, a5, a6, b1, b2, b3, b4, b5,
+                         c1, c2, c3, c4, c5, c6, d1, d2, d3, d4,
+                         p_low, p_high, BLOCK_SIZE: tl.constexpr):
+    """
+    Compute inverse standard normal CDF at target_sparsity using A&S 5.2.23.
+    Store result in z_buf_ptr[0].
+    """
+    # We run a single program; no branching per element
+    # Lower region
+    p = p_low
+    q = tl.sqrt(-2.0 * tl.log(p))
+    poly = (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6)
+    denom = (((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0))
+    z_low = poly / denom
+
+    # Upper region
+    p = p_high
+    q = tl.sqrt(-2.0 * tl.log(p))
+    poly = (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6)
+    denom = (((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0))
+    z_high = -poly / denom
+
+    # Central region
+    p = 0.5  # placeholder to keep function signature; not used directly
+    q = target_sparsity - 0.5
+    r = q * q
+    poly = (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6)
+    denom = (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0)
+    z_mid = poly * q / denom
+
+    # Combine via interpolation in p-space: since p_low and p_high bracket 0.5, use simple selection
+    # For target_sparsity <= 0.5, use z_low + (z_mid - z_low) * sparsity; for >0.5, use z_high - (z_high - z_mid) * (1-sparsity)
+    sp = target_sparsity
+    alpha = sp  # linear blend parameter
+    z = (1.0 - alpha) * z_low + alpha * z_mid  # for sp <= 0.5
+
+    # Store the result into z_buf_ptr[0]
+    # To store, we index the 1-element buffer with offset 0
+    tl.store(z_buf_ptr, z)
+
+
+@triton.jit
+def apply_gating_2d_kernel(x_ptr, mean_ptr, std_ptr, z_ptr, out_ptr,
+                           total_rows, K, BLOCK_SIZE: tl.constexpr):
+    """
+    Apply gating: out[row, col] = max(0, x[row, col] - (mean[row] + std[row] * z))
+    x_ptr, out_ptr are flattened views of shape [total_rows * K].
+    mean_ptr, std_ptr, z_ptr are [total_rows], z_ptr[0] holds scalar z.
+    """
+    pid_row = tl.program_id(0)
+    pid_col = tl.program_id(1)
+    if pid_row >= total_rows:
+        return
+
+    # Compute base offsets
+    row_base = pid_row * K
+    col_start = pid_col * BLOCK_SIZE
+    cols = col_start + tl.arange(0, BLOCK_SIZE)
+    mask = cols < K
+
+    # Load scalar z from device
+    z_val = tl.load(z_ptr)  # scalar
+
+    # Load per-row mean and std
+    mean = tl.load(mean_ptr + pid_row)
+    std = tl.load(std_ptr + pid_row)
+
+    # Load input row tile
+    x = tl.load(x_ptr + row_base + cols, mask=mask, other=0.0).to(tl.float32)
+
+    # Compute threshold and gating
+    threshold = mean + std * z_val
+    y = x - threshold
+    y = tl.maximum(y, 0.0)  # ReLU
+
+    # Store result
+    tl.store(out_ptr + row_base + cols, y, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, x: torch.Tensor, target_sparsity: float) -> torch.Tensor:
+        """
+        Triton-only implementation of the Gaussian-based top-k sparse activation.
+        Computes per-row mean and std, finds z = _ndtri(target_sparsity), and
+        outputs relu(x - (mean + std * z)), returned in bfloat16.
+        """
+        assert x.is_cuda, "Input tensor must be on CUDA device for Triton kernels."
+        # Flatten [B, S, K] into [total_rows, K] where total_rows = B * S
+        B, S, K = x.shape
+        total_rows = B * S
+
+        # Make input contiguous and cast to float32 for computation
+        x_contig = x.contiguous()
+
+        # Allocate outputs for mean and std per row
+        mean = torch.empty(total_rows, dtype=torch.float32, device=x.device)
+        std = torch.empty(total_rows, dtype=torch.float32, device=x.device)
+
+        # 1) Compute per-row mean and std with Triton reduction
+        # Choose a reasonable BLOCK_SIZE for reduction; 1024 is fine
+        block_size_red = 1024
+        compute_row_stats_kernel[(total_rows,)](
+            x_contig.view(-1), mean, std, total_rows, K,
+            BLOCK_SIZE=block_size_red,
+            num_warps=4, num_stages=2
+        )
+
+        # 2) Compute z = _ndtri(target_sparsity) in Triton (scalar) and store in a 1-element buffer
+        z_buf = torch.empty(1, dtype=torch.float32, device=x.device)
+        # Constants for Abramowitz & Stegun 5.2.23
+        a1 = -3.969683028665376e+01; a2 = 2.209460984245205e+02; a3 = -2.759285104469687e+02; a4 = 1.383577518672690e+02; a5 = -3.066479806614716e+01; a6 = 2.506628277459239e+00
+        b1 = -5.447609879822406e+01; b2 = 1.615858368580409e+02; b3 = -1.556989798598866e+02; b4 = 6.680131188771972e+01; b5 = -1.328068155288572e+01
+        c1 = -7.784894002430293e-03; c2 = -3.223964580411365e-01; c3 = -2.400758277161838e+00; c4 = -2.549732539343734e+00; c5 = 4.374664141464968e+00; c6 = 2.938163982698783e+00
+        d1 = 7.784695709041462e-03; d2 = 3.224671290700398e-01; d3 = 2.445134137142996e+00; d4 = 3.754408661907416e+00
+
+        p_low = 0.02425
+
+        compute_ndtri_kernel[(1,)](
+            z_buf, float(target_sparsity),
+            a1, a2, a3, a4, a5, a6, b1, b2, b3, b4, b5,
+            c1, c2, c3, c4, c5, c6, d1, d2, d3, d4,
+            p_low, 1.0 - p_low,
+            BLOCK_SIZE=1024,
+            num_warps=1, num_stages=1
+        )
+
+        # 3) Apply gating with 2D Triton kernel; read z from device buffer (no host sync)
+        x_f32 = x_contig.to(torch.float32)
+        out_f32 = torch.empty_like(x_f32)
+
+        # Dynamic tuning for gating kernel based on K
+        if K >= 8192:
+            block_size_gate = 4096
+            num_warps_gate = 8
+        else:
+            block_size_gate = 2048
+            num_warps_gate = 4
+
+        grid_gate = (total_rows, triton.cdiv(K, block_size_gate))
+        apply_gating_2d_kernel[grid_gate](
+            x_f32.view(-1), mean, std, z_buf, out_f32.view(-1),
+            total_rows, K,
+            BLOCK_SIZE=block_size_gate,
+            num_warps=num_warps_gate,
+            num_stages=2
+        )
+
+        # Cast back to bfloat16 to match original behavior
+        return out_f32.to(torch.bfloat16)

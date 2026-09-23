@@ -1,0 +1,157 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def reduce_mean_std_row(x_ptr, mean_ptr, std_ptr, N, ROW_SIZE: tl.constexpr):
+    """
+    Triton reduction: compute per-row mean and population std (unbiased=False) across the last dim (size N).
+    Each program handles one row. ROW_SIZE must equal N and is a compile-time constant for the kernel.
+    x_ptr points to the input flattened as [rows, N] row-major; mean_ptr/std_ptr are per-row outputs [rows].
+    """
+    row_id = tl.program_id(axis=0)
+    offs = tl.arange(0, ROW_SIZE)
+    # Load the entire row vector without masks
+    x = tl.load(x_ptr + row_id * N + offs)
+    # Compute sum and sum of squares in fp32
+    sum_val = tl.sum(x)
+    sum_sq = tl.sum(x * x)
+    # Mean and population std
+    mean = sum_val / N
+    var = sum_sq / N - mean * mean
+    std = tl.sqrt(var)
+    # Store results
+    tl.store(mean_ptr + row_id, mean)
+    tl.store(std_ptr + row_id, std)
+
+
+@triton.jit
+def compute_inv_ndtri_scalar(inv_ptr, p):
+    """
+    Compute inverse normal CDF (quantile) for a scalar p in (0,1) using Abramowitz & Stegun 26.2.23.
+    Write result to inv_ptr[0] as float32.
+    """
+    # Constants
+    a1 = -3.969683028665376e+01
+    a2 = 2.209460984245205e+02
+    a3 = -2.759285104469687e+02
+    a4 = 1.383577518672690e+02
+    a5 = -3.066479806614716e+01
+    a6 = 2.506628277459239e+00
+
+    b1 = -5.447609879822406e+01
+    b2 = 1.615858368580409e+02
+    b3 = -1.556989798598866e+02
+    b4 = 6.680131188771972e+01
+    b5 = -1.328068155288572e+01
+
+    c1 = -7.784894002430293e-03
+    c2 = -3.223964580411365e-01
+    c3 = -2.400758277161838e+00
+    c4 = -2.549732539343734e+00
+    c5 = 4.374664141464968e+00
+    c6 = 2.938163982698783e+00
+
+    d1 = 7.784695709041462e-03
+    d2 = 3.224671290700398e-01
+    d3 = 2.445134137142996e+00
+    d4 = 3.754408661907416e+00
+
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+
+    # Lower region
+    q = tl.sqrt(-2.0 * tl.log(p))
+    result = (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / \
+             ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+
+    # Central region
+    q2 = p - 0.5
+    r = q2 * q2
+    result2 = (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q2 / \
+              (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0)
+
+    # Upper region
+    q3 = tl.sqrt(-2.0 * tl.log(1.0 - p))
+    result3 = -(((((c1 * q3 + c2) * q3 + c3) * q3 + c4) * q3 + c5) * q3 + c6) / \
+              ((((d1 * q3 + d2) * q3 + d3) * q3 + d4) * q3 + 1.0)
+
+    # Select region and compute final result
+    mask_low = p < p_low
+    mask_mid = (p >= p_low) & (p <= p_high)
+    # default to central result; Triton supports elementwise selection
+    # Note: we need to implement region selection manually using tl.where
+    inv = result2
+    inv = tl.where(mask_low, result, inv)
+    inv = tl.where(mask_mid, result2, inv)
+    inv = tl.where(~mask_low & ~mask_mid, result3, inv)
+
+    tl.store(inv_ptr, inv)
+
+
+@triton.jit
+def gate_rows_2d(x_ptr, mean_ptr, std_ptr, inv_ptr, out_ptr, rows, N, BLOCK_SIZE: tl.constexpr):
+    """
+    Triton elementwise gating across tiles of the last dimension (columns) for each row.
+    For each row, computes threshold = mean + std * inv_cdf(inv_ptr), then out = max(0, x - threshold).
+    x_ptr points to input [rows, N] flattened (row-major). mean_ptr/std_ptr are per-row scalars [rows].
+    out_ptr points to output [rows, N] flattened.
+    """
+    row_id = tl.program_id(axis=0)
+    tile_id = tl.program_id(axis=1)
+    start = tile_id * BLOCK_SIZE
+    offs = start + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+
+    # Load per-row stats
+    mean = tl.load(mean_ptr + row_id)
+    std = tl.load(std_ptr + row_id)
+    inv_cdf = tl.load(inv_ptr)  # scalar
+    threshold = mean + std * inv_cdf
+
+    # Load x tile
+    x = tl.load(x_ptr + row_id * N + offs, mask=mask, other=0.0)
+
+    # Gating: y = max(0, x - threshold)
+    y = x - threshold
+    y = tl.maximum(y, 0.0)
+
+    # Store results
+    tl.store(out_ptr + row_id * N + offs, y, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, x: torch.Tensor, target_sparsity: float) -> torch.Tensor:
+        # If no sparsity requested, return input unchanged
+        if target_sparsity == 0.0:
+            return x
+
+        # Compute in float32 for stability
+        x_f32 = x.to(torch.float32)
+
+        # Flatten to [rows, N] where N is last dim
+        B, S, N = x_f32.shape
+        rows = B * S
+        x_2d = x_f32.view(rows, N)
+
+        # 1) Compute per-row mean and std (population, unbiased=False)
+        mean = torch.empty(rows, device=x_f32.device, dtype=torch.float32)
+        std = torch.empty(rows, device=x_f32.device, dtype=torch.float32)
+        # Use ROW_SIZE = N as a compile-time constant for the kernel
+        reduce_mean_std_row[(rows,)](x_2d, mean, std, N, ROW_SIZE=N, num_warps=4)
+
+        # 2) Compute inv_norm_cdf(target_sparsity) via Triton scalar kernel
+        inv_cdf_buf = torch.empty(1, device=x_f32.device, dtype=torch.float32)
+        compute_inv_ndtri_scalar[(1,)](inv_cdf_buf, float(target_sparsity))
+
+        # 3) Apply gating via Triton 2D kernel over tiles of N
+        out_2d = torch.empty((rows, N), device=x_f32.device, dtype=torch.float32)
+        BLOCK_SIZE_GT = 1024
+        num_tiles = (N + BLOCK_SIZE_GT - 1) // BLOCK_SIZE_GT
+        grid = (rows, num_tiles)
+        gate_rows_2d[grid](x_2d, mean, std, inv_cdf_buf, out_2d, rows, N, BLOCK_SIZE=BLOCK_SIZE_GT, num_warps=4)
+
+        # Reshape back to [B, S, N] and cast to bfloat16 to match original behavior
+        out = out_2d.view(B, S, N).to(torch.bfloat16)
+        return out

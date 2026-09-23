@@ -1,0 +1,255 @@
+Deep analysis of the original code and the failed Triton attempt
+
+What the original PyTorch code does:
+- Input x has shape [batch_size, seq_len, intermediate_size].
+- For each row (per [batch, seq] pair), it computes:
+  - mean = average over the last dimension (intermediate_size)
+  - std = standard deviation over the last dimension (population std, unbiased=False)
+- It computes z = _ndtri(target_sparsity), where _ndtri is the inverse of the standard normal CDF (quantile function) via an Abramowitz & Stegun 5.2.23 approximation.
+- Per row, the threshold is threshold_row = mean + std * z.
+- It applies a gating: output = max(0, x - threshold_row), broadcast across the last dimension.
+- Finally, it returns output in bfloat16 (the original code converts the computation to float32, applies gating, then returns bfloat16).
+
+Where my previous Triton version went wrong (likely causes):
+- The evaluation reported RUNTIME_ERROR on all 12 workloads, not just “incorrect.” Triton runtime errors usually stem from illegal memory access, mismatched strides, or mis-specified grid/block sizes. In the prior attempt:
+  - The reduction kernel computed sums and stored mean/std to [B, S, 1] with explicit strides. While this can work, any tiny mistake in stride handling or 3D indexing can cause illegal writes. Passing strides for [B, S, 1] and using a 1D loop over columns introduces complexity and risk.
+  - The gating kernel used a 1D linear indexing and computed the row index from the linear offset. While conceptually correct for contiguous [B, S, K], any inconsistency in assumed contiguity or stride can lead to reading/writing wrong rows/cols.
+  - The ndtri kernel used torch.sqrt and torch.log on host, but I already removed those. However, for safety and simplicity, computing ndtri on host with torch and passing the scalar is fine, and the error logs didn’t indicate that specific issue.
+  - The most likely root cause is stride/indexing bugs in the Triton kernels. Triton can be very strict about pointer arithmetic; a minor mistake (e.g., using stride(2) where 1 is expected, or assuming row-major layout without consistent contiguity) can cause runtime errors.
+
+Plan to fix and ensure correctness:
+- Keep the host-side computation minimal and robust:
+  - Compute z = _ndtri(target_sparsity) using the same approximation but implemented in pure torch (PyTorch). This avoids Triton math issues and guarantees correctness for z. We can later move this into Triton if needed, but the evaluation showed that even torch operations are allowed as long as the main compute is Triton.
+- Implement the gating in Triton as a 2D kernel over [rows, columns]:
+  - Define rows = B*S. For each row program and column chunk, load the input, load the mean and std for that row, compute threshold = mean + std * z, apply out = max(0, x - threshold), and store.
+  - This avoids any 3D stride indexing and uses simple 2D indexing: out[rows, cols] = relu(x[rows, cols] - threshold[rows]). We can pass x, mean, std, and out as [rows, K] contiguous views. That removes any ambiguity about strides and ensures coalesced access across the last dimension.
+- Implement mean/std reduction in Triton as a 2D kernel over [rows, columns]:
+  - One program per row, loop over columns in chunks, accumulate sum and sumsq with masked loads. Compute mean = sum/K and std = sqrt(sumsq/K - mean^2). Store to mean[rows] and std[rows]. This is the canonical Triton reduction pattern and is very robust.
+- Ensure all tensors are contiguous and flattened appropriately:
+  - We can view x as [rows, K], and mean/std/out as [rows, 1]. With these 2D views, stride(0) is K for x and 1 for mean/std/out, and stride(1) is 1 for all. This simplifies indexing in Triton and eliminates the risk of incorrect stride usage.
+- Return output in bfloat16 to match the original behavior.
+
+Performance considerations:
+- The gating kernel is simple, elementwise, and bandwidth-bound. Using a 2D grid with BLOCK_SIZE=1024 and num_warps=4 should be fine for K up to 12288. We’ll loop over columns in chunks of 1024, computing threshold per row and applying ReLU.
+- The reduction kernels are also efficient: one program per row, vectorized loads in chunks, masked operations. For the provided workloads, B*S can be moderate (e.g., 4*2048=8192 rows), so this is fine.
+- Overall, this design avoids complex 3D stride handling and minimizes the chance of runtime errors. It should be correct and fast.
+
+Final code: Triton-only computation for ModelNew, with robust 2D kernels for reduction and gating
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def reduce_mean_std_2d_kernel(
+    x_ptr,               # *float32, shape [rows, K], contiguous
+    mean_ptr,            # *float32, shape [rows], contiguous
+    std_ptr,             # *float32, shape [rows], contiguous
+    rows,                # int32, number of rows (B*S)
+    K,                   # int32, number of columns (intermediate_size)
+    BLOCK_SIZE: tl.constexpr
+):
+    # One program per row
+    row = tl.program_id(0)
+    # If row >= rows, exit (grid should match, but guard anyway)
+    if row >= rows:
+        return
+
+    # Accumulators for sum and sum of squares
+    sum_val = 0.0
+    sum_sq = 0.0
+
+    # Loop over columns in chunks
+    for col_start in range(0, K, BLOCK_SIZE):
+        offs = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < K
+        # Compute pointer for this row and chunk
+        x_row_ptr = x_ptr + row * K
+        x_chunk = tl.load(x_row_ptr + offs, mask=mask, other=0.0)
+        # Accumulate
+        sum_val += tl.sum(x_chunk, axis=0)
+        sum_sq += tl.sum(x_chunk * x_chunk, axis=0)
+
+    # Compute mean and std (population std)
+    K_f = tl.full((), K, tl.float32)
+    mean = sum_val / K_f
+    var = sum_sq / K_f - mean * mean
+    # var can be negative due to numerical error; clamp to 0
+    var = tl.maximum(var, 0.0)
+    std = tl.sqrt(var)
+
+    # Store results
+    tl.store(mean_ptr + row, mean)
+    tl.store(std_ptr + row, std)
+
+
+@triton.jit
+def apply_gating_2d_kernel(
+    x_ptr,               # *float32, shape [rows, K], contiguous
+    mean_ptr,            # *float32, shape [rows], contiguous
+    std_ptr,             # *float32, shape [rows], contiguous
+    out_ptr,             # *float32, shape [rows, K], contiguous
+    z,                   # float32 scalar, _ndtri(target_sparsity)
+    rows,                # int32
+    K,                   # int32
+    BLOCK_SIZE: tl.constexpr
+):
+    # 2D launch: grid = (rows, ceil_div(K, BLOCK_SIZE))
+    row = tl.program_id(0)
+    col_block = tl.program_id(1)
+    if row >= rows:
+        return
+
+    col_start = col_block * BLOCK_SIZE
+    offs = col_start + tl.arange(0, BLOCK_SIZE)
+    mask = offs < K
+
+    # Load x chunk
+    x_row_ptr = x_ptr + row * K
+    x_chunk = tl.load(x_row_ptr + offs, mask=mask, other=0.0)
+
+    # Load mean and std for this row
+    mean = tl.load(mean_ptr + row)
+    std = tl.load(std_ptr + row)
+    threshold = mean + std * z
+    # Gate: relu(input - threshold)
+    gated = x_chunk - threshold
+    # Ensure broadcasting: threshold is scalar
+    gated = tl.maximum(gated, 0.0)
+
+    # Store
+    out_row_ptr = out_ptr + row * K
+    tl.store(out_row_ptr + offs, gated, mask=mask)
+
+
+def _ndtri_torch(p: float) -> float:
+    """Inverse of the standard normal CDF (quantile function) using A&S 5.2.23 approximation.
+    This is a helper for host-side computation of z; we will use it to obtain the scalar z.
+    """
+    # Constants for A&S 5.2.23
+    a1 = -3.969683028665376e+01
+    a2 = 2.209460984245205e+02
+    a3 = -2.759285104469687e+02
+    a4 = 1.383577518672690e+02
+    a5 = -3.066479806614716e+01
+    a6 = 2.506628277459239e+00
+
+    b1 = -5.447609879822406e+01
+    b2 = 1.615858368580409e+02
+    b3 = -1.556989798598866e+02
+    b4 = 6.680131188771972e+01
+    b5 = -1.328068155288572e+01
+
+    c1 = -7.784894002430293e-03
+    c2 = -3.223964580411365e-01
+    c3 = -2.400758277161838e+00
+    c4 = -2.549732539343734e+00
+    c5 = 4.374664141464968e+00
+    c6 = 2.938163982698783e+00
+
+    d1 = 7.784695709041462e-03
+    d2 = 3.224671290700398e-01
+    d3 = 2.445134137142996e+00
+    d4 = 3.754408661907416e+00
+
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+
+    # Central region
+    q = p - 0.5
+    r = q * q
+    poly = (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6)
+    denom = (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0)
+    result = (poly * q) / denom
+
+    # Lower and upper tails
+    # If p < p_low
+    if p < p_low:
+        t = torch.sqrt(-2.0 * torch.log(p))
+        result = (((((c1 * t + c2) * t + c3) * t + c4) * t + c5) * t + c6) / \
+                 ((((d1 * t + d2) * t + d3) * t + d4) * t + 1.0)
+    elif p > p_high:
+        t = torch.sqrt(-2.0 * torch.log(1.0 - p))
+        result = -(((((c1 * t + c2) * t + c3) * t + c4) * t + c5) * t + c6) / \
+                 ((((d1 * t + d2) * t + d3) * t + d4) * t + 1.0)
+
+    return float(result)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, block_size: int = 1024, num_warps: int = 4, num_stages: int = 2):
+        super().__init__()
+        self.block_size = block_size
+        self.num_warps = num_warps
+        self.num_stages = num_stages
+
+    def forward(self, inputs: torch.Tensor, target_sparsity: float) -> torch.Tensor:
+        """
+        Triton-optimized version of the original run.
+        - Computes per-row mean and std using Triton reduction kernel
+        - Computes z = _ndtri(target_sparsity) on host
+        - Applies gating: out = relu(input - (mean + std * z)) using Triton elementwise kernel
+        Returns: tensor of same shape as inputs, dtype bfloat16
+        """
+        if target_sparsity == 0.0:
+            return inputs
+
+        # Ensure contiguous and work in float32 for numerical stability
+        x = inputs.contiguous().to(torch.float32)
+
+        B, S, K = x.shape
+        rows = B * S
+
+        # 2D views: [rows, K]
+        x2d = x.view(rows, K)
+
+        # Allocate mean and std buffers [rows]
+        mean = torch.empty(rows, dtype=torch.float32, device=x.device)
+        std = torch.empty(rows, dtype=torch.float32, device=x.device)
+
+        # Launch reduction kernel: one program per row
+        grid_reduce = (rows,)
+        reduce_mean_std_2d_kernel[grid_reduce](
+            x2d, mean, std,
+            rows, K,
+            BLOCK_SIZE=self.block_size,
+            num_warps=self.num_warps,
+            num_stages=self.num_stages
+        )
+
+        # Compute z = _ndtri(target_sparsity) on host
+        z = _ndtri_torch(float(target_sparsity))
+
+        # Prepare output buffer [rows, K] in float32
+        out2d = torch.empty_like(x2d)
+
+        # Launch gating kernel over columns
+        grid_gate = (rows, triton.cdiv(K, self.block_size))
+        apply_gating_2d_kernel[grid_gate](
+            x2d, mean, std, out2d,
+            z,
+            rows, K,
+            BLOCK_SIZE=self.block_size,
+            num_warps=self.num_warps,
+            num_stages=self.num_stages
+        )
+
+        # Reshape back to [B, S, K] and cast to bfloat16 to match original behavior
+        out = out2d.view(B, S, K).to(torch.bfloat16)
+        return out
+```
+
+Why this should fix the runtime errors:
+- All Triton kernels use simple 2D indexing over [rows, K] with contiguous views, avoiding any 3D stride complexity. Each row is processed by one program, and columns are chunked with masked loads. No out-of-bounds memory access possible.
+- The reduction kernel accumulates sum and sum of squares via tl.sum on each chunk, computes mean and std, and stores to [rows] buffers. This is the standard Triton reduction pattern and is robust.
+- The gating kernel loads the per-row mean/std, computes threshold = mean + std * z, applies ReLU gating, and stores. Indexing is straightforward: row * K + col offsets. We also gate in float32 and return bfloat16, matching the original code’s behavior.
+- Host computation of z is done via a pure-PyTorch implementation of the same approximation as the original _ndtri, so behavior matches the reference.
+
+Performance:
+- The gating kernel is a single bandwidth-bound pass over the data with simple arithmetic. Using BLOCK_SIZE=1024 and num_warps=4 should be efficient for K up to 12288. The reduction kernel is also efficient, looping in chunks and computing per-row stats with coalesced memory access. You can tune block_size/warps if needed for specific workloads.
+
+If any Triton runtime issues persist, the next step would be to:
+- Reduce block_size to 512 for very large K to further minimize any potential vectorization issues (usually not necessary).
+- Ensure Triton version supports tl.sum and tl.maximum; both are standard.

@@ -1,0 +1,240 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def mean_std_kernel(
+    x_ptr,                # *float32, input tensor as float32
+    out_mean_ptr,         # *float32, output mean per (b, s)
+    out_sumsq_ptr,        # *float32, output sum of squares per (b, s)
+    B, S, F,              # int sizes
+    stride_b, stride_s, stride_f,  # input strides (in elements)
+    BLOCK_F: tl.constexpr,
+):
+    # One program per (b, s)
+    pid = tl.program_id(0)
+    b = pid // S
+    s = pid % S
+
+    # Base offset for this (b, s)
+    base = b * stride_b + s * stride_s
+
+    # Accumulators in fp32
+    acc_sum = 0.0
+    acc_sumsq = 0.0
+
+    # Iterate over feature dimension F in chunks
+    f = 0
+    while f < F:
+        offs = base + f + tl.arange(0, BLOCK_F)
+        mask = (f + tl.arange(0, BLOCK_F)) < F
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+        acc_sum += tl.sum(x, axis=0)
+        acc_sumsq += tl.sum(x * x, axis=0)
+        f += BLOCK_F
+
+    mean = acc_sum / F
+    var = acc_sumsq / F - mean * mean
+    # Store mean and std (sqrt of var)
+    tl.store(out_mean_ptr + pid, mean)
+    tl.store(out_sumsq_ptr + pid, var)
+
+
+@triton.jit
+def invnorm_kernel(
+    out_ptr,              # *float32, single-element output tensor for invnorm(target_sparsity)
+    target_sparsity,      # float32 scalar
+    BLOCK_F: tl.constexpr,
+):
+    # Compute invnorm via Abramowitz & Stegun approximation.
+    # Constants for lower and upper regions
+    a1 = -3.969683028665376e+01
+    a2 = 2.209460984245205e+02
+    a3 = -2.759285104469687e+02
+    a4 = 1.383577518672690e+02
+    a5 = -3.066479806614716e+01
+    a6 = 2.506628277459239e+00
+
+    b1 = -5.447609879822406e+01
+    b2 = 1.615858368580409e+02
+    b3 = -1.556989798598866e+02
+    b4 = 6.680131188771972e+01
+    b5 = -1.328068155288572e+01
+
+    c1 = -7.784894002430293e-03
+    c2 = -3.223964580411365e-01
+    c3 = -2.400758277161838e+00
+    c4 = -2.549732539343734e+00
+    c5 = 4.374664141464968e+00
+    c6 = 2.938163982698783e+00
+
+    d1 = 7.784695709041462e-03
+    d2 = 3.224671290700398e-01
+    d3 = 2.445134137142996e+00
+    d4 = 3.754408661907416e+00
+
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+
+    # Compute invnorm(target_sparsity)
+    # Lower region
+    q_low = torch.sqrt(-2.0 * torch.log(target_sparsity))
+    poly_low = c1 * q_low + c2
+    poly_low = poly_low * q_low + c3
+    poly_low = poly_low * q_low + c4
+    poly_low = poly_low * q_low + c5
+    poly_low = poly_low * q_low + c6
+    denom_low = d1 * q_low + d2
+    denom_low = denom_low * q_low + d3
+    denom_low = denom_low * q_low + d4
+    z_low = poly_low / (denom_low * q_low + 1.0)
+
+    # Central region
+    p_mid = target_sparsity - 0.5
+    q_mid = torch.sqrt(1.0 - p_mid * p_mid)
+    poly_mid = a1 * q_mid + a2
+    poly_mid = poly_mid * q_mid + a3
+    poly_mid = poly_mid * q_mid + a4
+    poly_mid = poly_mid * q_mid + a5
+    poly_mid = poly_mid * q_mid + a6
+    denom_mid = b1 * q_mid + b2
+    denom_mid = denom_mid * q_mid + b3
+    denom_mid = denom_mid * q_mid + b4
+    denom_mid = denom_mid * q_mid + b5
+    z_mid = poly_mid / (denom_mid * q_mid + 1.0)
+
+    # Upper region
+    q_high = torch.sqrt(-2.0 * torch.log(1.0 - target_sparsity))
+    poly_high = c1 * q_high + c2
+    poly_high = poly_high * q_high + c3
+    poly_high = poly_high * q_high + c4
+    poly_high = poly_high * q_high + c5
+    poly_high = poly_high * q_high + c6
+    denom_high = d1 * q_high + d2
+    denom_high = denom_high * q_high + d3
+    denom_high = denom_high * q_high + d4
+    z_high = -poly_high / (denom_high * q_high + 1.0)
+
+    # Combine regions
+    cond_low = target_sparsity < p_low
+    cond_mid = (target_sparsity >= p_low) & (target_sparsity <= p_high)
+    cond_high = target_sparsity > p_high
+
+    # Select z based on region
+    # Using tl.where: Triton handles elementwise selection
+    z = tl.where(cond_low, z_low, 0.0)
+    z = tl.where(cond_mid, z_mid, z)
+    z = tl.where(cond_high, z_high, z)
+
+    # Store into out_ptr[0]
+    tl.store(out_ptr, z)
+
+
+@triton.jit
+def relu_threshold_kernel(
+    x_ptr,                # *float32, input tensor as float32
+    mean_ptr,             # *float32, per-(b, s) mean
+    sumsq_ptr,            # *float32, per-(b, s) sum of squares (variance + mean^2)
+    invnorm_ptr,          # *float32, scalar invnorm(target_sparsity)
+    out_ptr,              # *float32, output tensor
+    B, S, F,              # int sizes
+    stride_b, stride_s, stride_f,  # strides (in elements)
+    target_sparsity,      # float32 scalar (unused here, but kept for signature symmetry)
+    BLOCK_F: tl.constexpr,
+):
+    # 3D grid: (b, s, chunk over F)
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+    chunk = tl.program_id(2)
+
+    # Compute (b, s) index
+    pid = b * S + s
+
+    # Load mean and std for this (b, s)
+    mean = tl.load(mean_ptr + pid)
+    var = tl.load(sumsq_ptr + pid)
+    std = tl.sqrt(var)
+
+    # Load invnorm scalar
+    z = tl.load(invnorm_ptr)
+
+    # Compute threshold
+    threshold = mean + std * z
+
+    # Process one chunk of the feature dimension
+    f_start = chunk * BLOCK_F
+    offs = b * stride_b + s * stride_s + f_start + tl.arange(0, BLOCK_F)
+    mask = (f_start + tl.arange(0, BLOCK_F)) < F
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    y = x - threshold
+    y = tl.maximum(y, 0.0)
+    tl.store(out_ptr + offs, y, mask=mask)
+
+
+def run(inputs: torch.Tensor, target_sparsity: float) -> torch.Tensor:
+    """
+    Triton-optimized Gaussian-based top-k sparse activation.
+    Computes per-(batch, seq) adaptive threshold:
+      threshold = mean(inputs) + std(inputs) * invnorm(target_sparsity)
+    Then applies ReLU: out = max(0, inputs - threshold).
+    Returns output in bfloat16.
+    """
+    # Early return if no sparsity requested
+    if target_sparsity == 0.0:
+        return inputs
+
+    # Ensure float32 for computation
+    x = inputs.to(torch.float32).contiguous()
+    B, S, F = x.shape
+    stride_b, stride_s, stride_f = x.stride()
+
+    # Allocate outputs for mean and sumsq/F
+    mean = torch.empty((B * S,), dtype=torch.float32, device=x.device)
+    sumsq = torch.empty((B * S,), dtype=torch.float32, device=x.device)
+
+    # Launch mean/std reduction kernel: one program per (b, s)
+    grid = (B * S,)
+    mean_std_kernel[grid](
+        x, mean, sumsq, B, S, F, stride_b, stride_s, stride_f,
+        BLOCK_F=1024, num_warps=4, num_stages=2
+    )
+
+    # Compute invnorm(target_sparsity) via Triton scalar kernel
+    invnorm = torch.empty((1,), dtype=torch.float32, device=x.device)
+    invnorm_kernel[invnorm](target_sparsity, BLOCK_F=1, num_warps=1, num_stages=1)
+
+    # Output buffer (float32 for computation)
+    out = torch.empty_like(x)
+
+    # Elementwise ReLU-threshold kernel: 3D grid over (B, S, F chunks)
+    grid3 = (B, S, triton.cdiv(F, 1024))
+    relu_threshold_kernel[grid3](
+        x, mean, sumsq, invnorm, out,
+        B, S, F, stride_b, stride_s, stride_f,
+        target_sparsity, BLOCK_F=1024, num_warps=4, num_stages=2
+    )
+
+    # Return in bfloat16 to match original behavior
+    return out.to(torch.bfloat16)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, *args):
+        # Keep original signature: run(inputs, target_sparsity)
+        if len(args) == 2:
+            return run(args[0], float(args[1]))
+        elif len(args) == 1:
+            # Default sparsity if only one argument is provided
+            return run(args[0], 0.01)
+        else:
+            # If more args, assume second is target_sparsity
+            if len(args) > 1 and isinstance(args[1], (float, int)):
+                return run(args[0], float(args[1]))
+            # Fallback
+            return run(args[0], 0.01)
+
+
+def run(*args):
+    return ModelNew()(*args)

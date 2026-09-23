@@ -1,0 +1,208 @@
+import torch
+import triton
+import triton.language as tl
+
+
+# Kernel: compute per-row mean and population std over last dim N for 2D [rows, N].
+# X2D: *f32, shape [rows, N], contiguous row-major.
+# MEAN: fp32 [rows], STD: fp32 [rows]
+@triton.jit
+def row_stats_kernel(
+    X2D_ptr,         # *f32, [rows, N]
+    MEAN_ptr,        # *f32, [rows]
+    STD_ptr,         # *f32, [rows]
+    rows,            # int
+    N,               # int
+    BLOCK: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    # Accumulate sum and sum of squares in fp32
+    sum_val = 0.0
+    sum_sq = 0.0
+    col = 0
+    while col < N:
+        offs = col + tl.arange(0, BLOCK)
+        mask = offs < N
+        idx = row_id * N + offs
+        x = tl.load(X2D_ptr + idx, mask=mask, other=0.0)
+        sum_val += tl.sum(x, axis=0)
+        sum_sq += tl.sum(x * x, axis=0)
+        col += BLOCK
+    mean = sum_val / N
+    var = sum_sq / N - mean * mean  # population variance (unbiased=False)
+    std = tl.sqrt(var)
+    tl.store(MEAN_ptr + row_id, mean)
+    tl.store(STD_ptr + row_id, std)
+
+
+# Triton scalar kernel: compute inverse standard normal CDF (ndtri) for probability p.
+# p: 1-element fp32 tensor on device; q: 1-element fp32 tensor on device.
+@triton.jit
+def ndtri_kernel(p, q):
+    # Abramowitz & Stegun 5.2.23 approximation
+    # Constants
+    a1 = -3.969683028665376e+01
+    a2 = 2.209460984245205e+02
+    a3 = -2.759285104469687e+02
+    a4 = 1.383577518672690e+02
+    a5 = -3.066479806614716e+01
+    a6 = 2.506628277459239e+00
+
+    b1 = -5.447609879822406e+01
+    b2 = 1.615858368580409e+02
+    b3 = -1.556989798598866e+02
+    b4 = 6.680131188771972e+01
+    b5 = -1.328068155288572e+01
+
+    c1 = -7.784894002430293e-03
+    c2 = -3.223964580411365e-01
+    c3 = -2.400758277161838e+00
+    c4 = -2.549732539343734e+00
+    c5 = 4.374664141464968e+00
+    c6 = 2.938163982698783e+00
+
+    d1 = 7.784695709041462e-03
+    d2 = 3.224671290700398e-01
+    d3 = 2.445134137142996e+00
+    d4 = 3.754408661907416e+00
+
+    p0 = 0.02425
+    p1 = 1.0 - p0
+
+    pp = p[0]
+    # Lower region
+    if pp < p0:
+        z = tl.sqrt(-2.0 * tl.log(pp))
+        # Horner's method for numerator and denominator
+        num = c1 * z + c2
+        num = num * z + c3
+        num = num * z + c4
+        num = num * z + c5
+        num = num * z + c6
+        den = d1 * z + d2
+        den = den * z + d3
+        den = den * z + d4
+        den = den * z + 1.0
+        q[0] = num / den
+    # Central region
+    elif pp <= p1:
+        z = pp - 0.5
+        r = z * z
+        num = a1 * r + a2
+        num = num * r + a3
+        num = num * r + a4
+        num = num * r + a5
+        num = num * r + a6
+        den = b1 * r + b2
+        den = den * r + b3
+        den = den * r + b4
+        den = den * r + b5
+        den = den * r + 1.0
+        q[0] = z * num / den
+    else:
+        z = tl.sqrt(-2.0 * tl.log(1.0 - pp))
+        num = c1 * z + c2
+        num = num * z + c3
+        num = num * z + c4
+        num = num * z + c5
+        num = num * z + c6
+        den = d1 * z + d2
+        den = den * z + d3
+        den = den * z + d4
+        den = den * z + 1.0
+        q[0] = -num / den
+
+
+# Kernel: compute per-row threshold = mean[row] + std[row] * multiplier
+@triton.jit
+def threshold_vec_kernel(MEAN_ptr, STD_ptr, MULTIPLIER, THRESH_ptr, rows):
+    row_id = tl.program_id(0)
+    mean = tl.load(MEAN_ptr + row_id)
+    std = tl.load(STD_ptr + row_id)
+    thresh = mean + std * MULTIPLIER
+    tl.store(THRESH_ptr + row_id, thresh)
+
+
+# Kernel: apply ReLU(x - threshold[row]) elementwise for 2D [rows, N].
+# X2D: *f32 input, THRESH: *f32 per-row threshold, OUT2D: *f32 output
+@triton.jit
+def relu_threshold_kernel(
+    X2D_ptr,         # *f32, [rows, N]
+    THRESH_ptr,      # *f32, [rows]
+    OUT2D_ptr,       # *f32, [rows, N]
+    rows,            # int
+    N,               # int
+    BLOCK: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    thr = tl.load(THRESH_ptr + row_id)
+    col = 0
+    while col < N:
+        offs = col + tl.arange(0, BLOCK)
+        mask = offs < N
+        in_idx = row_id * N + offs
+        x = tl.load(X2D_ptr + in_idx, mask=mask, other=0.0)
+        y = x - thr
+        y = tl.maximum(y, 0.0)  # ReLU
+        out_idx = row_id * N + offs
+        tl.store(OUT2D_ptr + out_idx, y, mask=mask)
+        col += BLOCK
+
+
+def run(inputs: torch.Tensor, target_sparsity: float) -> torch.Tensor:
+    """
+    Triton-optimized Gaussian-based top-k sparse activation.
+    Computes per-row threshold = mean + std * ndtri(target_sparsity),
+    then applies ReLU(x - threshold[row]).
+    """
+    if target_sparsity == 0.0:
+        return inputs
+
+    # Prepare input: convert to fp32 and make contiguous 2D [rows, N]
+    B, S, N = inputs.shape
+    rows = B * S
+    x = inputs.to(torch.float32)
+    x2d = x.contiguous().view(rows, N)
+
+    # Allocate outputs and statistics
+    mean = torch.empty(rows, device=inputs.device, dtype=torch.float32)
+    std = torch.empty(rows, device=inputs.device, dtype=torch.float32)
+
+    # 1) Compute per-row mean and std
+    grid_stats = (rows,)
+    row_stats_kernel[grid_stats](
+        x2d, mean, std,
+        rows=rows, N=N,
+        BLOCK=1024,
+        num_warps=8,
+    )
+
+    # 2) Compute ndtri(target_sparsity) in Triton
+    p = torch.full((1,), float(target_sparsity), device=inputs.device, dtype=torch.float32)
+    q = torch.empty(1, device=inputs.device, dtype=torch.float32)
+    ndtri_kernel[(1,)](p, q)
+
+    # 3) Compute per-row threshold
+    threshold = torch.empty(rows, device=inputs.device, dtype=torch.float32)
+    threshold_vec_kernel[grid_stats](mean, std, q, threshold, rows)
+
+    # 4) Apply ReLU(x - threshold[row]) elementwise
+    OUT2d = torch.empty((rows, N), device=inputs.device, dtype=torch.float32)
+    relu_threshold_kernel[grid_stats](
+        x2d, threshold, OUT2d,
+        rows=rows, N=N,
+        BLOCK=1024,
+        num_warps=4,
+    )
+
+    # Return in bf16 to match original behavior
+    return OUT2d.view(B, S, N).to(torch.bfloat16)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, *args):
+        return run(*args)
+
+
+def run(*args):
+    return ModelNew()(*args)

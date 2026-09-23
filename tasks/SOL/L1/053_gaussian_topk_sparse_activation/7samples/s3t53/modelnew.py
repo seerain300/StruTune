@@ -1,0 +1,208 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def row_stats_kernel(X_ptr, mean_out_ptr, sumsq_out_ptr,
+                      ROWS: tl.int32, F: tl.int32,
+                      BLOCK_SIZE: tl.constexpr):
+    """
+    For each row (0..ROWS-1), compute sum and sum of squares across F features.
+    Writes mean[row] = sum/F, sumsq[row].
+    """
+    row = tl.program_id(0)
+    sum_val = 0.0
+    sum_sq = 0.0
+
+    for col in range(0, F, BLOCK_SIZE):
+        idx = col + tl.arange(0, BLOCK_SIZE)
+        mask = idx < F
+        base = row * F
+        offs = base + idx
+        x = tl.load(X_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        sum_val += tl.sum(x, axis=0)
+        sum_sq += tl.sum(x * x, axis=0)
+
+    mean = sum_val / F
+    # Write outputs as fp32
+    tl.store(mean_out_ptr + row, mean)
+    tl.store(sumsq_out_ptr + row, sum_sq)
+
+
+@triton.jit
+def compute_std_kernel(var_in_ptr, std_out_ptr, F: tl.int32,
+                       BLOCK_SIZE: tl.constexpr):
+    """
+    Elementwise: std[i] = sqrt(max(var[i], 0)) for i in [0..F-1].
+    Each program handles a tile of the var vector.
+    """
+    pid = tl.program_id(0)
+    col = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = col < F
+    var = tl.load(var_in_ptr + col, mask=mask, other=0.0)
+    var = tl.maximum(var, 0.0)
+    std = tl.sqrt(var)
+    tl.store(std_out_ptr + col, std)
+
+
+@triton.jit
+def ndtri_scalar_kernel(p_in_ptr, p_out_ptr, eps: tl.float32):
+    """
+    Compute inverse standard normal CDF for a scalar p in [eps, 1-eps] using A&S 7.1.26.
+    Writes result to p_out_ptr[0].
+    """
+    # Load scalar p
+    p = tl.load(p_in_ptr)
+    # Clamp to [eps, 1-eps]
+    p = tl.maximum(tl.minimum(p, 1.0 - eps), eps)
+
+    # Constants for A&S 7.1.26 approximation
+    a1 = -3.969683028665376e+01
+    a2 = 2.209460984245205e+02
+    a3 = -2.759285104469687e+02
+    a4 = 1.383577518672690e+02
+    a5 = -3.066479806614716e+01
+    a6 = 2.506628277459239e+00
+
+    b1 = -5.447609879822406e+01
+    b2 = 1.615858368580409e+02
+    b3 = -1.556989798598866e+02
+    b4 = 6.680131188771972e+01
+    b5 = -1.328068155288572e+01
+
+    c1 = -7.784894002430293e-03
+    c2 = -3.223964580411365e-01
+    c3 = -2.400758277161838e+00
+    c4 = -2.549732539343734e+00
+    c5 = 4.374664141464968e+00
+    c6 = 2.938163982698783e+00
+
+    d1 = 7.784695709041462e-03
+    d2 = 3.224671290700398e-01
+    d3 = 2.445134137142996e+00
+    d4 = 3.754408661907416e+00
+
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+
+    # Lower region
+    q = tl.sqrt(-2.0 * tl.log(p))
+    z_low = (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / \
+            ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+
+    # Central region
+    q_mid = p - 0.5
+    r_mid = q_mid * q_mid
+    z_mid = (((((a1 * r_mid + a2) * r_mid + a3) * r_mid + a4) * r_mid + a5) * r_mid + a6) * q_mid / \
+            (((((b1 * r_mid + b2) * r_mid + b3) * r_mid + b4) * r_mid + b5) * r_mid + 1.0)
+
+    # Upper region
+    q_up = tl.sqrt(-2.0 * tl.log(1.0 - p))
+    z_up = -(((((c1 * q_up + c2) * q_up + c3) * q_up + c4) * q_up + c5) * q_up + c6) / \
+           ((((d1 * q_up + d2) * q_up + d3) * q_up + d4) * q_up + 1.0)
+
+    # Select region based on p
+    mask_low = p < p_low
+    mask_mid = (p >= p_low) & (p <= p_high)
+    mask_up = p > p_high
+
+    z = tl.where(mask_low, z_low, 0.0)
+    z = tl.where(mask_mid, z_mid, z)
+    z = tl.where(mask_up, z_up, z)
+
+    tl.store(p_out_ptr, z)
+
+
+@triton.jit
+def relu_threshold_kernel(X_ptr, mean_ptr, std_ptr, multiplier_ptr, Y_ptr,
+                          ROWS: tl.int32, F: tl.int32,
+                          BLOCK_SIZE: tl.constexpr):
+    """
+    For each row (0..ROWS-1), load mean and std, compute cutoff = mean + std * multiplier,
+    then write Y[row, col] = max(0, X[row, col] - cutoff).
+    """
+    row = tl.program_id(0)
+    # Load mean and std for this row
+    mean = tl.load(mean_ptr + row)
+    std = tl.load(std_ptr + row)
+    multiplier = tl.load(multiplier_ptr)  # scalar
+    cutoff = mean + std * multiplier
+
+    for col in range(0, F, BLOCK_SIZE):
+        idx = col + tl.arange(0, BLOCK_SIZE)
+        mask = idx < F
+        base = row * F
+        x = tl.load(X_ptr + base + idx, mask=mask, other=0.0).to(tl.float32)
+        y = tl.maximum(x - cutoff, 0.0)
+        tl.store(Y_ptr + base + idx, y, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, block_size: int = 2048, num_warps: int = 8, num_stages: int = 2):
+        super().__init__()
+        self.block_size = block_size
+        self.num_warps = num_warps
+        self.num_stages = num_stages
+
+    def forward(self, inputs: torch.Tensor, target_sparsity: float) -> torch.Tensor:
+        # Expect input shape [B, S, F]
+        assert inputs.dim() == 3, "Input must be 3D [batch_size, seq_len, intermediate_size]"
+        B, S, F = inputs.shape
+        rows = B * S
+
+        # 1) Flatten to [rows, F] and ensure contiguous fp16
+        x = inputs.contiguous().to(torch.float16)
+
+        # 2) Allocate outputs for stats
+        mean = torch.empty(rows, dtype=torch.float32, device=x.device)
+        sumsq = torch.empty(rows, dtype=torch.float32, device=x.device)
+
+        # 3) Run Triton stats kernel (accumulate in fp32)
+        grid = (rows,)
+        row_stats_kernel[grid](
+            x.view(rows * F), mean, sumsq,
+            ROWS=rows, F=F,
+            BLOCK_SIZE=self.block_size,
+            num_warps=self.num_warps,
+            num_stages=self.num_stages,
+        )
+
+        # 4) Compute var and std in Triton
+        var = torch.empty(rows, dtype=torch.float32, device=x.device)
+        # var[i] = sumsq[i]/F - mean[i]^2
+        # We'll populate var via a small kernel by computing it elementwise: not necessary; use torch ops on 1D tensors (allowed minimal).
+        var = sumsq / F - mean * mean
+        # Ensure non-negative for numerical safety
+        var = torch.clamp(var, min=0.0)
+
+        std_out = torch.empty(F, dtype=torch.float32, device=x.device)
+        # Compute std per feature index; we need per-row std. Use elementwise kernel with F as grid
+        # Note: We need per-row std; instead of elementwise per-feature, compute per-row vector:
+        # For simplicity and Triton compliance, compute per-row std via torch ops on the var vector and pass to kernel.
+        std_row = torch.sqrt(var)  # 1D per-row std
+
+        # 5) Compute ndtri scalar in Triton
+        p_in = x.new_tensor(target_sparsity)  # 1-element device tensor (float32)
+        p_out = torch.empty(1, dtype=torch.float32, device=x.device)
+        ndtri_scalar_kernel[(1,)](
+            p_in, p_out, 1e-7,
+            num_warps=1,
+            num_stages=1,
+        )
+        std_multiplier = p_out  # 1-element tensor scalar
+
+        # 6) Apply activation in Triton: y = max(0, x - (mean + std * multiplier))
+        y = torch.empty(rows * F, dtype=torch.float32, device=x.device)
+        relu_threshold_kernel[(rows,)](
+            x.view(rows * F).to(torch.float32),
+            mean, std_row, std_multiplier, y,
+            ROWS=rows, F=F,
+            BLOCK_SIZE=self.block_size,
+            num_warps=self.num_warps,
+            num_stages=self.num_stages,
+        )
+
+        # 7) Reshape and cast to bfloat16 to match original output
+        y_out = y.view(B, S, F).to(torch.bfloat16)
+        return y_out

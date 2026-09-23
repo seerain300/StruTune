@@ -1,0 +1,192 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def reduce_mean_std_2d(x_ptr, mean_ptr, std_ptr, N, BLOCK_SIZE: tl.constexpr):
+    """
+    Triton reduction: compute per-row mean and population std (unbiased=False) across last dim.
+    x_ptr: pointer to input flattened as [rows, N] (row-major), contiguous
+    mean_ptr/std_ptr: per-row outputs [rows], float32
+    N: number of columns (int32)
+    """
+    row_id = tl.program_id(axis=0)
+    sum_val = 0.0
+    sum_sq = 0.0
+
+    start = 0
+    while start < N:
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < N
+        x = tl.load(x_ptr + row_id * N + offs, mask=mask, other=0.0)
+        sum_val += tl.sum(x)
+        sum_sq += tl.sum(x * x)
+        start += BLOCK_SIZE
+
+    mean = sum_val / N
+    var = sum_sq / N - mean * mean  # population variance
+    std = tl.sqrt(var)
+    tl.store(mean_ptr + row_id, mean)
+    tl.store(std_ptr + row_id, std)
+
+
+@triton.jit
+def compute_inv_ndtri_scalar(out_ptr, p, BLOCK_SIZE: tl.constexpr):
+    """
+    Triton scalar kernel: compute inverse standard normal CDF (quantile function) using A&S approximation.
+    Writes a single float to out_ptr[0].
+    p: scalar probability in (0, 1), float32
+    """
+    # Abramowitz & Stegun 7.1.26 approximation
+    a1 = -3.969683028665376e+01
+    a2 = 2.209460984245205e+02
+    a3 = -2.759285104469687e+02
+    a4 = 1.383577518672690e+02
+    a5 = -3.066479806614716e+01
+    a6 = 2.506628277459239e+00
+
+    b1 = -5.447609879822406e+01
+    b2 = 1.615858368580409e+02
+    b3 = -1.556989798598866e+02
+    b4 = 6.680131188771972e+01
+    b5 = -1.328068155288572e+01
+
+    c1 = -7.784894002430293e-03
+    c2 = -3.223964580411365e-01
+    c3 = -2.400758277161838e+00
+    c4 = -2.549732539343734e+00
+    c5 = 4.374664141464968e+00
+    c6 = 2.938163982698783e+00
+
+    d1 = 7.784695709041462e-03
+    d2 = 3.224671290700398e-01
+    d3 = 2.445134137142996e+00
+    d4 = 3.754408661907416e+00
+
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+
+    # Compute inv_cdf for p
+    # Lower region
+    q_low = tl.sqrt(-2.0 * tl.log(p))
+    z_low = (((((c1 * q_low + c2) * q_low + c3) * q_low + c4) * q_low + c5) * q_low + c6) / \
+            ((((d1 * q_low + d2) * q_low + d3) * q_low + d4) * q_low + 1.0)
+
+    # Central region
+    q_mid = p - 0.5
+    r_mid = q_mid * q_mid
+    poly_mid = (((((a1 * r_mid + a2) * r_mid + a3) * r_mid + a4) * r_mid + a5) * r_mid + a6)
+    den_mid = (((((b1 * r_mid + b2) * r_mid + b3) * r_mid + b4) * r_mid + b5) * r_mid + 1.0)
+    z_mid = poly_mid * q_mid / den_mid
+
+    # Upper region
+    q_high = tl.sqrt(-2.0 * tl.log(1.0 - p))
+    z_high = -(((((c1 * q_high + c2) * q_high + c3) * q_high + c4) * q_high + c5) * q_high + c6) / \
+             ((((d1 * q_high + d2) * q_high + d3) * q_high + d4) * q_high + 1.0)
+
+    # Select result based on region
+    # If p < p_low: z_low; elif p > p_high: z_high; else: z_mid
+    # We implement piecewise selection via masks
+    z = tl.where(p < p_low, z_low, tl.where(p > p_high, z_high, z_mid))
+    tl.store(out_ptr, z)
+
+
+@triton.jit
+def gate_rows_2d(x_ptr, mean_ptr, std_ptr, inv_ptr, out_ptr,
+                 rows, N, BLOCK_SIZE: tl.constexpr):
+    """
+    Triton elementwise gating:
+    For each row, compute threshold = mean + std * inv_ndtri(target_sparsity),
+    then write y = max(0, x - threshold) into out_ptr[row, :].
+    x_ptr/out_ptr are [rows, N] contiguous row-major.
+    mean_ptr/std_ptr are [rows], float32.
+    inv_ptr is a 1-element tensor containing inv_ndtri(target_sparsity), float32.
+    """
+    row_id = tl.program_id(axis=0)
+    col_block = tl.program_id(axis=1)
+    start = col_block * BLOCK_SIZE
+
+    offs = start + tl.arange(0, BLOCK_SIZE)
+    mask = offs < N
+
+    # Load inputs
+    x = tl.load(x_ptr + row_id * N + offs, mask=mask, other=0.0)
+
+    # Load per-row stats
+    mean = tl.load(mean_ptr + row_id)
+    std = tl.load(std_ptr + row_id)
+    inv = tl.load(inv_ptr)  # scalar
+
+    # Compute gating
+    threshold = mean + std * inv
+    y = x - threshold
+    # ReLU
+    y = tl.maximum(y, 0.0)
+
+    # Store output
+    tl.store(out_ptr + row_id * N + offs, y, mask=mask)
+
+
+def _ndtri_triton(p: float, device: torch.device) -> torch.Tensor:
+    """
+    Host helper to compute inv norm CDF via Triton scalar kernel. Returns 1-element tensor on device.
+    """
+    inv = torch.empty(1, device=device, dtype=torch.float32)
+    compute_inv_ndtri_scalar[(1,)](inv, p, BLOCK_SIZE=1)
+    return inv
+
+
+def run(inputs: torch.Tensor, target_sparsity: float) -> torch.Tensor:
+    """
+    Triton-only implementation of the original logic:
+    - Compute per-row mean and std across last dim (unbiased=False).
+    - Compute inv norm CDF(target_sparsity) via Triton scalar kernel.
+    - Apply gating y = max(0, x - (mean + std * inv)) using a Triton elementwise kernel.
+    Returns output in bfloat16.
+    """
+    # Cast to float32 for numeric stability in reduction and elementwise compute
+    x = inputs
+    x_f32 = x.to(torch.float32)
+
+    # Flatten to 2D [rows, N], where N = intermediate_size (last dim)
+    N = x_f32.shape[-1]
+    rows = x_f32.numel() // N
+    x_2d = x_f32.view(rows, N)
+
+    # 1) Triton reduction to compute per-row mean and std (unbiased=False)
+    mean = torch.empty(rows, device=x_f32.device, dtype=torch.float32)
+    std = torch.empty(rows, device=x_f32.device, dtype=torch.float32)
+    BLOCK_SIZE_RS = 1024
+    reduce_mean_std_2d[(rows,)](x_2d, mean, std, N, BLOCK_SIZE=BLOCK_SIZE_RS, num_warps=4)
+
+    # 2) Triton scalar kernel: inv_norm_cdf(target_sparsity)
+    inv_cdf_buf = _ndtri_triton(target_sparsity, x_f32.device)  # shape [1], float32
+
+    # 3) Triton elementwise gating over tiles
+    out_2d = torch.empty((rows, N), device=x_f32.device, dtype=torch.float32)
+    BLOCK_SIZE_GT = 1024
+    num_tiles = (N + BLOCK_SIZE_GT - 1) // BLOCK_SIZE_GT
+    grid = (rows, num_tiles)
+    gate_rows_2d[grid](x_2d, mean, std, inv_cdf_buf, out_2d, rows, N, BLOCK_SIZE=BLOCK_SIZE_GT, num_warps=4)
+
+    # Reshape back and cast to bfloat16 to match original behavior
+    out = out_2d.view(*x.shape).to(torch.bfloat16)
+    return out
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, *args):
+        # Emulate the original call: run(inputs, target_sparsity)
+        # The original example passes a single input tensor; we accept it and a sparsity parameter.
+        if len(args) == 0:
+            return None
+        inputs = args[0]
+        target_sparsity = 0.5  # default; if provided, original run would expect a second arg
+        if len(args) > 1:
+            target_sparsity = float(args[1])
+        return run(inputs, target_sparsity)
+
+
+def run(*args):
+    return ModelNew()(*args)

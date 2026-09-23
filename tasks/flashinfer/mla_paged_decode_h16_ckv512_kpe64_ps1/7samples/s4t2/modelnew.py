@@ -1,0 +1,215 @@
+import torch
+import math
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_attn_and_lse_kernel(
+    qn_ptr,            # *float32, [B, N, Dc] flattened
+    qp_ptr,            # *float32, [B, N, Dp] flattened
+    Kc_ptr,            # *float32, [M_b, Dc] flattened (subset of ckv_cache)
+    Kp_ptr,            # *float32, [M_b, Dp] flattened (subset of kpe_cache)
+    attn_ptr,          # *float32, [B, N, M_b] flattened
+    lse_ptr,           # *float32, [B, N] flattened
+    B: tl.constexpr,   # int
+    N: tl.constexpr,   # int (num_qo_heads)
+    Dc: tl.constexpr,  # int (head_dim_ckv, 512 here)
+    Dp: tl.constexpr,  # int (head_dim_kpe, 64 here)
+    M_b: tl.constexpr, # int (number of tokens in batch b)
+    sm_scale: tl.constexpr,  # float32 scalar
+    BLOCK_N: tl.constexpr     # tile size for tokens loop (e.g., 128)
+):
+    # program id: one program per (b, h)
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    # Compute base pointers for qn, qp for this (b, h)
+    # qn is laid out as [B, N, Dc] contiguous; linear index = ((b*N + h)*Dc + d)
+    qn_base = (pid_b * N + pid_h) * Dc
+    # qp is [B, N, Dp]; linear index = ((b*N + h)*Dp + d)
+    qp_base = (pid_b * N + pid_h) * Dp
+
+    # Load qn and qp vectors as 1D arrays
+    qn = tl.load(qn_ptr + qn_base + tl.arange(0, Dc))
+    qp = tl.load(qp_ptr + qp_base + tl.arange(0, Dp))
+
+    # Prepare vectors to hold logits_scaled, max, sum_exp
+    # We’ll iterate over tokens in chunks of BLOCK_N
+    logits = tl.zeros([BLOCK_N], dtype=tl.float32)
+    # For logsumexp stability
+    m = tl.full([1], -float("inf"), dtype=tl.float32)  # running max
+    sum_exp = tl.zeros([1], dtype=tl.float32)          # running sum of exp normalized
+
+    idx = 0
+    while idx < M_b:
+        offs = idx + tl.arange(0, BLOCK_N)
+        mask = offs < M_b
+
+        # Load Kc rows and Kp rows for this chunk
+        # Kc flattened: [M_b, Dc], row index = offs*stride_kc_row, stride_kc_row = Dc
+        Kc_chunk = tl.load(Kc_ptr + offs * Dc, mask=mask, other=0.0)  # [BLOCK_N, Dc]
+        Kp_chunk = tl.load(Kp_ptr + offs * Dp, mask=mask, other=0.0)  # [BLOCK_N, Dp]
+
+        # Compute dot products: sum over d of qn[d] * Kc[d] and qn[d] * Kp[d]
+        # Use tl.dot for 1D vectors: qn [Dc] times Kc_chunk.T [Dc, BLOCK_N] -> [BLOCK_N]
+        dot1 = tl.dot(qn, Kc_chunk.T)  # [BLOCK_N]
+        dot2 = tl.dot(qp, Kp_chunk.T)  # [BLOCK_N]
+        logits_chunk = sm_scale * (dot1 + dot2)
+
+        # For masked entries, set logits_chunk to -inf so they don’t affect max/sum
+        logits_chunk = tl.where(mask, logits_chunk, -float("inf"))
+
+        # Update running max and sum_exp for logsumexp
+        # m_new = max(m, max(logits_chunk))
+        m_new = tl.maximum(m, tl.max(logits_chunk, axis=0))
+        # sum_exp = sum_exp * exp(m - m_new) + sum(exp(logits_chunk - m_new))
+        sum_exp = sum_exp * tl.exp(m - m_new) + tl.sum(tl.exp(logits_chunk - m_new), axis=0)
+        m = m_new
+
+        # Write logits_chunk to attn[b, h, idx:idx+BLOCK_N]
+        attn_line_base = (pid_b * N + pid_h) * M_b
+        tl.store(attn_ptr + attn_line_base + idx + tl.arange(0, BLOCK_N), logits_chunk, mask=mask)
+
+        idx += BLOCK_N
+
+    # Compute final logsumexp in base-2
+    # lse = m + log(sum_exp) / ln(2)
+    ln2 = 0.6931471805599453
+    lse_val = m + tl.log(sum_exp) / ln2
+    tl.store(lse_ptr + pid_b * N + pid_h, lse_val)
+
+
+@triton.jit
+def matvec_proj_kernel(
+    attn_ptr,      # *float32, [B, N, M_b]
+    Kc_ptr,        # *float32, [M_b, Dc] flattened
+    out_ptr,       # *float32, [B, N, Dc] flattened
+    B: tl.constexpr,
+    N: tl.constexpr,
+    Dc: tl.constexpr,
+    M_b: tl.constexpr,
+    BLOCK_N: tl.constexpr
+):
+    # program id: one program per (b, h)
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    # Load attn vector for this (b, h): attn[b, h, :] of length M_b
+    attn_line_base = (pid_b * N + pid_h) * M_b
+    attn_vec = tl.load(attn_ptr + attn_line_base + tl.arange(0, M_b))
+
+    # Compute out[b, h, :] = attn_vec @ Kc[:, :] where Kc is [M_b, Dc]
+    # We need to accumulate over rows
+    out_vec = tl.zeros([Dc], dtype=tl.float32)
+    idx = 0
+    while idx < M_b:
+        offs = idx + tl.arange(0, BLOCK_N)
+        mask = offs < M_b
+        Kc_chunk = tl.load(Kc_ptr + offs * Dc, mask=mask, other=0.0)  # [BLOCK_N, Dc]
+        # attn_vec[offs] dot Kc_chunk.T -> [Dc]
+        partial = tl.dot(attn_vec[offs], Kc_chunk.T)  # [Dc]
+        out_vec += partial
+        idx += BLOCK_N
+
+    tl.store(out_ptr + (pid_b * N + pid_h) * Dc + tl.arange(0, Dc), out_vec)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, sm_scale=1.0, block_n=128):
+        super().__init__()
+        self.sm_scale = float(sm_scale)
+        self.block_n = block_n
+
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices):
+        """
+        Triton-only forward:
+        - q_nope: [B, N, 512], bfloat16
+        - q_pe: [B, N, 64], bfloat16
+        - ckv_cache: [P, 1, 512], bfloat16 (squeeze handled inside)
+        - kpe_cache: [P, 1, 64], bfloat16 (squeeze handled inside)
+        - kv_indptr: [B+1], int32
+        - kv_indices: [M], int32 (M can be large; actual M per batch is kv_indptr[b+1]-kv_indptr[b])
+        Returns:
+        - output: [B, N, 512], bfloat16
+        - lse: [B, N], float32 (base-2 logsumexp)
+        """
+        assert q_nope.dim() == 3 and q_nope.shape[-1] == 512
+        assert q_pe.dim() == 3 and q_pe.shape[-1] == 64
+        assert ckv_cache.dim() == 3 and ckv_cache.shape[-1] == 512
+        assert kpe_cache.dim() == 3 and kpe_cache.shape[-1] == 64
+        assert kv_indptr.dim() == 1 and kv_indptr.dtype == torch.int32
+        assert kv_indices.dim() == 1 and kv_indices.dtype == torch.int32
+
+        B = q_nope.shape[0]
+        N = q_nope.shape[1]
+        Dc = q_nope.shape[2]  # 512
+        Dp = q_pe.shape[2]    # 64
+        P = ckv_cache.shape[0]
+
+        device = q_nope.device
+        # Prepare Kc_all and Kp_all (flat subsets per batch)
+        # Note: we will create subset per batch b on the fly by passing Kc_ptr/Kp_ptr
+        # but for the kernels we need contiguous flattened arrays of the whole cache.
+        # Squeeze dummy dim
+        Kc_all = ckv_cache.to(torch.float32).squeeze(1).contiguous()  # [P, Dc]
+        Kp_all = kpe_cache.to(torch.float32).squeeze(1).contiguous()  # [P, Dp]
+
+        # Allocate outputs
+        output = torch.empty((B, N, Dc), dtype=torch.float32, device=device)  # we'll write float32 and cast to bfloat16 at the end
+        lse = torch.empty((B, N), dtype=torch.float32, device=device)
+
+        # attn as float32 buffer [B, N, max_tokens], but we don't know max_tokens across batches. We'll compute per batch using kernel.
+        # We instead will allocate attn per batch iteration, but Triton grid needs static shapes. So we do per-batch loops on host:
+        # Loop over batches: Triton only for kernel; host orchestrates.
+        # However, Triton kernels must be launched with static grid. We can launch one kernel per batch b, grid (N,) to avoid a 3D attn allocation.
+        # Strategy: For each b, we launch the fused kernel with grid (N,), and it will compute lse and attn[b, :, :], then we launch matvec for each h in N.
+
+        for b in range(B):
+            # Determine M_b and tok_idx for this batch
+            start = int(kv_indptr[b].item())
+            end = int(kv_indptr[b + 1].item())
+            M_b = end - start
+            if M_b <= 0:
+                # No KV entries for this batch: output zeros, lse -inf
+                lse[b] = float("-inf")
+                # We need to fill output zeros for all heads. We can compute a dummy out for each head h, but since M_b=0, out will be zeros by default.
+                # However, to be precise, let's explicitly set:
+                # We don't have Kc_sub when M_b=0, but we can compute out zeros. Since we didn't store lse yet, set output[b, :, :] to 0 here.
+                output[b] = 0.0
+                continue
+
+            tok_idx = kv_indices[start:end].to(torch.int32)
+            # Create subsets Kc_sub and Kp_sub
+            Kc_sub = Kc_all[tok_idx].contiguous()  # [M_b, Dc]
+            Kp_sub = Kp_all[tok_idx].contiguous()  # [M_b, Dp]
+
+            # Cast q_nope and q_pe rows to float32
+            qn_flat = q_nope[b].to(torch.float32).contiguous()   # [N, Dc]
+            qp_flat = q_pe[b].to(torch.float32).contiguous()     # [N, Dp]
+
+            # Allocate attn for this batch (we won't store it in output; only used in matvec kernel)
+            attn = torch.empty((N, M_b), dtype=torch.float32, device=device)
+            # Run fused kernel: one program per head h in 0..N-1
+            grid = (N,)
+            fused_attn_and_lse_kernel[grid](
+                qn_flat, qp_flat, Kc_sub, Kp_sub, attn, lse[b].contiguous(),  # attn and lse are 1D per b
+                B, N, Dc, Dp, M_b, self.sm_scale,
+                BLOCK_N=self.block_n
+            )
+
+            # Now compute out[b, h, :] for each h via matvec kernel: one program per (b,h)
+            out_b = torch.empty((N, Dc), dtype=torch.float32, device=device)
+            grid_proj = (B, N)
+            matvec_proj_kernel[grid_proj](
+                attn, Kc_sub, out_b,
+                B, N, Dc, M_b, self.block_n
+            )
+
+            # Store the per-head outputs in the main output tensor
+            output[b] = out_b  # out_b shape [N, Dc], output shape [B, N, Dc]
+
+        # Cast output to bfloat16 to match original
+        output = output.to(torch.bfloat16)
+
+        return output, lse

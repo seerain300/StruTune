@@ -1,0 +1,227 @@
+import math
+import torch
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+# Triton kernel: compute output (vector of length Dc) and lse (scalar) for a single (b, h).
+# Assumptions: qn: [Dc], qp: [Dp], Kc: [L_tokens, Dc], Kp: [L_tokens, Dp].
+@triton.jit
+def _compute_single_head(
+    qn_ptr, qp_ptr, Kc_ptr, Kp_ptr,
+    out_ptr, lse_ptr,
+    H: tl.constexpr, Dc: tl.constexpr, Dp: tl.constexpr, L_tokens: tl.constexpr,
+    sm_scale: tl.float32
+):
+    # This kernel computes output vector out[h, :] and stores lse[h].
+    # It loops over tokens to build logits, then recomputes attention, and finally accumulates output.
+
+    # Prepare accumulators
+    out_vec = tl.zeros([Dc], dtype=tl.float32)  # final output vector for this head
+    max_logit = -float("inf")
+    sum_exp = 0.0
+
+    # First pass: compute logits vector, find max for numerics, accumulate sum_exp for lse.
+    for t in tl.static_range(L_tokens):
+        sum_qn = 0.0
+        sum_qp = 0.0
+        # Compute qn @ Kc[t, :]
+        for i in tl.static_range(Dc):
+            qn_i = tl.load(qn_ptr + i)  # qn[i]
+            Kc_t_i = tl.load(Kc_ptr + t * Dc + i)  # Kc[t, i]
+            sum_qn += qn_i * Kc_t_i
+        # Compute qp @ Kp[t, :]
+        for j in tl.static_range(Dp):
+            qp_j = tl.load(qp_ptr + j)  # qp[j]
+            Kp_t_j = tl.load(Kp_ptr + t * Dp + j)  # Kp[t, j]
+            sum_qp += qp_j * Kp_t_j
+        logits_t = sum_qn + sum_qp
+        scaled = logits_t * sm_scale
+        # Update max for lse
+        if scaled > max_logit:
+            max_logit = scaled
+        # Accumulate sum of exp for lse
+        sum_exp += tl.exp(scaled)
+
+    # Compute lse = max + log(sum_exp) / ln(2)
+    ln2 = 1.4426950408889634  # 1 / log(2)
+    lse_val = max_logit + tl.log(sum_exp) / ln2
+    # Store lse (per head)
+    tl.store(lse_ptr, lse_val)
+
+    # Second pass: compute attention and accumulate output vector
+    for t in tl.static_range(L_tokens):
+        sum_qn = 0.0
+        sum_qp = 0.0
+        # Recompute logits for this token to get attention
+        for i in tl.static_range(Dc):
+            qn_i = tl.load(qn_ptr + i)
+            Kc_t_i = tl.load(Kc_ptr + t * Dc + i)
+            sum_qn += qn_i * Kc_t_i
+        for j in tl.static_range(Dp):
+            qp_j = tl.load(qp_ptr + j)
+            Kp_t_j = tl.load(Kp_ptr + t * Dp + j)
+            sum_qp += qp_j * Kp_t_j
+        logits_t = sum_qn + sum_qp
+        scaled = logits_t * sm_scale
+        attn_t = tl.exp(scaled - lse_val) / ln2
+        # Accumulate output: out[h, i] += attn_t * Kc[t, i]
+        for i in tl.static_range(Dc):
+            Kc_t_i = tl.load(Kc_ptr + t * Dc + i)
+            out_vec[i] += attn_t * Kc_t_i
+
+    # Store output vector as bfloat16
+    # out_ptr points to the start of out[b, h, :], a contiguous [Dc] vector
+    for i in tl.static_range(Dc):
+        tl.store(out_ptr + i, tl.cast(out_vec[i], tl.bfloat16))
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale):
+        # Prepare data on the same device
+        device = q_nope.device
+        assert q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
+        B, H, Dc = q_nope.shape
+        _, H2, Dp = q_pe.shape
+        assert H == H2, "num_qo_heads must match between q_nope and q_pe"
+        # Constants
+        assert H == 16, "num_qo_heads must be 16"
+        assert Dc == 512, "head_dim_ckv must be 512"
+        assert Dp == 64, "head_dim_kpe must be 64"
+
+        num_pages = ckv_cache.shape[0]
+        Kc_all = ckv_cache.squeeze(1).to(torch.float32)  # [num_pages, Dc]
+        Kp_all = kpe_cache.squeeze(1).to(torch.float32)  # [num_pages, Dp]
+
+        # Prepare output and lse
+        output = torch.empty((B, H, Dc), dtype=torch.bfloat16, device=device)
+        lse = torch.empty((B, H), dtype=torch.float32, device=device)
+
+        # Process each batch element and head in Triton
+        for b in range(B):
+            # Compute token range for this batch element
+            page_beg = int(kv_indptr[b].item())
+            page_end = int(kv_indptr[b + 1].item())
+            L_tokens = page_end - page_beg
+            if L_tokens <= 0:
+                # No tokens: output zeros and lse = -inf
+                output[b].zero_()
+                lse[b].fill_(-float("inf"))
+                continue
+
+            tok_idx = kv_indices[page_beg:page_end].to(torch.long)  # [L_tokens]
+            Kc = Kc_all[tok_idx]  # [L_tokens, Dc], contiguous
+            Kp = Kp_all[tok_idx]  # [L_tokens, Dp], contiguous
+
+            # qn and qp for each head
+            for h in range(H):
+                qn = q_nope[b, h, :].to(torch.float32).contiguous()  # [Dc]
+                qp = q_pe[b, h, :].to(torch.float32).contiguous()   # [Dp]
+
+                # Launch Triton kernel for this (b, h)
+                out_ptr = output[b, h, :].contiguous()
+                # Triton expects pointers; lse is a 1-element vector per head
+                lse_ptr = lse[b]  # scalar tensor in PyTorch
+
+                # Make sure Kc/Kp are contiguous
+                Kc_t = Kc.contiguous()
+                Kp_t = Kp.contiguous()
+
+                # Launch with grid = (1,) since we handle one (b,h) per program
+                _compute_single_head[(1,)](
+                    qn, qp, Kc_t, Kp_t,
+                    out_ptr, lse_ptr,
+                    H=H, Dc=Dc, Dp=Dp, L_tokens=L_tokens,
+                    sm_scale=float(sm_scale),
+                    num_warps=4,  # small problem sizes; adjust if needed
+                    num_stages=2
+                )
+
+        return output, lse
+
+
+# Original helper functions (for testing consistency if needed)
+@torch.no_grad()
+def run(q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale):
+    batch_size, num_qo_heads, head_dim_ckv = q_nope.shape
+    head_dim_kpe = q_pe.shape[-1]
+    page_size = ckv_cache.shape[1]
+    len_indptr = kv_indptr.shape[0]
+    num_kv_indices = kv_indices.shape[0]
+
+    # Check constants
+    assert num_qo_heads == 16
+    assert head_dim_ckv == 512
+    assert head_dim_kpe == 64
+    assert page_size == 1
+
+    # Check constraints
+    assert len_indptr == batch_size + 1
+    assert num_kv_indices == kv_indptr[-1].item()
+
+    device = q_nope.device
+
+    Kc_all = ckv_cache.squeeze(1).to(torch.float32)  # [num_pages, head_dim_ckv]
+    Kp_all = kpe_cache.squeeze(1).to(torch.float32)  # [num_pages, head_dim_kpe]
+
+    output = torch.zeros(
+        (batch_size, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=device
+    )
+    lse = torch.full((batch_size, num_qo_heads), -float("inf"), dtype=torch.float32, device=device)
+
+    for b in range(batch_size):
+        page_beg = int(kv_indptr[b].item())
+        page_end = int(kv_indptr[b + 1].item())
+
+        if page_beg >= page_end:
+            output[b].zero_()
+            continue
+
+        L_tokens = page_end - page_beg
+        tok_idx = kv_indices[page_beg:page_end].to(torch.long)  # [L_tokens]
+
+        Kc = Kc_all[tok_idx]  # [L_tokens, head_dim_ckv]
+        Kp = Kp_all[tok_idx]  # [L_tokens, head_dim_kpe]
+        qn = q_nope[b].to(torch.float32)  # [num_qo_heads, head_dim_ckv]
+        qp = q_pe[b].to(torch.float32)    # [num_qo_heads, head_dim_kpe]
+
+        for h in range(num_qo_heads):
+            logits = qn[h] @ Kc.T + qp[h] @ Kp.T  # [L_tokens]
+            logits_scaled = logits * sm_scale
+            lse[b, h] = torch.logsumexp(logits_scaled, dim=-1) / math.log(2.0)
+
+            attn = torch.softmax(logits_scaled, dim=-1)  # [L_tokens]
+            out = attn @ Kc  # [head_dim_ckv]
+            output[b, h, :] = out.to(torch.bfloat16)
+
+    return output, lse
+
+def get_inputs():
+    q_nope = torch.randn([1, 16, 512], dtype=torch.bfloat16)
+    q_pe = torch.randn([1, 16, 64], dtype=torch.bfloat16)
+    ckv_cache = torch.randn([989669, 1, 512], dtype=torch.bfloat16)
+    kpe_cache = torch.randn([989669, 1, 64], dtype=torch.bfloat16)
+    _n = 1; _t = 8
+    _lens = torch.full((_n,), _t // _n, dtype=torch.int32)
+    _lens[: _t % _n] += 1
+    kv_indptr = torch.cat([torch.zeros(1, dtype=torch.int32), torch.cumsum(_lens, 0)]).to(torch.int32)
+    kv_indices = torch.randint(0, 989669, [8], dtype=torch.int32)
+    sm_scale = 1.0  # float32 scalar
+    return [q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale]
+
+def fused_operator(tensor_0, tensor_1, tensor_2, tensor_3, tensor_4, tensor_5, tensor_6):
+    _out = ModelNew()(tensor_0, tensor_1, tensor_2, tensor_3, tensor_4, tensor_5, tensor_6)
+    return list(_out) if isinstance(_out, (tuple, list)) else [_out]
+
+# Original Model (not used in evaluation, kept for reference)
+class Model(torch.nn.Module):
+    def forward(self, *args):
+        return run(*args)

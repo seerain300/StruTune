@@ -1,0 +1,230 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def concat_kernel(
+    e_ptr,          # *const float: [B, T, H]
+    i_ptr,          # *const float: [B, I, H]
+    out_ptr,        # *float: [B, T+I, H]
+    B: tl.int32, T: tl.int32, I: tl.int32, H: tl.int32,
+    e_s0, e_s1, e_s2,   # strides for e_ptr
+    i_s0, i_s1, i_s2,   # strides for i_ptr
+    o_s0, o_s1, o_s2,   # strides for out_ptr
+    BLOCK_l: tl.constexpr, BLOCK_h: tl.constexpr,
+):
+    # Grid: (B, ceil((T+I)/BLOCK_l), ceil(H/BLOCK_h))
+    pid_b = tl.program_id(0)
+    pid_l = tl.program_id(1)
+    pid_h = tl.program_id(2)
+
+    # Offsets
+    l_offsets = pid_l * BLOCK_l + tl.arange(0, BLOCK_l)  # sequence positions [0, T+I)
+    h_offsets = pid_h * BLOCK_h + tl.arange(0, BLOCK_h)  # hidden dims [0, H)
+
+    # Validity masks
+    mask_l = l_offsets < (T + I)
+    mask_h = h_offsets < H
+
+    # Compute base pointers
+    # Output addressing: out[b, l, h] = (o_ptr + b*o_s0 + l*o_s1 + h*o_s2)
+    out_ptrs = out_ptr + pid_b * o_s0 + l_offsets[:, None] * o_s1 + h_offsets[None, :] * o_s2
+
+    # Source selection
+    # If l < T, take from e; else, take from i at index l - T
+    take_encoder = l_offsets < T
+    # Masks for loads
+    mask_e = (pid_b < B) & take_encoder & mask_l & mask_h
+    mask_i = (pid_b < B) & (~take_encoder) & mask_l & mask_h
+
+    # Compute e/i pointers
+    e_ptrs = e_ptr + pid_b * e_s0 + l_offsets[:, None] * e_s1 + h_offsets[None, :] * e_s2
+    i_ptrs = i_ptr + pid_b * i_s0 + (l_offsets[:, None] - T) * i_s1 + h_offsets[None, :] * i_s2
+
+    # Load with masks; for non-taken rows, load zeros
+    vals_e = tl.load(e_ptrs, mask=mask_e, other=0.0)
+    vals_i = tl.load(i_ptrs, mask=mask_i, other=0.0)
+    vals = tl.where(take_encoder[ :, None ], vals_e, vals_i)
+
+    # Store
+    tl.store(out_ptrs, vals, mask=mask_l[:, None] & mask_h[None, :])
+
+
+@triton.jit
+def matmul_kernel(
+    A_ptr,          # *const float: [M, H] where M = B*(T+I)
+    W_ptr,          # *const float: [H, H] (process_weight.T)
+    C_ptr,          # *float: [M, H]
+    M: tl.int32, H: tl.int32, K: tl.int32,   # K == H
+    A_s0, A_s1,     # strides for A_ptr
+    W_s0, W_s1,     # strides for W_ptr
+    C_s0, C_s1,     # strides for C_ptr
+    BLOCK_m: tl.constexpr, BLOCK_n: tl.constexpr, BLOCK_k: tl.constexpr,
+):
+    # Grid: (ceil(M/BLOCK_m), ceil(H/BLOCK_n))
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    m_offsets = pid_m * BLOCK_m + tl.arange(0, BLOCK_m)
+    n_offsets = pid_n * BLOCK_n + tl.arange(0, BLOCK_n)
+
+    mask_m = m_offsets < M
+    mask_n = n_offsets < H
+
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_m, BLOCK_n), dtype=tl.float32)
+
+    # Reduction over K in chunks
+    for k0 in range(0, K, BLOCK_k):
+        k_offsets = k0 + tl.arange(0, BLOCK_k)
+        mask_k = k_offsets < K
+
+        # Load A[m, k]
+        A_ptrs = A_ptr + m_offsets[:, None] * A_s0 + k_offsets[None, :] * A_s1
+        A_tile = tl.load(A_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+
+        # Load W[k, n]
+        W_ptrs = W_ptr + k_offsets[:, None] * W_s0 + n_offsets[None, :] * W_s1
+        W_tile = tl.load(W_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+
+        # Accumulate
+        acc += tl.dot(A_tile, W_tile)
+
+    # Store results
+    C_ptrs = C_ptr + m_offsets[:, None] * C_s0 + n_offsets[None, :] * C_s1
+    tl.store(C_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
+
+
+@triton.jit
+def copy_rows_kernel(
+    src_ptr,        # *const float: [B, ROWS, H], but we pass processed
+    dst_ptr,        # *float: [B, ROWS, H], but we pass processed_encoder or processed_hidden
+    B: tl.int32, ROWS: tl.int32, H: tl.int32,
+    s_s0, s_s1, s_s2,   # strides for src_ptr
+    d_s0, d_s1, d_s2,   # strides for dst_ptr
+    ROW_START: tl.int32, BLOCK_l: tl.constexpr, BLOCK_h: tl.constexpr,
+):
+    # Copy rows [ROW_START, ROW_START+ROWS) from src to dst for all batches
+    pid_b = tl.program_id(0)
+    pid_l = tl.program_id(1)
+    pid_h = tl.program_id(2)
+
+    l_offsets = pid_l * BLOCK_l + tl.arange(0, BLOCK_l)   # [0, ROWS)
+    h_offsets = pid_h * BLOCK_h + tl.arange(0, BLOCK_h)   # [0, H)
+
+    mask_l = (l_offsets + ROW_START) < (ROW_START + ROWS)
+    mask_h = h_offsets < H
+
+    # Build pointers
+    src_ptrs = src_ptr + pid_b * s_s0 + (l_offsets[:, None] + ROW_START) * s_s1 + h_offsets[None, :] * s_s2
+    dst_ptrs = dst_ptr + pid_b * d_s0 + l_offsets[:, None] * d_s1 + h_offsets[None, :] * d_s2
+
+    vals = tl.load(src_ptrs, mask=mask_l[:, None] & mask_h[None, :], other=0.0)
+    tl.store(dst_ptrs, vals, mask=mask_l[:, None] & mask_h[None, :])
+
+
+class ModelNew(torch.nn.Module):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        process_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Triton-optimized forward:
+        - Concatenate along sequence dim in Triton
+        - Linear projection (matmul) in Triton
+        - Split streams in Triton
+        Returns: (processed_encoder, processed_hidden)
+        """
+        assert hidden_states.is_cuda and encoder_hidden_states.is_cuda and process_weight.is_cuda, "Inputs must be CUDA tensors."
+        assert hidden_states.dtype == torch.float32 and encoder_hidden_states.dtype == torch.float32 and process_weight.dtype == torch.float32, "Use float32 tensors for consistency."
+
+        B, T, H = encoder_hidden_states.shape
+        Bi, I, Hi = hidden_states.shape
+        assert B == Bi, "Batch sizes must match."
+        assert H == Hi, "Hidden dimension must match."
+        assert process_weight.shape[0] == H and process_weight.shape[1] == H, "process_weight must be [H, H]."
+
+        # 1) Concatenate in Triton
+        L = T + I
+        concatenated = torch.empty((B, L, H), device=hidden_states.device, dtype=torch.float32)
+
+        BLOCK_l = 128
+        BLOCK_h = 128
+        grid_concat = (B, triton.cdiv(L, BLOCK_l), triton.cdiv(H, BLOCK_h))
+        concat_kernel[grid_concat](
+            encoder_hidden_states, hidden_states, concatenated,
+            B, T, I, H,
+            encoder_hidden_states.stride(0), encoder_hidden_states.stride(1), encoder_hidden_states.stride(2),
+            hidden_states.stride(0), hidden_states.stride(1), hidden_states.stride(2),
+            concatenated.stride(0), concatenated.stride(1), concatenated.stride(2),
+            BLOCK_l=BLOCK_l, BLOCK_h=BLOCK_h,
+            num_warps=4, num_stages=2,
+        )
+
+        # 2) Matmul: processed = concatenated @ process_weight.T
+        # Treat concatenated as [M, H] with M = B * L
+        M = B * L
+        K = H  # reduction dimension equals hidden dim
+        processed = torch.empty((M, H), device=hidden_states.device, dtype=torch.float32)
+
+        # We need A_ptr as [M, H], but concatenated is [B, L, H].
+        # Flatten A by viewing: since concatenated is contiguous in last dim (H), we can construct A pointer by mapping m -> b,l
+        # To pass A_ptr as [M,H], we rely on the fact that concatenated is contiguous in last dim; we can pass a flattened view of
+        # concatenated reshaped to [M,H] via constructing A_ptr = concatenated.view(M, H) and using its strides (s0=H, s1=1).
+        # However, Triton expects a proper pointer; simpler approach: we manually compute A's strides by interpreting concatenated as [M,H].
+        # We'll compute A's logical strides: s0 = H, s1 = 1.
+        A_s0 = H
+        A_s1 = 1
+        W_s0, W_s1 = process_weight.stride(0), process_weight.stride(1)  # process_weight.T has strides [H,H] (since process_weight is [H,H])
+
+        C_s0 = H  # since processed is [M,H], logical s0 = H, s1 = 1 for store
+        C_s1 = 1
+
+        BLOCK_m = 64
+        BLOCK_n = 128
+        BLOCK_k = 64
+        grid_matmul = (triton.cdiv(M, BLOCK_m), triton.cdiv(H, BLOCK_n))
+        matmul_kernel[grid_matmul](
+            concatenated, process_weight.t(), processed,
+            M, H, K,
+            A_s0, A_s1,
+            W_s0, W_s1,
+            C_s0, C_s1,
+            BLOCK_m=BLOCK_m, BLOCK_n=BLOCK_n, BLOCK_k=BLOCK_k,
+            num_warps=4, num_stages=2,
+        )
+
+        # 3) Split streams using Triton copy kernels
+        processed_encoder = torch.empty((B, T, H), device=hidden_states.device, dtype=torch.float32)
+        processed_hidden = torch.empty((B, I, H), device=hidden_states.device, dtype=torch.float32)
+
+        # Reshape processed [M,H] back to [B,L,H] to use copy rows; we can compute logical pointers by mapping m -> b,l:
+        # For m in [0, B*L), b = m // L, l = m % L
+        # We'll instead copy directly from processed into outputs by using a per-batch grid and computing b,l inside the kernel.
+
+        # For encoder rows: rows 0..T-1
+        grid_copy_encoder = (B, triton.cdiv(T, 64), triton.cdiv(H, 64))
+        copy_rows_kernel[grid_copy_encoder](
+            processed, processed_encoder,
+            B, T, H,
+            processed.stride(0), processed.stride(1), processed.stride(2),
+            processed_encoder.stride(0), processed_encoder.stride(1), processed_encoder.stride(2),
+            ROW_START=0, BLOCK_l=64, BLOCK_h=64,
+            num_warps=4, num_stages=2,
+        )
+
+        # For hidden rows: rows T..T+I-1
+        grid_copy_hidden = (B, triton.cdiv(I, 64), triton.cdiv(H, 64))
+        copy_rows_kernel[grid_copy_hidden](
+            processed, processed_hidden,
+            B, I, H,
+            processed.stride(0), processed.stride(1), processed.stride(2),
+            processed_hidden.stride(0), processed_hidden.stride(1), processed_hidden.stride(2),
+            ROW_START=T, BLOCK_l=64, BLOCK_h=64,
+            num_warps=4, num_stages=2,
+        )
+
+        return processed_encoder, processed_hidden

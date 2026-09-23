@@ -1,0 +1,164 @@
+import torch
+import torch.nn.functional as F
+import math
+import triton
+import triton.language as tl
+
+
+def _ndtri(p: torch.Tensor) -> torch.Tensor:
+    """Inverse of the standard normal CDF (quantile function).
+    Uses Abramowitz and Stegun approximation (formula 26.2.23).
+    This is a rational approximation that works well for p in (0, 1).
+    """
+    # Constants for the approximation
+    a1 = -3.969683028665376e+01
+    a2 = 2.209460984245205e+02
+    a3 = -2.759285104469687e+02
+    a4 = 1.383577518672690e+02
+    a5 = -3.066479806614716e+01
+    a6 = 2.506628277459239e+00
+
+    b1 = -5.447609879822406e+01
+    b2 = 1.615858368580409e+02
+    b3 = -1.556989798598866e+02
+    b4 = 6.680131188771972e+01
+    b5 = -1.328068155288572e+01
+
+    c1 = -7.784894002430293e-03
+    c2 = -3.223964580411365e-01
+    c3 = -2.400758277161838e+00
+    c4 = -2.549732539343734e+00
+    c5 = 4.374664141464968e+00
+    c6 = 2.938163982698783e+00
+
+    d1 = 7.784695709041462e-03
+    d2 = 3.224671290700398e-01
+    d3 = 2.445134137142996e+00
+    d4 = 3.754408661907416e+00
+
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+
+    result = torch.zeros_like(p)
+
+    # Lower region
+    mask_low = p < p_low
+    q = torch.sqrt(-2.0 * torch.log(p[mask_low]))
+    result[mask_low] = (((((c1*q + c2)*q + c3)*q + c4)*q + c5)*q + c6) / \
+                       ((((d1*q + d2)*q + d3)*q + d4)*q + 1.0)
+
+    # Central region
+    mask_mid = (p >= p_low) & (p <= p_high)
+    q = p[mask_mid] - 0.5
+    r = q * q
+    result[mask_mid] = (((((a1*r + a2)*r + a3)*r + a4)*r + a5)*r + a6)*q / \
+                       (((((b1*r + b2)*r + b3)*r + b4)*r + b5)*r + 1.0)
+
+    # Upper region
+    mask_high = p > p_high
+    q = torch.sqrt(-2.0 * torch.log(1.0 - p[mask_high]))
+    result[mask_high] = -(((((c1*q + c2)*q + c3)*q + c4)*q + c5)*q + c6) / \
+                        ((((d1*q + d2)*q + d3)*q + d4)*q + 1.0)
+
+    return result
+
+
+@triton.jit
+def relu_threshold_kernel(
+    x_ptr,                 # *float32, input tensor (float32)
+    mean_ptr,              # *float32, per-(b, s) mean
+    std_ptr,               # *float32, per-(b, s) std
+    invnorm,               # float32 scalar multiplier
+    out_ptr,               # *float32, output tensor
+    B, S, F,               # int sizes
+    stride_b, stride_s, stride_f,  # strides (in elements)
+    BLOCK_F: tl.constexpr,
+):
+    # 3D launch: (B, S, cdiv(F, BLOCK_F))
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+    chunk = tl.program_id(2)
+
+    start = chunk * BLOCK_F
+    offs = start + tl.arange(0, BLOCK_F)
+    mask = offs < F
+
+    base = b * stride_b + s * stride_s
+    x = tl.load(x_ptr + base + offs * stride_f, mask=mask, other=0.0)
+
+    # Load mean and std for this (b, s)
+    mean_val = tl.load(mean_ptr + (b * S + s))
+    std_val = tl.load(std_ptr + (b * S + s))
+
+    cutoff = mean_val + std_val * invnorm
+    y = x - cutoff
+    y = tl.maximum(y, 0.0)  # ReLU
+
+    tl.store(out_ptr + base + offs * stride_f, y, mask=mask)
+
+
+@torch.no_grad()
+def run(inputs: torch.Tensor, target_sparsity: float) -> torch.Tensor:
+    """
+    Gaussian-based top-k sparse activation.
+    Computes adaptive sparsity threshold based on input statistics:
+    1) Compute mean and std of input across feature dimension
+    2) Calculate threshold = mean + std * norm.icdf(target_sparsity)
+    3) Apply ReLU(input - threshold) to create sparse activations
+    Returns: tensor of same shape as input, in bfloat16.
+    """
+    # Early return if no sparsity requested
+    if target_sparsity == 0.0:
+        return inputs
+
+    # Compute in float32 for numerical stability
+    inputs_f32 = inputs.to(torch.float32).contiguous()
+    B, S, F = inputs_f32.shape
+
+    # Compute per-(b, s) mean and std along feature dimension
+    inputs_mean = torch.mean(inputs_f32, dim=-1, keepdim=True)  # [B, S, 1]
+    inputs_std = torch.std(inputs_f32, dim=-1, keepdim=True, unbiased=False)  # [B, S, 1]
+
+    # Compute invnorm(target_sparsity) via A&S approximation (scalar)
+    invnorm_multiplier = _ndtri(torch.tensor(target_sparsity, dtype=torch.float32, device=inputs.device))
+
+    # Flatten for kernel launch and prepare output
+    x = inputs_f32.view(B * S, F)
+    mean = inputs_mean.view(B * S)
+    std = inputs_std.view(B * S)
+    out_f32 = torch.empty_like(x)
+
+    # Launch Triton elementwise kernel
+    BLOCK_F = 1024
+    grid = (B, S, triton.cdiv(F, BLOCK_F))
+    relu_threshold_kernel[grid](
+        x, mean, std, float(invnorm_multiplier.item()), out_f32,
+        B, S, F,
+        x.stride(0), x.stride(1), x.stride(1),  # note: feature stride in flattened x is 1
+        BLOCK_F=BLOCK_F,
+        num_warps=4,
+        num_stages=2
+    )
+
+    # Reshape back to [B, S, F]
+    out_f32 = out_f32.view(B, S, F)
+
+    # Return in bfloat16 to match original behavior
+    return out_f32.to(torch.bfloat16)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, *args):
+        # Preserve original signature: run(inputs, target_sparsity)
+        # The evaluator passes two tensors; we delegate to run.
+        if len(args) == 2:
+            return run(args[0], float(args[1]))
+        elif len(args) == 1:
+            # Default sparsity if only one argument is provided
+            return run(args[0], 0.01)
+        else:
+            # If more args, assume second is target_sparsity
+            if len(args) > 1 and isinstance(args[1], (float, int)):
+                return run(args[0], float(args[1]))
+            # Fallback
+            return run(args[0], 0.01)

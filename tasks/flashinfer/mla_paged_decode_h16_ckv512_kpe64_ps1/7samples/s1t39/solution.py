@@ -1,0 +1,197 @@
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def attn_logits_kernel(
+    qn_ptr,             # *float32, [D]
+    qp_ptr,             # *float32, [Dp]
+    Kc_ptr,             # *float32, [L, D], row-major
+    Kp_ptr,             # *float32, [L, Dp], row-major
+    logits_ptr,         # *float32, [L]
+    L: tl.int32,        # number of tokens
+    D: tl.int32,        # head_dim_ckv
+    Dp: tl.int32,       # head_dim_kpe
+    scale: tl.float32,  # sm_scale
+    BLOCK_K: tl.constexpr
+):
+    # One program per token i
+    i = tl.program_id(0)
+    acc = 0.0
+    # Reduce over Kc dimension
+    for k in range(0, D, BLOCK_K):
+        k_off = k + tl.arange(0, BLOCK_K)
+        mask_k = k_off < D
+        qn_slice = tl.load(qn_ptr + k_off, mask=mask_k, other=0.0)  # [BLOCK_K]
+        kc_ptrs = Kc_ptr + i * D + k_off
+        kc = tl.load(kc_ptrs, mask=mask_k, other=0.0)               # [BLOCK_K]
+        acc += tl.sum(qn_slice * kc, axis=0)
+    # Reduce over Kp dimension
+    for k in range(0, Dp, BLOCK_K):
+        k_off = k + tl.arange(0, BLOCK_K)
+        mask_k = k_off < Dp
+        qp_slice = tl.load(qp_ptr + k_off, mask=mask_k, other=0.0)  # [BLOCK_K]
+        kp_ptrs = Kp_ptr + i * Dp + k_off
+        kp = tl.load(kp_ptrs, mask=mask_k, other=0.0)               # [BLOCK_K]
+        acc += tl.sum(qp_slice * kp, axis=0)
+    # Apply scale
+    acc = acc * scale
+    tl.store(logits_ptr + i, acc)
+
+
+@triton.jit
+def lse_base2_kernel(
+    logits_ptr,       # *float32, [L]
+    L: tl.int32,
+    out_lse_ptr,      # *float32, [1]
+    scale: tl.float32  # 1/ln(2) = log(2)
+):
+    # First pass: find max
+    m = tl.full((), -float("inf"), tl.float32)
+    for i in range(0, L):
+        val = tl.load(logits_ptr + i)
+        if val > m:
+            m = val
+    # Second pass: sum exp(val - m)
+    s = 0.0
+    for i in range(0, L):
+        val = tl.load(logits_ptr + i)
+        s += tl.exp((val - m) * scale)
+    lse = tl.log(s) * scale  # logsumexp_base2 = log(sum(exp((v - m)/ln(2)))) / ln(2) -> log(s) * scale
+    tl.store(out_lse_ptr, lse)
+
+
+@triton.jit
+def softmax_base2_kernel(
+    logits_ptr,        # *float32, [L]
+    lse_ptr,           # *float32, [1]
+    attn_ptr,          # *float32, [L]
+    L: tl.int32,
+    scale: tl.float32  # 1/ln(2)
+):
+    # Load lse
+    lse = tl.load(lse_ptr)
+    for i in range(0, L):
+        val = tl.load(logits_ptr + i)
+        attn = tl.exp((val - lse) * scale)
+        tl.store(attn_ptr + i, attn)
+
+
+@triton.jit
+def matvec_kernel(
+    attn_ptr,          # *float32, [L]
+    Kc_ptr,            # *float32, [L, D], row-major
+    y_ptr,             # *float32, [D]
+    D: tl.int32,
+    L: tl.int32,
+    BLOCK_K: tl.constexpr
+):
+    # One program per output dimension h
+    h = tl.program_id(0)
+    acc = 0.0
+    for i in range(0, L):
+        attn_i = tl.load(attn_ptr + i)
+        # Load Kc[i, h]
+        k_off = tl.arange(0, BLOCK_K) + h  # single element reduction
+        kc = tl.load(Kc_ptr + i * D + h)
+        acc += attn_i * kc
+    tl.store(y_ptr + h, acc)
+
+
+def run(q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale):
+    # Ensure inputs are on CUDA
+    device = q_nope.device
+    batch_size = q_nope.shape[0]
+    D = q_nope.shape[2]
+    Dp = q_pe.shape[2]
+
+    output = torch.empty((batch_size, 16, D), dtype=torch.bfloat16, device=device)
+    lse = torch.empty((batch_size, 16), dtype=torch.float32, device=device)
+
+    for b in range(batch_size):
+        # Determine token range
+        L = int(kv_indptr[b + 1].item()) - int(kv_indptr[b].item())
+        if L <= 0:
+            # No tokens for this batch
+            lse[b] = -float("inf")
+            continue
+
+        # Gather selected tokens
+        tokens = kv_indices[b:b + L]
+        Kc_selected = ckv_cache.squeeze(1).to(torch.float32)[tokens]  # [L, D]
+        Kp_selected = kpe_cache.squeeze(1).to(torch.float32)[tokens]  # [L, Dp]
+
+        # For each head j
+        for j in range(16):
+            # 1) Compute logits[j, :] = qn[j] · Kc_selected + qp[j] · Kp_selected
+            qn = q_nope[b, j, :].to(torch.float32).contiguous()
+            qp = q_pe[b, j, :].to(torch.float32).contiguous()
+            logits = torch.empty(L, dtype=torch.float32, device=device)
+
+            # Launch attn_logits_kernel
+            attn_logits_kernel[(L,)](
+                qn, qp, Kc_selected, Kp_selected, logits,
+                L, D, Dp, sm_scale,
+                BLOCK_K=128
+            )
+
+            # 2) Compute base-2 logsumexp of logits_scaled = logits * sm_scale
+            out_lse = torch.empty(1, dtype=torch.float32, device=device)
+            lse_base2_kernel[(1,)](
+                logits, L, out_lse, 1.0 / math.log(2.0)
+            )
+            lse[b, j] = out_lse[0]
+
+            # 3) Compute attention weights attn[j, :]
+            attn = torch.empty(L, dtype=torch.float32, device=device)
+            softmax_base2_kernel[(L,)](
+                logits, lse[b, j], attn, L, 1.0 / math.log(2.0)
+            )
+
+            # 4) Compute out[b, j, :] = attn[j, :] @ Kc_selected[:, :]
+            y = torch.empty(D, dtype=torch.float32, device=device)
+            matvec_kernel[(D,)](
+                attn, Kc_selected, y, D, L,
+                BLOCK_K=128
+            )
+            output[b, j, :] = y.to(torch.bfloat16)
+
+    return output, lse
+
+
+# Helper for local testing (non-recursive)
+def get_inputs():
+    device = 'cuda'
+    batch_size = 1
+    D = 512
+    Dp = 64
+    L = 8
+    q_nope = torch.randn([batch_size, 16, D], dtype=torch.bfloat16, device=device)
+    q_pe = torch.randn([batch_size, 16, Dp], dtype=torch.bfloat16, device=device)
+    ckv_cache = torch.randn([989669, 1, D], dtype=torch.bfloat16, device=device)
+    kpe_cache = torch.randn([989669, 1, Dp], dtype=torch.bfloat16, device=device)
+    kv_indptr = torch.tensor([0, L], dtype=torch.int32, device=device)
+    kv_indices = torch.randint(0, 989669, [L], dtype=torch.int32, device=device)
+    sm_scale = 1.0
+    return [q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale]
+
+
+def fused_operator(tensor_0, tensor_1, tensor_2, tensor_3, tensor_4, tensor_5, tensor_6):
+    _out = run(tensor_0, tensor_1, tensor_2, tensor_3, tensor_4, tensor_5, tensor_6)
+    return list(_out) if isinstance(_out, (tuple, list)) else [_out]
+
+
+# Entry point for evaluator
+class ModelNew(torch.nn.Module):
+    def forward(self, *args):
+        # Ensure tensors are on CUDA before launching Triton kernels
+        for i in range(len(args)):
+            if isinstance(args[i], torch.Tensor) and args[i].device.type != 'cuda':
+                args[i] = args[i].to('cuda')
+        return run(*args)
+
+
+def run(*args):
+    return ModelNew()(*args)

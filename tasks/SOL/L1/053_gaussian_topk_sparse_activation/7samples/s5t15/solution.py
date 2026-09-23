@@ -1,0 +1,199 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def row_sum_kernel(X_ptr, Sum_ptr, S, H, BLOCK_SIZE: tl.constexpr):
+    # One program per row (S rows)
+    row_id = tl.program_id(0)
+    # Accumulator for sum of the row
+    acc = tl.zeros((), dtype=tl.float32)
+    # Iterate over the feature dimension H in chunks
+    for off in range(0, H, BLOCK_SIZE):
+        idx = off + tl.arange(0, BLOCK_SIZE)
+        mask = idx < H
+        # Compute linear index for row-major [S, H]
+        X_row_ptr = X_ptr + row_id * H + idx
+        vals = tl.load(X_row_ptr, mask=mask, other=0.0)
+        acc += tl.sum(vals, axis=0)
+    # Store the sum for this row
+    tl.store(Sum_ptr + row_id, acc)
+
+
+@triton.jit
+def row_sumsq_kernel(X_ptr, SumSq_ptr, S, H, BLOCK_SIZE: tl.constexpr):
+    row_id = tl.program_id(0)
+    acc = tl.zeros((), dtype=tl.float32)
+    for off in range(0, H, BLOCK_SIZE):
+        idx = off + tl.arange(0, BLOCK_SIZE)
+        mask = idx < H
+        X_row_ptr = X_ptr + row_id * H + idx
+        vals = tl.load(X_row_ptr, mask=mask, other=0.0)
+        acc += tl.sum(vals * vals, axis=0)
+    tl.store(SumSq_ptr + row_id, acc)
+
+
+@triton.jit
+def mean_std_kernel(Sum_ptr, SumSq_ptr, Mean_ptr, Std_ptr, S, H):
+    # Compute mean and std for each of S rows
+    for i in range(0, S):
+        s = tl.load(Sum_ptr + i)  # sum
+        ss = tl.load(SumSq_ptr + i)  # sum of squares
+        mean = s / H
+        var = ss / H - mean * mean
+        # std = sqrt(var); var should be non-negative due to population variance
+        std = tl.sqrt(var)
+        tl.store(Mean_ptr + i, mean)
+        tl.store(Std_ptr + i, std)
+
+
+@triton.jit
+def ndtri_vector_kernel(p_ptr, z_ptr, BLOCK_SIZE: tl.constexpr):
+    # p_ptr: pointer to a single float32 (target_sparsity)
+    # z_ptr: pointer to a single float32 output
+    p = tl.load(p_ptr)
+    # Abramowitz & Stegun 7.1.26 approximation constants
+    a1 = -3.969683028665376e+01
+    a2 = 2.209460984245205e+02
+    a3 = -2.759285104469687e+02
+    a4 = 1.383577518672690e+02
+    a5 = -3.066479806614716e+01
+    a6 = 2.506628277459239e+00
+
+    b1 = -5.447609879822406e+01
+    b2 = 1.615858368580409e+02
+    b3 = -1.556989798598866e+02
+    b4 = 6.680131188771972e+01
+    b5 = -1.328068155288572e+01
+
+    c1 = -7.784894002430293e-03
+    c2 = -3.223964580411365e-01
+    c3 = -2.400758277161838e+00
+    c4 = -2.549732539343734e+00
+    c5 = 4.374664141464968e+00
+    c6 = 2.938163982698783e+00
+
+    d1 = 7.784695709041462e-03
+    d2 = 3.224671290700398e-01
+    d3 = 2.445134137142996e+00
+    d4 = 3.754408661907416e+00
+
+    # Piecewise logic using masks
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+    low = p < p_low
+    mid = (p >= p_low) & (p <= p_high)
+    high = p > p_high
+
+    # Lower region
+    q_low = tl.sqrt(-2.0 * tl.log(p))
+    z_low = (((((c1 * q_low + c2) * q_low + c3) * q_low + c4) * q_low + c5) * q_low + c6) / \
+            ((((d1 * q_low + d2) * q_low + d3) * q_low + d4) * q_low + 1.0)
+
+    # Central region
+    q_mid = p - 0.5
+    r_mid = q_mid * q_mid
+    poly_mid = (((((a1 * r_mid + a2) * r_mid + a3) * r_mid + a4) * r_mid + a5) * r_mid + a6) * q_mid
+    poly_mid = poly_mid / (((((b1 * r_mid + b2) * r_mid + b3) * r_mid + b4) * r_mid + b5) * r_mid + 1.0)
+
+    # Upper region
+    q_high = tl.sqrt(-2.0 * tl.log(1.0 - p))
+    z_high = -(((((c1 * q_high + c2) * q_high + c3) * q_high + c4) * q_high + c5) * q_high + c6) / \
+             ((((d1 * q_high + d2) * q_high + d3) * q_high + d4) * q_high + 1.0)
+
+    z = tl.zeros((), dtype=tl.float32)
+    z = tl.where(low, z_low, z)
+    z = tl.where(mid, poly_mid, z)
+    z = tl.where(high, z_high, z)
+    tl.store(z_ptr, z)
+
+
+@triton.jit
+def compute_thresholds_kernel(Mean_ptr, Std_ptr, z_scalar_ptr, Thresholds_ptr, S):
+    # Compute thresholds[i] = Mean[i] + Std[i] * z_scalar for i in [0, S)
+    z = tl.load(z_scalar_ptr)
+    for i in range(0, S):
+        mean = tl.load(Mean_ptr + i)
+        std = tl.load(Std_ptr + i)
+        th = mean + std * z
+        tl.store(Thresholds_ptr + i, th)
+
+
+@triton.jit
+def gate_relu_kernel(X_ptr, Thresholds_ptr, Out_ptr, S, L, H, BLOCK_SIZE: tl.constexpr):
+    # 2D grid: axis 0 over rows (S), axis 1 over feature tiles
+    row_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+    # Compute the column indices for this tile
+    off = tile_id * BLOCK_SIZE
+    idx = off + tl.arange(0, BLOCK_SIZE)
+    mask = idx < H
+    # Row-major flattened: element index = row_id * H + idx
+    X_row_ptr = X_ptr + row_id * H + idx
+    th_row = tl.load(Thresholds_ptr + row_id)
+    vals = tl.load(X_row_ptr, mask=mask, other=0.0)
+    gate = vals - th_row
+    # ReLU: max(0, gate)
+    gate = tl.maximum(gate, 0.0)
+    Out_row_ptr = Out_ptr + row_id * H + idx
+    tl.store(Out_row_ptr, gate, mask=mask)
+
+
+def _run_triton(X: torch.Tensor, target_sparsity: float):
+    # Ensure CUDA tensor and float32 compute
+    if not X.is_cuda:
+        raise RuntimeError("Input must be a CUDA tensor.")
+    # Flatten to [S, H], where S = B * L, H = last dim
+    B, L, H = X.shape
+    X_flat = X.view(-1, H).contiguous()
+    # Compute sum and sumsq via Triton kernels
+    S = B * L
+    sum_rows = torch.empty(S, dtype=torch.float32, device=X.device)
+    sumsq_rows = torch.empty(S, dtype=torch.float32, device=X.device)
+
+    # Launch reduction kernels
+    BLOCK_SIZE = 1024  # good for typical H up to 16K or more
+    grid_sum = (S,)
+    row_sum_kernel[grid_sum](X_flat, sum_rows, S, H, BLOCK_SIZE=BLOCK_SIZE, num_warps=4)
+    row_sumsq_kernel[grid_sum](X_flat, sumsq_rows, S, H, BLOCK_SIZE=BLOCK_SIZE, num_warps=4)
+
+    # Compute mean and std in Triton
+    mean_rows = torch.empty(S, dtype=torch.float32, device=X.device)
+    std_rows = torch.empty(S, dtype=torch.float32, device=X.device)
+    mean_std_kernel[(S,)](sum_rows, sumsq_rows, mean_rows, std_rows, S, H)
+
+    # Compute z = _ndtri(target_sparsity) on device via Triton vector kernel
+    sp_tensor = torch.empty(1, dtype=torch.float32, device=X.device)
+    sp_tensor[0] = float(target_sparsity)
+    z_scalar = torch.empty(1, dtype=torch.float32, device=X.device)
+    ndtri_vector_kernel[(1,)](sp_tensor, z_scalar, BLOCK_SIZE=1, num_warps=1)
+
+    # Compute per-row thresholds
+    thresholds = torch.empty(S, dtype=torch.float32, device=X.device)
+    compute_thresholds_kernel[(S,)](mean_rows, std_rows, z_scalar, thresholds, S)
+
+    # Elementwise gating
+    out_flat = torch.empty((S, H), dtype=torch.float32, device=X.device)
+    grid_gate = (S, triton.cdiv(H, BLOCK_SIZE))
+    gate_relu_kernel[grid_gate](X_flat, thresholds, out_flat, S, L, H, BLOCK_SIZE=BLOCK_SIZE, num_warps=4)
+
+    # Reshape and cast to bfloat16 to match original behavior
+    out = out_flat.view(B, L, H).to(torch.bfloat16)
+    return out
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, *args):
+        # Expect a single 3D input tensor [batch_size, seq_len, intermediate_size]
+        if len(args) != 1:
+            raise RuntimeError("ModelNew expects a single 3D input tensor [B, L, H]")
+        inputs = args[0]
+        # Ensure CUDA tensor
+        if not inputs.is_cuda:
+            inputs = inputs.cuda()
+        return _run_triton(inputs, target_sparsity=0.1)  # default sparsity; configurable
+
+
+def run(*args):
+    return ModelNew()(*args)

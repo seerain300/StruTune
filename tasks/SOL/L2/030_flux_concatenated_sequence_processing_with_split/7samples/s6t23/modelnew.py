@@ -1,0 +1,128 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def cat_matmul_weightT_kernel(
+    encoder_ptr,  # [B, T, H], float32
+    hidden_ptr,   # [B, I, H], float32
+    weight_ptr,   # [H, H], float32
+    out_ptr,      # [B, T+I, H], float32
+    B: tl.int32, T: tl.int32, I: tl.int32, H: tl.int32,
+    stride_e_n: tl.int32, stride_e_s: tl.int32, stride_e_h: tl.int32,
+    stride_h_n: tl.int32, stride_h_s: tl.int32, stride_h_h: tl.int32,
+    stride_w_h: tl.int32, stride_w_k: tl.int32,
+    stride_out_n: tl.int32, stride_out_s: tl.int32, stride_out_h: tl.int32,
+    BLOCK_K: tl.constexpr,  # tile size over input features (H)
+    BLOCK_OUT: tl.constexpr # tile size over output features (H)
+):
+    # Grid is (B, T+I). Each program computes one output row (n, s).
+    pid_n = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    total_seq = T + I
+
+    # Determine which source to use based on s
+    is_encoder = pid_s < T
+
+    # Prepare output pointer for this row
+    out_row_ptr = out_ptr + pid_n * stride_out_n + pid_s * stride_out_s
+
+    # Accumulator for the output vector of length H
+    acc = tl.zeros((BLOCK_OUT,), dtype=tl.float32)
+
+    # Loop over input features H in tiles of BLOCK_K
+    k0 = 0
+    while k0 < H:
+        ks = k0 + tl.arange(0, BLOCK_K)  # [BLOCK_K]
+        mask_k = ks < H
+
+        # Load input row element: either from encoder or hidden
+        if is_encoder:
+            src_ptr = encoder_ptr + pid_n * stride_e_n + pid_s * stride_e_s
+            input_vec = tl.load(src_ptr + ks * stride_e_h, mask=mask_k, other=0.0)  # shape [BLOCK_K]
+        else:
+            src_ptr = hidden_ptr + pid_n * stride_h_n + (pid_s - T) * stride_h_s
+            input_vec = tl.load(src_ptr + ks * stride_h_h, mask=mask_k, other=0.0)  # shape [BLOCK_K]
+
+        # For each output feature h, accumulate acc[h] += input_vec[k] * weight[k, h]
+        h0 = 0
+        while h0 < H:
+            hs = h0 + tl.arange(0, BLOCK_OUT)  # [BLOCK_OUT]
+            mask_h = hs < H
+
+            # Load weight slice [BLOCK_K, BLOCK_OUT]: weight[ks, hs]
+            w_ptrs = weight_ptr + ks[:, None] * stride_w_h + hs[None, :] * stride_w_k
+            w_vals = tl.load(w_ptrs, mask=mask_k[:, None] & mask_h[None, :], other=0.0)  # shape [BLOCK_K, BLOCK_OUT]
+
+            # Compute partial dot product for this tile: sum over k of input_vec[k] * w_vals[k, :]
+            # input_vec is [BLOCK_K], w_vals is [BLOCK_K, BLOCK_OUT]
+            partial = tl.sum(input_vec[:, None] * w_vals, axis=0)  # shape [BLOCK_OUT]
+            acc += partial
+
+            h0 += BLOCK_OUT
+
+        k0 += BLOCK_K
+
+    # Store the accumulated output vector into out[n, s, :]
+    out_ptrs = out_row_ptr + tl.arange(0, BLOCK_OUT) * stride_out_h
+    mask_out = tl.arange(0, BLOCK_OUT) < H
+    tl.store(out_ptrs, acc, mask=mask_out)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, process_weight: torch.Tensor):
+        # Shapes:
+        # hidden_states: [B, I, H]
+        # encoder_hidden_states: [B, T, H]
+        # process_weight: [H, H]
+        B, I, H = hidden_states.shape
+        T, H_e, H = encoder_hidden_states.shape
+        assert H_e == H, "Hidden dimension must match between encoder and image streams"
+        assert process_weight.shape[0] == H and process_weight.shape[1] == H, "process_weight must be [H, H]"
+
+        # Ensure dtype is float32 for numerical consistency
+        # (You can remove this cast if your environment uses fp16/bf16)
+        if hidden_states.dtype != torch.float32:
+            hidden_states = hidden_states.float()
+        if encoder_hidden_states.dtype != torch.float32:
+            encoder_hidden_states = encoder_hidden_states.float()
+        if process_weight.dtype != torch.float32:
+            process_weight = process_weight.float()
+
+        # Make tensors contiguous for simple stride arithmetic
+        e = encoder_hidden_states.contiguous()
+        h = hidden_states.contiguous()
+        w = process_weight.contiguous()
+
+        # Allocate output tensor [B, T+I, H], contiguous
+        total_seq = T + I
+        out = torch.empty((B, total_seq, H), device=h.device, dtype=w.dtype).contiguous()
+
+        # Extract strides (PyTorch strides are in elements)
+        stride_e_n, stride_e_s, stride_e_h = e.stride(0), e.stride(1), e.stride(2)
+        stride_h_n, stride_h_s, stride_h_h = h.stride(0), h.stride(1), h.stride(2)
+        stride_w_h, stride_w_k = w.stride(0), w.stride(1)  # typically (H, 1) for [H, H]
+        stride_out_n, stride_out_s, stride_out_h = out.stride(0), out.stride(1), out.stride(2)
+
+        # Launch Triton kernel over (B, T+I)
+        BLOCK_K = 64    # tile size over input features (H)
+        BLOCK_OUT = 128 # tile size over output features (H)
+
+        grid = (B, total_seq)
+        cat_matmul_weightT_kernel[grid](
+            e, h, w, out,
+            B, T, I, H,
+            stride_e_n, stride_e_s, stride_e_h,
+            stride_h_n, stride_h_s, stride_h_h,
+            stride_w_h, stride_w_k,
+            stride_out_n, stride_out_s, stride_out_h,
+            BLOCK_K=BLOCK_K, BLOCK_OUT=BLOCK_OUT,
+            num_warps=4,
+        )
+
+        # Split into encoder and hidden outputs
+        processed_encoder = out[:, :T, :]
+        processed_hidden = out[:, T:, :]
+
+        return processed_encoder, processed_hidden

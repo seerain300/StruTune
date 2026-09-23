@@ -1,0 +1,142 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _concat_sequences_kernel(
+    out_ptr,           # *const T, shape [N, L_total, K]
+    encoder_ptr,       # *const T, shape [N, L_txt, K]
+    hidden_ptr,        # *const T, shape [N, L_img, K]
+    N, L_txt, L_img, K,
+    BLOCK_K: tl.constexpr,
+):
+    # Grid: (N, L_total, tiles_along_K)
+    n = tl.program_id(0)
+    t = tl.program_id(1)
+    tile_k = tl.program_id(2)
+
+    # Compute K offsets for this tile
+    k_offsets = tile_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask_k = k_offsets < K
+
+    # Determine source tensor based on t
+    is_encoder = t < L_txt
+    # Load from appropriate source
+    if is_encoder:
+        src_ptr = encoder_ptr + n * L_txt * K + t * K + k_offsets
+        src_vals = tl.load(src_ptr, mask=mask_k, other=0.0)
+    else:
+        src_ptr = hidden_ptr + n * L_img * K + (t - L_txt) * K + k_offsets
+        src_vals = tl.load(src_ptr, mask=mask_k, other=0.0)
+
+    # Store to output at position (n, t, :)
+    out_row_ptr = out_ptr + n * L_total * K + t * K + k_offsets
+    tl.store(out_row_ptr, src_vals, mask=mask_k)
+
+
+@triton.jit
+def _matmul_row_kernel(
+    C_rows_ptr,        # *T, shape [N_rows, K]
+    A_rows_ptr,        # *const T, shape [N_rows, K]
+    B_ptr,             # *const T, shape [K, K]
+    N_rows, K,         # int32
+    BLOCK_K: tl.constexpr,
+):
+    # Each program handles one row in A_rows (one (n, t) pair)
+    row_id = tl.program_id(0)
+    # Base pointers for this row
+    A_row_ptr = A_rows_ptr + row_id * K
+    C_row_ptr = C_rows_ptr + row_id * K
+
+    # Accumulator for this row
+    acc = tl.zeros([K], dtype=tl.float32)
+
+    start = 0
+    while start < K:
+        k_offsets = start + tl.arange(0, BLOCK_K)
+        mask_k = k_offsets < K
+
+        # Load A segment: A_row[start:start+BLOCK_K]
+        A_seg = tl.load(A_row_ptr + k_offsets, mask=mask_k, other=0.0).to(tl.float32)  # [BLOCK_K]
+
+        # Load B block: B[start:start+BLOCK_K, 0:K] as [BLOCK_K, K]
+        B_block_ptr = B_ptr + k_offsets[:, None] * K + tl.arange(0, K)[None, :]  # [BLOCK_K, K]
+        B_block = tl.load(B_block_ptr, mask=mask_k[:, None], other=0.0).to(tl.float32)  # [BLOCK_K, K]
+
+        # Accumulate: for each i in BLOCK_K, dot(A_seg[i], B_block[i, :])
+        # Create a [1, K] column vector from A_seg to broadcast along K
+        # Using elementwise multiply and reduction:
+        # A_seg[:, None] has shape [BLOCK_K, 1], B_block has shape [BLOCK_K, K]
+        # Multiply: [BLOCK_K, 1] * [BLOCK_K, K] -> [BLOCK_K, K], then sum along axis=1 -> [K]
+        prod = A_seg[:, None] * B_block  # [BLOCK_K, K]
+        acc += tl.sum(prod, axis=0)
+
+        start += BLOCK_K
+
+    # Store the accumulated result
+    tl.store(C_row_ptr, acc, mask=True)  # acc is [K], store all valid elements
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor,
+                encoder_hidden_states: torch.Tensor,
+                process_weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Triton-optimized version of the original run function.
+        All numeric computation is performed by Triton kernels.
+        """
+        # Extract shapes
+        N = hidden_states.shape[0]
+        L_txt = encoder_hidden_states.shape[1]
+        L_img = hidden_states.shape[1]
+        K = hidden_states.shape[2]
+        L_total = L_txt + L_img
+        N_rows = N * L_total
+
+        # Ensure tensors are on the same device and dtype
+        device = hidden_states.device
+        # Allocate concatenated tensor [N, L_total, K]
+        concatenated = torch.empty((N, L_total, K), device=device, dtype=hidden_states.dtype)
+
+        # 1) Concatenate via Triton
+        BLOCK_K = 256 if K >= 256 else 128
+        grid_concat = (N, L_total, triton.cdiv(K, BLOCK_K))
+        _concat_sequences_kernel[grid_concat](
+            concatenated, encoder_hidden_states, hidden_states,
+            N, L_txt, L_img, K,
+            BLOCK_K=BLOCK_K,
+            num_warps=4, num_stages=2,
+        )
+
+        # Flatten rows for GEMM
+        A_rows = concatenated.reshape(N_rows, K).contiguous()  # [N_rows, K]
+        # Process weight: we need B = process_weight.T -> [K, K]
+        B = process_weight.t().contiguous()  # [K, K]
+        # Output rows buffer
+        C_rows = torch.empty((N_rows, K), device=device, dtype=torch.float32)  # accumulate in fp32
+
+        # 2) GEMM: A_rows @ B -> C_rows (fp32 accumulation)
+        # Choose BLOCK_K for reduction
+        BLOCK_K_GEMM = 256 if K >= 256 else 128
+        grid_gemm = (N_rows,)
+        _matmul_row_kernel[grid_gemm](
+            C_rows, A_rows, B,
+            N_rows, K,
+            BLOCK_K=BLOCK_K_GEMM,
+            num_warps=4, num_stages=2,
+        )
+
+        # Cast back to original dtype if needed
+        if C_rows.dtype != hidden_states.dtype:
+            C_rows = C_rows.to(hidden_states.dtype)
+
+        # 3) Reshape back to [N, L_total, K] and split
+        processed = C_rows.view(N, L_total, K)
+        processed_encoder = processed[:, :L_txt, :]
+        processed_hidden = processed[:, L_txt:, :]
+
+        return processed_encoder, processed_hidden
+
+
+def run(*args):
+    return ModelNew()(*args)

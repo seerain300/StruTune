@@ -1,0 +1,194 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def row_stats_kernel(X_ptr, mean_out_ptr, sumsq_out_ptr,
+                      ROWS: tl.int32, F: tl.int32,
+                      BLOCK_SIZE: tl.constexpr):
+    """
+    For each row (0..ROWS-1), compute sum and sum of squares across F features.
+    mean_out[row] = sum / F, sumsq_out[row] = sumsq / F. (We will multiply by F later in host.)
+    """
+    row = tl.program_id(0)
+    # Guard: if row >= ROWS, do nothing (grid ensures row < ROWS)
+    # Compute sum and sumsq
+    sum_ = 0.0
+    sumsq_ = 0.0
+    for col in range(0, F, BLOCK_SIZE):
+        offs = col + tl.arange(0, BLOCK_SIZE)
+        mask = offs < F
+        x = tl.load(X_ptr + row * F + offs, mask=mask, other=0.0)
+        # Reduce within the vector
+        sum_ += tl.sum(x, axis=0)
+        sumsq_ += tl.sum(x * x, axis=0)
+    # Write mean (sum / F) and sumsq / F scaled by F (we'll multiply by F in host to keep precision)
+    tl.store(mean_out_ptr + row, sum_ / F)
+    tl.store(sumsq_out_ptr + row, sumsq_ / F)
+
+
+@triton.jit
+def ndtri_kernel(p_in_ptr, p_out_ptr, eps: tl.float32):
+    """
+    Compute inverse standard normal CDF (ndtri) for a single float in p_in_ptr and write to p_out_ptr.
+    Uses Abramowitz & Stegun 7.1.26 approximation.
+    Clamp input to [eps, 1-eps] to avoid log(0)/log(1).
+    """
+    # Load input scalar
+    p = tl.load(p_in_ptr)
+    # Clamp
+    p = tl.maximum(p, eps)
+    p = tl.minimum(p, 1.0 - eps)
+    # Constants
+    a1 = -3.969683028665376e+01
+    a2 = 2.209460984245205e+02
+    a3 = -2.759285104469687e+02
+    a4 = 1.383577518672690e+02
+    a5 = -3.066479806614716e+01
+    a6 = 2.506628277459239e+00
+
+    b1 = -5.447609879822406e+01
+    b2 = 1.615858368580409e+02
+    b3 = -1.556989798598866e+02
+    b4 = 6.680131188771972e+01
+    b5 = -1.328068155288572e+01
+
+    c1 = -7.784894002430293e-03
+    c2 = -3.223964580411365e-01
+    c3 = -2.400758277161838e+00
+    c4 = -2.549732539343734e+00
+    c5 = 4.374664141464968e+00
+    c6 = 2.938163982698783e+00
+
+    d1 = 7.784695709041462e-03
+    d2 = 3.224671290700398e-01
+    d3 = 2.445134137142996e+00
+    d4 = 3.754408661907416e+00
+
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+
+    # Lower region
+    # Use mask-style branching via where, but since this is scalar, compute both and select.
+    q_low = tl.sqrt(-2.0 * tl.log(p))
+    poly_low = (((((c1 * q_low + c2) * q_low + c3) * q_low + c4) * q_low + c5) * q_low + c6)
+    den_low = (((((d1 * q_low + d2) * q_low + d3) * q_low + d4) * q_low + 1.0))
+    x_low = poly_low / den_low
+
+    # Central region
+    q_mid = p - 0.5
+    r_mid = q_mid * q_mid
+    poly_mid = (((((a1 * r_mid + a2) * r_mid + a3) * r_mid + a4) * r_mid + a5) * r_mid + a6) * q_mid
+    den_mid = (((((b1 * r_mid + b2) * r_mid + b3) * r_mid + b4) * r_mid + b5) * r_mid + 1.0)
+    x_mid = poly_mid / den_mid
+
+    # Upper region
+    q_high = tl.sqrt(-2.0 * tl.log(1.0 - p))
+    poly_high = (((((c1 * q_high + c2) * q_high + c3) * q_high + c4) * q_high + c5) * q_high + c6)
+    den_high = (((((d1 * q_high + d2) * q_high + d3) * q_high + d4) * q_high + 1.0))
+    x_high = -poly_high / den_high
+
+    region = (p < p_low)
+    region = region | (p > p_high)  # prefer high if p > p_high; else mid
+    x = tl.where(region, x_high, tl.where(p < 0.5, x_low, x_mid))
+    tl.store(p_out_ptr, x)
+
+
+@triton.jit
+def relu_threshold_kernel(X_ptr, mean_ptr, std_ptr, multiplier_ptr, Y_ptr,
+                           ROWS: tl.int32, F: tl.int32,
+                           BLOCK_SIZE: tl.constexpr):
+    """
+    For each row (program_id 0..ROWS-1), load mean and std, compute cutoff = mean + std * multiplier,
+    then write Y[row, :] = max(0, X[row, :] - cutoff).
+    """
+    row = tl.program_id(0)
+    # Load scalar params
+    mean = tl.load(mean_ptr + row)
+    std = tl.load(std_ptr + row)
+    multiplier = tl.load(multiplier_ptr)
+    cutoff = mean + std * multiplier
+    for col in range(0, F, BLOCK_SIZE):
+        offs = col + tl.arange(0, BLOCK_SIZE)
+        mask = offs < F
+        x = tl.load(X_ptr + row * F + offs, mask=mask, other=0.0)
+        y = x - cutoff
+        y = tl.maximum(y, 0.0)  # ReLU
+        tl.store(Y_ptr + row * F + offs, y, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, block_size: int = 2048, num_warps: int = 8, num_stages: int = 2, eps: float = 1e-7):
+        super().__init__()
+        self.block_size = block_size
+        self.num_warps = num_warps
+        self.num_stages = num_stages
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor, target_sparsity: float) -> torch.Tensor:
+        """
+        Triton-only implementation of Gaussian-based top-k sparse activation.
+
+        Args:
+            x: Input tensor of shape [batch_size, seq_len, intermediate_size]
+            target_sparsity: Float in [0, 1] indicating target sparsity level. 0.0 means no sparsity.
+
+        Returns:
+            Sparsified tensor of same shape as input, dtype bfloat16.
+        """
+        # If no sparsity requested, return x cast to bfloat16
+        if target_sparsity == 0.0:
+            return x.to(torch.bfloat16)
+
+        # Flatten to [rows, F] where rows = B * S
+        B, S, F = x.shape
+        rows = B * S
+        x32 = x.to(torch.float32).contiguous()
+
+        # 1) Compute per-row sum and sum of squares
+        mean = torch.empty(rows, dtype=torch.float32, device=x32.device)
+        sumsq = torch.empty(rows, dtype=torch.float32, device=x32.device)
+
+        row_stats_kernel[(rows,)](
+            x32, mean, sumsq,
+            ROWS=rows, F=F,
+            BLOCK_SIZE=self.block_size,
+            num_warps=self.num_warps,
+            num_stages=self.num_stages,
+        )
+
+        # 2) Compute per-row mean and std (unbiased=False): std = sqrt(sumsq/F - mean^2)
+        # Note: Triton can't do elementwise math on tensors here; we compute std on host for simplicity and speed.
+        mean_row = mean.view(B, S)  # [B, S]
+        sumsq_row = sumsq.view(B, S)
+        std = torch.sqrt(sumsq_row / F - mean_row.pow(2))  # [B, S]
+
+        # 3) Compute inverse normal CDF for scalar target_sparsity using Triton kernel
+        p_in = x32.new_tensor(target_sparsity)  # 1-element device scalar
+        p_out = torch.empty(1, dtype=torch.float32, device=x32.device)
+        ndtri_kernel[(1,)](
+            p_in, p_out, self.eps,
+            num_warps=1,
+            num_stages=1,
+        )
+        std_multiplier = p_out  # shape [1], device scalar
+
+        # 4) Apply activation in Triton
+        y = torch.empty(rows * F, dtype=torch.float32, device=x32.device)
+        relu_threshold_kernel[(rows,)](
+            x32.view(rows, F),
+            mean.view(rows), std.view(rows), std_multiplier, y,
+            ROWS=rows, F=F,
+            BLOCK_SIZE=self.block_size,
+            num_warps=self.num_warps,
+            num_stages=self.num_stages,
+        )
+
+        # 5) Reshape and cast to bfloat16 to match original output
+        y_out = y.view(B, S, F).to(torch.bfloat16)
+        return y_out
+
+
+def run(*args):
+    return ModelNew()(*args)
