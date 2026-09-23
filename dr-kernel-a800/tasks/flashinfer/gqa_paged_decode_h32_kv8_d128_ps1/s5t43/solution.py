@@ -1,0 +1,147 @@
+import math
+import torch
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+@triton.jit
+def gqa_row_scalar_kernel(
+    q_ptr,                # *bf16, [B, H, D]
+    k_ptr,                # *bf16, [Np, 1, K, D]
+    v_ptr,                # *bf16, [Np, 1, K, D]
+    kv_indptr_ptr,        # *int32, [B+1]
+    kv_indices_ptr,       # *int32, [Np]
+    output_ptr,           # *bf16, [B, H, D]
+    lse_ptr,              # *float32, [B, H]
+    sm_scale: tl.constexpr,       # float32 scalar
+    B: tl.constexpr,        # batch_size (unused but can be used if needed)
+    H: tl.constexpr,        # num_qo_heads
+    D: tl.constexpr,        # head_dim (e.g., 128)
+    K: tl.constexpr,        # num_kv_heads (e.g., 8)
+    GQA_RATIO: tl.constexpr,     # H // K (e.g., 4)
+    MAX_TOKENS: tl.constexpr,    # max tokens processed in scalar loop (e.g., 1024)
+):
+    # One program per (b, h)
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    # Base offsets for q and output
+    q_base = pid_b * H * D + pid_h * D
+    out_base = pid_b * H * D + pid_h * D
+
+    # Load q vector for this (b, h): q[b, h, :] as fp32
+    q_vec = tl.zeros((D,), dtype=tl.float32)
+    for d in tl.range(0, D):
+        q_elem = tl.load(q_ptr + q_base + d).to(tl.float32)
+        q_vec[d] = q_elem
+
+    # Load indptr[start, end] for this batch element
+    start = tl.load(kv_indptr_ptr + pid_b).to(tl.int32)
+    end = tl.load(kv_indptr_ptr + pid_b + 1).to(tl.int32)
+    num_tokens = end - start
+
+    # Pass 1: compute sum_exp = sum(exp((q·k) * sm_scale)) across tokens
+    sum_exp = 0.0  # fp32 scalar
+    for t in tl.range(0, MAX_TOKENS):
+        if t >= num_tokens:
+            break
+        # kv_head for GQA: kv_head = h // (H // K) = h // GQA_RATIO
+        kv_h = pid_h // GQA_RATIO
+        # indices[t] selects which cached token; since indices has Np elements, we read it as int32
+        idx = tl.load(kv_indices_ptr + t).to(tl.int32)
+        # k_row = k[idx, kv_h, :] (shape [D])
+        k_base = idx * (K * D) + kv_h * D
+        k_row = tl.zeros((D,), dtype=tl.float32)
+        for d in tl.range(0, D):
+            k_elem = tl.load(k_ptr + k_base + d).to(tl.float32)
+            k_row[d] = k_elem
+        # v_row = v[idx, kv_h, :] (shape [D])
+        v_base = idx * (K * D) + kv_h * D
+        v_row = tl.zeros((D,), dtype=tl.float32)
+        for d in tl.range(0, D):
+            v_elem = tl.load(v_ptr + v_base + d).to(tl.float32)
+            v_row[d] = v_elem
+
+        # dot = sum(q_vec * k_row)
+        dot = 0.0
+        for d in tl.range(0, D):
+            dot += q_vec[d] * k_row[d]
+        # sum_exp += exp(dot * sm_scale)
+        sum_exp += tl.exp(dot * sm_scale)
+
+    # lse in base-2: log2(sum_exp)
+    ln_sum = tl.log(sum_exp)
+    ln2 = 0.6931471805599453  # math.log(2)
+    lse = ln_sum / ln2  # fp32
+    # Store lse to output lse buffer at (b, h)
+    tl.store(lse_ptr + pid_b * H + pid_h, lse)
+
+    # Pass 2: compute output vector
+    out_vec = tl.zeros((D,), dtype=tl.float32)
+    for t in tl.range(0, MAX_TOKENS):
+        if t >= num_tokens:
+            break
+        kv_h = pid_h // GQA_RATIO
+        idx = tl.load(kv_indices_ptr + t).to(tl.int32)
+        k_base = idx * (K * D) + kv_h * D
+        k_row = tl.zeros((D,), dtype=tl.float32)
+        for d in tl.range(0, D):
+            k_elem = tl.load(k_ptr + k_base + d).to(tl.float32)
+            k_row[d] = k_elem
+        v_base = idx * (K * D) + kv_h * D
+        v_row = tl.zeros((D,), dtype=tl.float32)
+        for d in tl.range(0, D):
+            v_elem = tl.load(v_ptr + v_base + d).to(tl.float32)
+            v_row[d] = v_elem
+
+        dot = 0.0
+        for d in tl.range(0, D):
+            dot += q_vec[d] * k_row[d]
+        attn = tl.exp((dot - lse) * sm_scale)
+        # out_vec += attn * v_row
+        for d in tl.range(0, D):
+            out_vec[d] += attn * v_row[d]
+
+    # Store output vector as bfloat16
+    for d in tl.range(0, D):
+        tl.store(output_ptr + out_base + d, out_vec[d].to(tl.bfloat16))
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale):
+        # Ensure inputs are contiguous
+        q = q.contiguous()
+        k_cache = k_cache.contiguous()
+        v_cache = v_cache.contiguous()
+        kv_indptr = kv_indptr.contiguous()
+        kv_indices = kv_indices.contiguous()
+
+        # Extract shapes
+        batch_size, num_qo_heads, head_dim = q.shape
+        _, _, num_kv_heads, _ = k_cache.shape
+        assert num_qo_heads == 32 and num_kv_heads == 8 and head_dim == 128
+
+        device = q.device
+        # Output buffers
+        output = torch.empty((batch_size, num_qo_heads, head_dim), dtype=torch.bfloat16, device=device)
+        lse = torch.empty((batch_size, num_qo_heads), dtype=torch.float32, device=device)
+
+        # Launch Triton kernel: one program per (b, h)
+        grid = (batch_size, num_qo_heads)
+        gqa_row_scalar_kernel[grid](
+            q, k_cache, v_cache, kv_indptr, kv_indices, output, lse,
+            sm_scale,
+            B=batch_size, H=num_qo_heads, D=head_dim, K=num_kv_heads, GQA_RATIO=8, MAX_TOKENS=1024,
+            num_warps=2, num_stages=1,
+        )
+
+        return output, lse
+
+
+def run(*args):
+    return ModelNew()(*args)

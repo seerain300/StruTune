@@ -1,0 +1,179 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+class ModelNew(nn.Module):
+    def forward(self, hidden_states: torch.Tensor, weight: torch.Tensor, expert_bias: torch.Tensor, routed_scaling_factor: float):
+        # hidden_states: [num_tokens, hidden_dim], float32, CUDA
+        # weight: [num_experts, hidden_dim], float32, CUDA (num_experts=256)
+        # expert_bias: [num_experts], float32, CUDA
+        # routed_scaling_factor: float
+
+        num_tokens = hidden_states.shape[0]
+        hidden_dim = hidden_states.shape[1]
+        num_experts = weight.shape[0]
+        assert num_experts == 256, "num_experts must be 256"
+
+        # Output buffers
+        topk_idx = torch.empty((num_tokens, 8), dtype=torch.int32, device=hidden_states.device)
+        topk_weight = torch.empty((num_tokens, 8), dtype=torch.float32, device=hidden_states.device)
+
+        # 1) Compute scores[token, expert] = sigmoid(dot(hidden_states[token, :], weight[expert, :])) + expert_bias[expert]
+        scores = torch.empty((num_tokens, num_experts), dtype=torch.float32, device=hidden_states.device)
+
+        grid1 = (num_tokens, num_experts)
+        compute_scores_kernel[grid1](
+            hidden_states, weight, expert_bias, scores, num_tokens, hidden_dim
+        )
+
+        # 2) Triton kernel: group selection, masking, and final top-8 selection
+        grid2 = (num_tokens,)
+        route_and_select_kernel[grid2](
+            scores, expert_bias, routed_scaling_factor, topk_idx, topk_weight, num_tokens, num_experts
+        )
+
+        return topk_idx, topk_weight
+
+
+# Triton kernel 1: compute logits via dot-product and apply sigmoid + bias
+@triton.jit
+def compute_scores_kernel(
+    hidden_states, weight, expert_bias, scores,
+    num_tokens, hidden_dim,
+    BLOCK_H: tl.constexpr
+):
+    token_id = tl.program_id(0)
+    expert_id = tl.program_id(1)
+
+    # Accumulate dot product for this token and expert
+    dot = tl.zeros((), dtype=tl.float32)
+    for j in range(0, hidden_dim):
+        h = tl.load(hidden_states + token_id * hidden_dim + j)
+        w = tl.load(weight + expert_id * hidden_dim + j)
+        dot += h * w
+
+    # Apply sigmoid
+    score = 1.0 / (1.0 + tl.exp(-dot))
+
+    # Add expert bias
+    bias = tl.load(expert_bias + expert_id)
+    score += bias
+
+    # Store
+    tl.store(scores + token_id * num_experts + expert_id, score)
+
+
+# Triton kernel 2: full routing and final selection (no torch ops on host)
+@triton.jit
+def route_and_select_kernel(
+    scores, expert_bias, routed_scaling_factor, out_idx, out_weight,
+    num_tokens, num_experts,
+    EXPERTS_PER_GROUP: tl.constexpr, N_GROUP: tl.constexpr, TOPK_GROUP: tl.constexpr, TOPK_FINAL: tl.constexpr
+):
+    token_id = tl.program_id(0)
+
+    # Constants
+    group_size = EXPERTS_PER_GROUP  # 32
+    n_group = N_GROUP               # 8
+    topk_group = TOPK_GROUP         # 4
+    topk_final = TOPK_FINAL         # 8
+
+    # 1) Compute group_scores [n_group]
+    group_scores = tl.zeros((n_group,), dtype=tl.float32)
+    for g in range(0, n_group):
+        group_start = g * group_size
+        top1 = -float('inf')
+        top1_idx = -1
+        top2 = -float('inf')
+        top2_idx = -1
+        for e in range(0, num_experts):
+            score = tl.load(scores + token_id * num_experts + e)
+            in_group = (e >= group_start) & (e < group_start + group_size)
+            # Only consider if within group; top2 logic maintains the two highest
+            if score > top1:
+                top2 = top1
+                top2_idx = top1_idx
+                top1 = score
+                top1_idx = e
+            elif score > top2:
+                top2 = score
+                top2_idx = e
+        group_scores[g] = top1 + top2
+
+    # 2) Select top-4 groups (argmax indices)
+    # We need top4_idx and their values to build mask; build mask via direct comparisons.
+    # We’ll keep track of selected groups using scalar flags.
+    # For Triton, we implement iterative selection: pick the largest, then next largest, etc.
+    selected_count = 0
+    top4_idx = [tl.zeros((), dtype=tl.int32) for _ in range(topk_group)]
+    top4_vals = [tl.zeros((), dtype=tl.float32) for _ in range(topk_group)]
+    for k in range(0, topk_group):
+        maxv = -float('inf')
+        max_idx = -1
+        for g in range(0, n_group):
+            v = group_scores[g]
+            if v > maxv:
+                maxv = v
+                max_idx = g
+        top4_idx[k] = max_idx
+        top4_vals[k] = maxv
+        group_scores[max_idx] = -float('inf')  # mark as selected
+
+    # 3) Build group_mask [num_experts]: 1 if expert belongs to any of selected groups, else 0
+    group_mask = tl.zeros((num_experts,), dtype=tl.int32)
+    for k in range(0, topk_group):
+        g = top4_idx[k]
+        group_start = g * group_size
+        for e in range(group_start, group_start + group_size):
+            group_mask[e] = 1
+
+    # 4) Mask scores_for_routing: non-selected group elements set to -inf
+    for e in range(0, num_experts):
+        score = tl.load(scores + token_id * num_experts + e)
+        keep = group_mask[e] != 0
+        # If not in any selected group, set to -inf
+        score = tl.where(keep, score, -float('inf'))
+        tl.store(scores + token_id * num_experts + e, score)
+
+    # 5) Select final top-8 from masked scores via iterative argmax (duplicates allowed)
+    final_selected = tl.zeros((topk_final,), dtype=tl.int32)
+    final_vals = tl.zeros((topk_final,), dtype=tl.float32)
+    for k in range(0, topk_final):
+        maxv = -float('inf')
+        max_idx = -1
+        for e in range(0, num_experts):
+            score = tl.load(scores + token_id * num_experts + e)
+            if score > maxv:
+                maxv = score
+                max_idx = e
+        final_selected[k] = max_idx
+        final_vals[k] = maxv
+        # Mark selected to avoid duplicates in subsequent selection
+        tl.store(scores + token_id * num_experts + max_idx, -float('inf'))
+
+    # 6) Gather original logits for selected indices: scores_orig[token, e] = sigmoid(dot) + bias
+    # We need to normalize by sum of original selected scores (not masked). Compute it here.
+    sum_orig = tl.zeros((), dtype=tl.float32)
+    for k in range(0, topk_final):
+        e = final_selected[k]
+        # Load original scores to use for normalization
+        orig_score = tl.load(scores + token_id * num_experts + e)
+        sum_orig += orig_score
+
+    # Write out indices and normalized weights
+    # Note: normalization uses original logits (before masking) for consistency with the PyTorch code.
+    # Apply routed_scaling_factor.
+    for k in range(0, topk_final):
+        e = final_selected[k]
+        orig_score = tl.load(scores + token_id * num_experts + e)
+        weight_k = orig_score / (sum_orig + 1e-20)
+        weight_k *= routed_scaling_factor
+        # Store topk_idx and topk_weight
+        tl.store(out_idx + token_id * topk_final + k, e)
+        tl.store(out_weight + token_id * topk_final + k, weight_k)
+
+
+def run(*args):
+    return ModelNew()(*args)

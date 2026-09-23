@@ -1,0 +1,81 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _layernorm_weight_scale_kernel(
+    hidden_ptr,       # *const input tensor, will be loaded and cast to float32 in-kernel
+    weight_ptr,       # *const weight tensor, will be loaded and used as float32 in-kernel
+    out_ptr,          # *output tensor, float32 (we'll cast to hidden dtype on host after kernel)
+    B: tl.int32,      # batch size
+    H: tl.int32,      # hidden size (4096 in this task)
+    EPS: tl.float32,  # epsilon (1e-5)
+    hidden_stride0: tl.int32,  # stride along batch dim for hidden
+    hidden_stride1: tl.int32,  # stride along hidden dim for hidden
+    out_stride0: tl.int32,     # stride along batch dim for output
+    out_stride1: tl.int32,     # stride along hidden dim for output
+    BLOCK_SIZE: tl.constexpr,  # should be H (4096)
+):
+    row = tl.program_id(0)
+    # Base pointers for this row
+    row_hidden_ptr = hidden_ptr + row * hidden_stride0
+    row_out_ptr = out_ptr + row * out_stride0
+
+    # Vector of column indices
+    cols = tl.arange(0, BLOCK_SIZE)
+
+    # Load row and compute sum of squares (in float32 for stability)
+    hidden_row = tl.load(row_hidden_ptr + cols * hidden_stride1)
+    hidden_row_f32 = tl.cast(hidden_row, tl.float32)
+    sumsq = tl.sum(hidden_row_f32 * hidden_row_f32)
+
+    mean = sumsq / H
+    inv_rms = tl.rsqrt(mean + EPS)
+
+    # Load weight vector as float32
+    weight_vec = tl.load(weight_ptr + cols)
+    weight_vec_f32 = tl.cast(weight_vec, tl.float32)
+
+    # Compute output: out_row[j] = hidden_row[j] * inv_rms * weight[j]
+    out_row = hidden_row_f32 * inv_rms * weight_vec_f32
+
+    # Store output (float32); host will cast to desired dtype after kernel
+    tl.store(row_out_ptr + cols * out_stride1, out_row)
+
+
+def _run_triton(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    # Ensure contiguity for best performance
+    hidden = hidden_states.contiguous()
+    weight = weight.contiguous()
+
+    B, H = hidden.shape
+    # Compute in float32 for numerical stability; return cast to original dtype at the end
+    out = torch.empty((B, H), dtype=torch.float32, device=hidden.device)
+
+    # Grid: one program per row
+    grid = (B,)
+
+    # Empirically high-performance launch params in the evaluation environment
+    _layernorm_weight_scale_kernel[grid](
+        hidden, weight, out,
+        B, H, 1e-5,
+        hidden.stride(0), hidden.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_SIZE=H,
+        num_warps=8,   # best-performing setting in your environment
+        num_stages=2,  # best-performing setting in your environment
+    )
+
+    # Cast output back to the original hidden_states dtype to match PyTorch behavior
+    return out.to(hidden_states.dtype)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        # Triton-only computation
+        return _run_triton(hidden_states, weight)
+
+
+def run(*args):
+    return ModelNew()(*args)

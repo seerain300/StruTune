@@ -1,0 +1,384 @@
+import torch
+import triton
+import triton.language as tl
+
+# 1) Triton matmul: logits = hidden_states @ weight.T
+# hidden_states: [M, K], weight: [N, K], logits: [M, N]
+@triton.jit
+def matmul_logits_kernel(
+    A_ptr,          # *f32, [M, K]
+    B_ptr,          # *f32, [N, K]
+    C_ptr,          # *f32, [M, N]
+    M: tl.int32,    # num_tokens
+    N: tl.int32,    # num_experts
+    K: tl.int32,    # hidden_size
+    stride_am: tl.int32,  # stride for A along M
+    stride_ak: tl.int32,  # stride for A along K
+    stride_bn: tl.int32,  # stride for B along N
+    stride_bk: tl.int32,  # stride for B along K
+    stride_cm: tl.int32,  # stride for C along M
+    stride_cn: tl.int32,  # stride for C along N
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    # Bounds check
+    if pid_m >= M or pid_n >= N:
+        return
+    acc = 0.0
+    # Loop over K dimension
+    for k in range(0, K):
+        a = tl.load(A_ptr + pid_m * stride_am + k * stride_ak)
+        b = tl.load(B_ptr + pid_n * stride_bn + k * stride_bk)
+        acc += a * b
+    tl.store(C_ptr + pid_m * stride_cm + pid_n * stride_cn, acc)
+
+# 2) Triton: scores = sigmoid(logits) + expert_bias (elementwise)
+# logits: [M, N], bias: [N], scores: [M, N]
+@triton.jit
+def sigmoid_add_bias_kernel(
+    logits_ptr,          # *f32, [M, N]
+    bias_ptr,            # *f32, [N]
+    scores_ptr,          # *f32, [M, N]
+    M: tl.int32,
+    N: tl.int32,
+    stride_lm: tl.int32,  # stride for logits along M
+    stride_ln: tl.int32,  # stride for logits along N
+    stride_sm: tl.int32,  # stride for scores along M
+    stride_sn: tl.int32,  # stride for scores along N
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    if pid_m >= M or pid_n >= N:
+        return
+    x = tl.load(logits_ptr + pid_m * stride_lm + pid_n * stride_ln)
+    b = tl.load(bias_ptr + pid_n)
+    s = 1.0 / (1.0 + tl.exp(-x))  # sigmoid
+    tl.store(scores_ptr + pid_m * stride_sm + pid_n * stride_sn, s + b)
+
+# 3) Triton: compute group_scores [M, 8] = sum of top-2 per group from scores reshaped as [M, 8, 32]
+# scores_flat_ptr is scores_ptr viewed as [M, 8, 32] via pointer arithmetic
+@triton.jit
+def group_top2_sum_kernel(
+    scores_ptr,          # *f32, [M, N] flattened for 2D addressing
+    group_scores_ptr,    # *f32, [M, 8]
+    M: tl.int32,         # num_tokens
+    N: tl.int32,         # num_experts
+    group_count: tl.constexpr,    # 8
+    experts_per_group: tl.constexpr,  # 32
+):
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+    # For each group, compute top-2 and sum
+    for g in range(group_count):
+        group_idx = g  # since we launch one program per token
+        total = 0.0
+        vals = tl.zeros((experts_per_group,), dtype=tl.float32)
+        # Decode 2D index: idx = group_idx * experts_per_group + offset
+        # Iterate over the 32 experts in this group
+        for i in range(experts_per_group):
+            idx = group_idx * experts_per_group + i
+            # Address in flattened scores [M, N]
+            # scores layout: row-major contiguous; address = pid * N + idx
+            addr = pid * N + idx
+            val = tl.load(scores_ptr + addr)
+            vals[i] = val
+        # Compute top-2
+        # Note: vals is a vector; we find max, remove it, then second max
+        max1 = -float('inf')
+        for i in range(experts_per_group):
+            max1 = tl.maximum(max1, vals[i])
+        # Remove occurrences of max1 by setting them to -inf
+        # (At most two equal maxima can exist; this simplifies)
+        for i in range(experts_per_group):
+            vals[i] = tl.where(vals[i] == max1, -float('inf'), vals[i])
+        max2 = -float('inf')
+        for i in range(experts_per_group):
+            max2 = tl.maximum(max2, vals[i])
+        total += max1 + max2
+        # Store per group score
+        tl.store(group_scores_ptr + pid * group_count + g, total)
+
+# 4) Triton: topk_group_kernel (K=4) — return indices (int32) of selected groups per token
+@triton.jit
+def topk_group_kernel(
+    group_scores_ptr,    # *f32, [M, 8]
+    selected_idx_ptr,    # *int32, [M, 4]
+    M: tl.int32,
+    K: tl.constexpr,     # 4
+):
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+    # Iteratively find top-k indices
+    best_vals = tl.full((K,), -float('inf'), dtype=tl.float32)
+    best_idxs = tl.zeros((K,), dtype=tl.int32)
+    # loop over groups 0..7
+    for g in range(8):
+        val = tl.load(group_scores_ptr + pid * 8 + g)
+        # place value into appropriate position among best_vals
+        for j in range(K):
+            if val > best_vals[j]:
+                # shift down
+                for jj in range(K - 1, j, -1):
+                    best_vals[jj] = best_vals[jj - 1]
+                    best_idxs[jj] = best_idxs[jj - 1]
+                best_vals[j] = val
+                best_idxs[j] = g
+                break
+    # Write out selected indices
+    for t in range(K):
+        tl.store(selected_idx_ptr + pid * K + t, best_idxs[t])
+
+# 5) Triton: build_group_mask_kernel — given selected group_idx [M, 4], set group_mask [M, 8] to 1 at selected positions
+@triton.jit
+def build_group_mask_kernel(
+    group_idx_ptr,       # *int32, [M, 4]
+    group_mask_ptr,      # *f32, [M, 8]
+    M: tl.int32,
+    K: tl.constexpr,     # 4
+    group_count: tl.constexpr,  # 8
+):
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+    # set zeros
+    for g in range(group_count):
+        tl.store(group_mask_ptr + pid * group_count + g, 0.0)
+    # set ones at selected groups
+    for t in range(K):
+        g_idx = tl.load(group_idx_ptr + pid * K + t)
+        tl.store(group_mask_ptr + pid * group_count + g_idx, 1.0)
+
+# 6) Triton: expand_and_set_ninf_kernel — expand group_mask [M, 8] to [M, 256], set non-selected groups' 32 entries to -inf
+@triton.jit
+def expand_and_set_ninf_kernel(
+    group_mask_ptr,      # *f32, [M, 8]
+    masked_scores_ptr,   # *f32, [M, 256], will be mutated in-place
+    M: tl.int32,
+    N: tl.int32,         # 256
+    group_count: tl.constexpr,    # 8
+    experts_per_group: tl.constexpr,  # 32
+):
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+    # expand mask to N and set -inf where mask == 0
+    for n in range(N):
+        found = False
+        for g in range(group_count):
+            if n < g * experts_per_group + experts_per_group and n >= g * experts_per_group:
+                mask_val = tl.load(group_mask_ptr + pid * group_count + g)  # scalar f32
+                if mask_val > 0.0:
+                    found = True
+                    break
+        cur = masked_scores_ptr + pid * N + n
+        val = tl.load(masked_scores_ptr + pid * N + n)
+        if not found:
+            val = -float('inf')
+        tl.store(cur, val)
+
+# 7) Triton: topk_final_experts_kernel — select final top-8 experts per token from masked_scores [M, 256]
+@triton.jit
+def topk_final_experts_kernel(
+    masked_scores_ptr,   # *f32, [M, 256]
+    selected_idx_ptr,    # *int32, [M, 8]
+    M: tl.int32,
+    K: tl.constexpr,     # 8
+    N: tl.int32,         # 256
+):
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+    best_vals = tl.full((K,), -float('inf'), dtype=tl.float32)
+    best_idxs = tl.zeros((K,), dtype=tl.int32)
+    for n in range(N):
+        val = tl.load(masked_scores_ptr + pid * N + n)
+        for j in range(K):
+            if val > best_vals[j]:
+                for jj in range(K - 1, j, -1):
+                    best_vals[jj] = best_vals[jj - 1]
+                    best_idxs[jj] = best_idxs[jj - 1]
+                best_vals[j] = val
+                best_idxs[j] = n
+                break
+    for t in range(K):
+        tl.store(selected_idx_ptr + pid * K + t, best_idxs[t])
+
+# 8) Triton: gather_selected_kernel — given indices [M, 8], gather original scores (pre-bias) from scores_ptr [M, N]
+@triton.jit
+def gather_selected_kernel(
+    scores_ptr,          # *f32, [M, N] (pre-bias scores: sigmoid(logits) + bias)
+    selected_idx_ptr,    # *int32, [M, 8]
+    selected_scores_ptr, # *f32, [M, 8]
+    M: tl.int32,
+    N: tl.int32,
+    K: tl.constexpr,     # 8
+):
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+    for t in range(K):
+        idx = tl.load(selected_idx_ptr + pid * K + t)
+        val = tl.load(scores_ptr + pid * N + idx)
+        tl.store(selected_scores_ptr + pid * K + t, val)
+
+# 9) Triton: normalize_and_scale_kernel — normalize selected_scores [M, 8] and scale by routed_scaling_factor
+@triton.jit
+def normalize_and_scale_kernel(
+    inp_ptr,         # *f32, [M, 8]
+    out_ptr,         # *f32, [M, 8]
+    scale: tl.float32,
+    M: tl.int32,
+    K: tl.constexpr  # 8
+):
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+    total = 0.0
+    for t in range(K):
+        val = tl.load(inp_ptr + pid * K + t)
+        total += val
+    for t in range(K):
+        val = tl.load(inp_ptr + pid * K + t)
+        out_val = val / (total + 1e-20) * scale
+        tl.store(out_ptr + pid * K + t, out_val)
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, routed_scaling_factor: float = 1.0):
+        super().__init__()
+        self.routed_scaling_factor = float(routed_scaling_factor)
+        # constants as in original
+        self.hidden_size = 128
+        self.num_experts = 256
+        self.group_count = 8
+        self.experts_per_group = 32
+        self.final_k = 8
+
+    def forward(self, hidden_states: torch.Tensor, weight: torch.Tensor, expert_bias: torch.Tensor):
+        """
+        Triton-only implementation. Launches all necessary Triton kernels.
+        Returns:
+        - topk_idx: [num_tokens, 8], int64
+        - topk_weight: [num_tokens, 8], float32
+        """
+        assert hidden_states.is_cuda and weight.is_cuda and expert_bias.is_cuda, "All inputs must be on CUDA for Triton kernels."
+        M = hidden_states.shape[0]
+        assert hidden_states.shape[1] == self.hidden_size, "hidden_states.hidden_size must be 128"
+        assert weight.shape[0] == self.num_experts, "weight.num_experts must be 256"
+        assert weight.shape[1] == self.hidden_size, "weight.hidden_size must be 128"
+        assert expert_bias.shape[0] == self.num_experts, "expert_bias length must be 256"
+
+        # Cast to float32 for Triton math
+        hidden_states_f32 = hidden_states.contiguous().to(torch.float32)
+        weight_f32 = weight.contiguous().to(torch.float32)
+        expert_bias_f32 = expert_bias.contiguous().to(torch.float32)
+
+        # 1) Triton matmul: logits [M, N]
+        logits = torch.empty((M, self.num_experts), device=hidden_states.device, dtype=torch.float32)
+        grid_matmul = (M, self.num_experts)
+        matmul_logits_kernel[grid_matmul](
+            hidden_states_f32, weight_f32, logits,
+            M, self.num_experts, self.hidden_size,
+            hidden_states_f32.stride(0), hidden_states_f32.stride(1),
+            weight_f32.stride(0), weight_f32.stride(1),
+            logits.stride(0), logits.stride(1),
+            num_warps=4, num_stages=2,
+        )
+
+        # 2) Triton: scores = sigmoid(logits) + expert_bias
+        scores = torch.empty_like(logits, device=hidden_states.device, dtype=torch.float32)
+        grid_sig = (M, self.num_experts)
+        sigmoid_add_bias_kernel[grid_sig](
+            logits, expert_bias_f32, scores,
+            M, self.num_experts,
+            logits.stride(0), logits.stride(1),
+            scores.stride(0), scores.stride(1),
+            num_warps=2, num_stages=2,
+        )
+
+        # 3) Triton: group_top2_sum → group_scores [M, 8]
+        group_scores = torch.empty((M, self.group_count), device=hidden_states.device, dtype=torch.float32)
+        grid_gt2 = (M,)
+        group_top2_sum_kernel[grid_gt2](
+            scores, group_scores,
+            M, self.num_experts,
+            self.group_count, self.experts_per_group,
+            num_warps=2, num_stages=2,
+        )
+
+        # 4) Triton: topk_group_kernel (K=4) → selected group indices [M, 4]
+        selected_group_idx = torch.empty((M, 4), device=hidden_states.device, dtype=torch.int32)
+        grid_tg = (M,)
+        topk_group_kernel[grid_tg](
+            group_scores, selected_group_idx,
+            M, 4,
+            num_warps=2, num_stages=2,
+        )
+
+        # 5) Triton: build_group_mask [M, 8]
+        group_mask = torch.empty((M, self.group_count), device=hidden_states.device, dtype=torch.float32)
+        grid_gm = (M,)
+        build_group_mask_kernel[grid_gm](
+            selected_group_idx, group_mask,
+            M, 4, self.group_count,
+            num_warps=2, num_stages=2,
+        )
+
+        # 6) Triton: expand_and_set_ninf → masked_scores [M, 256]
+        masked_scores = torch.empty((M, self.num_experts), device=hidden_states.device, dtype=torch.float32)
+        # Initialize masked_scores with scores for now; kernel will set non-selected groups to -inf
+        masked_scores.copy_(scores)
+        grid_ex = (M,)
+        expand_and_set_ninf_kernel[grid_ex](
+            group_mask, masked_scores,
+            M, self.num_experts,
+            self.group_count, self.experts_per_group,
+            num_warps=4, num_stages=2,
+        )
+
+        # 7) Triton: select final top-8 experts per token from masked_scores → selected_idx [M, 8]
+        selected_idx = torch.empty((M, self.final_k), device=hidden_states.device, dtype=torch.int32)
+        grid_t8 = (M,)
+        topk_final_experts_kernel[grid_t8](
+            masked_scores, selected_idx,
+            M, self.final_k, self.num_experts,
+            num_warps=4, num_stages=2,
+        )
+
+        # 8) Triton: gather original scores (pre-bias) for selected experts → selected_scores [M, 8]
+        selected_scores = torch.empty((M, self.final_k), device=hidden_states.device, dtype=torch.float32)
+        grid_gs = (M,)
+        gather_selected_kernel[grid_gs](
+            scores, selected_idx, selected_scores,
+            M, self.num_experts, self.final_k,
+            num_warps=2, num_stages=2,
+        )
+
+        # 9) Triton: normalize and scale
+        out_weight = torch.empty_like(selected_scores, device=hidden_states.device, dtype=torch.float32)
+        grid_n = (M,)
+        normalize_and_scale_kernel[grid_n](
+            selected_scores, out_weight,
+            self.routed_scaling_factor,
+            M, self.final_k,
+            num_warps=2, num_stages=2,
+        )
+
+        # Cast outputs to expected types
+        topk_idx = selected_idx.to(torch.int64)  # [M, 8]
+        topk_weight = out_weight  # [M, 8], float32, already scaled
+
+        return topk_idx, topk_weight
+
+# If you need a quick check:
+# model = ModelNew(routed_scaling_factor=1.0).cuda()
+# hidden_states = torch.randn(2048, 128, device='cuda')
+# weight = torch.randn(256, 128, device='cuda')
+# expert_bias = torch.randn(256, device='cuda')
+# idx, weight = model(hidden_states, weight, expert_bias)
+# print(idx.shape, weight.shape)
+
+
+def run(*args):
+    return ModelNew()(*args)

@@ -1,0 +1,373 @@
+import torch
+import triton
+import triton.language as tl
+
+
+# Triton kernel: compute G[i, j, h] = sum_n C_exp[b,c,i,n,j,h] * B_exp[b,c,j,n,i,h]
+# Inputs:
+#   A_out_ptr: [B, C, S, S, H] (float32), this will be populated by PyTorch as exp(cumsum(A)).
+#   B_exp_ptr: [B, C, S, H, N] (float32), contiguous.
+#   C_exp_ptr: [B, C, S, H, N] (float32), contiguous.
+#   G_ptr:     [B, C, S, S, H] (float32), output.
+# Grid: (B, C, S) -> each program handles one (b, c, i).
+@triton.jit
+def compute_G_kernel(
+    A_out_ptr, B_exp_ptr, C_exp_ptr, G_ptr,
+    B, C, S, H, N,
+    x_stride_b, x_stride_c, x_stride_s, x_stride_h, x_stride_n,
+    c_stride_b, c_stride_c, c_stride_s, c_stride_h, c_stride_n,
+    g_stride_b, g_stride_c, g_stride_i, g_stride_j, g_stride_h,
+    BLOCK_J: tl.constexpr,
+):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    i = tl.program_id(2)
+
+    # Initialize G[i, :, h] row for each h in (0..H-1)
+    # We'll write per h inside the loop below, as BLOCK_J covers j range.
+
+    # Loop over heads h (dynamic)
+    for h in range(0, H):
+        # Accumulator for G[i, :, h]
+        # Triton supports scalar accumulation for reductions over loops
+        acc = tl.zeros((), dtype=tl.float32)
+
+        # We need to cover j in [0, S-1]
+        # Use a block loop for better performance; since S is typically 128, one block is enough.
+        j_start = 0
+        while j_start < S:
+            j_offsets = j_start + tl.arange(0, BLOCK_J)
+            mask = j_offsets < S
+
+            # Compute pointers for A_out[b, c, i, j, h] and multiply
+            # A_out layout: [B, C, S, S, H]
+            a_ptrs = (
+                A_out_ptr
+                + b * x_stride_b
+                + c * x_stride_c
+                + i * x_stride_s
+                + j_offsets * x_stride_j
+                + h * x_stride_h
+            )
+            # A_out is contiguous in last two dims (S,S), strides: x_stride_s, x_stride_j, x_stride_h
+            # Here we need S and S strides; use S stride for i and j.
+            # We can derive: for A_out[b,c,i,j,h], address = b*? + c*? + i*x_stride_s + j*x_stride_j + h*x_stride_h
+            # From PyTorch, for contiguous [S,S,H], last two dims are contiguous, but our A_out is [B,C,S,S,H],
+            # so we should use the provided strides. We pass strides from torch.Tensor.stride() in forward.
+
+            # For simplicity, load A_out as a vector across j and apply masking.
+            # However, since Triton pointer arithmetic expects stride for j, we use provided x_stride_j.
+            # Note: Triton pointer arithmetic does not have x_stride_j, we must rely on the strides passed from torch.
+            # We pass g_stride_i, g_stride_j, g_stride_h for G. For A_out, we need separate strides. We'll use the strides from tensors.
+            # We'll assume A_out is contiguous in (S,S,H). If not, we'll pass correct strides from torch.
+
+            # Load A_out vector for this h across j
+            # We'll assume x_stride_j is the stride for j in A_out tensor. Pass it explicitly.
+            # In forward, we set x_stride_j = A_out.stride(-2) and x_stride_h = A_out.stride(-1).
+            a_vals = tl.load(a_ptrs, mask=mask, other=0.0)  # shape: [BLOCK_J]
+
+            # Loop over n dimension (N is typically 128)
+            for n in range(0, N):
+                # Build B and C pointers:
+                # B_exp[b, c, j, h, n]
+                b_ptrs = (
+                    B_exp_ptr
+                    + b * x_stride_b
+                    + c * x_stride_c
+                    + j_offsets * x_stride_j  # j dimension in B_exp is contiguous along j
+                    + h * x_stride_h
+                    + n * x_stride_n
+                )
+                # C_exp[b, c, i, h, n]
+                c_ptrs = (
+                    C_exp_ptr
+                    + b * c_stride_b
+                    + c * c_stride_c
+                    + i * c_stride_i  # i dimension stride for C_exp
+                    + h * c_stride_h
+                    + n * c_stride_n
+                )
+
+                # Load B and C vectors
+                b_vals = tl.load(b_ptrs, mask=mask, other=0.0)  # [BLOCK_J]
+                c_vals = tl.load(c_ptrs, mask=True, other=0.0)  # scalar or vector? We need scalar per n across j? This is not correct.
+
+                # We need to multiply elementwise: acc += sum_j (C_exp[b,c,i,h,n] * sum_j(B_exp[b,c,j,h,n] * A_out[b,c,i,j,h])).
+                # But above a_vals is vector. This approach is not correct. We need to compute per j term.
+
+                # Revisit approach: we cannot load B with vector j_offsets; B_exp is [B,C,S,H,N], j is not the fastest varying.
+                # Better: load B per j scalar and loop over j; or restructure.
+
+        # Store G[b, c, i, j, h] for all j in this block
+        # We'll store per j in the loop above. Here we keep acc per h for G vector across j.
+        # However, Triton requires us to write out per j; implement in next version properly.
+
+# The above kernel is incorrect as written. We'll replace with a correct one that loops over j explicitly.
+
+@triton.jit
+def compute_G_kernel_fixed(
+    A_out_ptr, B_exp_ptr, C_exp_ptr, G_ptr,
+    B, C, S, H, N,
+    a_bs, a_cs, a_s, a_j, a_h,
+    be_bs, be_cs, be_j, be_h, be_n,
+    ce_bs, ce_cs, ce_i, ce_h, ce_n,
+    g_bs, g_cs, g_i, g_j, g_h,
+    BLOCK_J: tl.constexpr,
+):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    i = tl.program_id(2)
+
+    # For each head h, compute G[i, :, h] as a vector
+    for h in range(0, H):
+        # Initialize accumulator for this (i, h): we'll accumulate across j in tiles
+        acc = tl.zeros((), dtype=tl.float32)
+
+        # We need to compute G[i, j, h] = sum_n (C_exp[b,c,i,h,n] * sum_j' (B_exp[b,c,j,h,n] * A_out[b,c,i,j,h]))
+        # Here, we need to compute inner sum_j' (B_exp * A_out) per j and then multiply with C_exp[n] and accumulate.
+
+        # Iterate j in blocks
+        for j_start in range(0, S, BLOCK_J):
+            j_offsets = j_start + tl.arange(0, BLOCK_J)
+            mask_j = j_offsets < S
+
+            # Vector of A_out for this (i, j, h): address = b*as + c*cs + i*a_s + j*a_j + h*a_h
+            a_ptrs = A_out_ptr + b * a_bs + c * a_cs + i * a_s + j_offsets * a_j + h * a_h
+            a_vals = tl.load(a_ptrs, mask=mask_j, other=0.0)  # [BLOCK_J]
+
+            # Compute sum over n: sum_n C_exp[n] * sum_j' B_exp[j] * A_out
+            inner = tl.zeros([BLOCK_J], dtype=tl.float32)
+            # Loop over n
+            for n in range(0, N):
+                # Load C_exp scalar: [b,c,i,h,n]
+                ce_ptrs = C_exp_ptr + b * ce_bs + c * ce_cs + i * ce_i + h * ce_h + n * ce_n
+                c_n = tl.load(ce_ptrs)
+                # Compute inner sum over j' for this n: sum_j' (B_exp[b,c,j,h,n] * A_out[b,c,i,j,h])
+                inner_n = tl.zeros([BLOCK_J], dtype=tl.float32)
+                # Loop over j in this block
+                for jj in range(0, BLOCK_J):
+                    j_idx = j_start + jj
+                    if j_idx < S:
+                        # Load B_exp scalar for this j_idx
+                        be_ptrs = B_exp_ptr + b * be_bs + c * be_cs + j_idx * be_j + h * be_h + n * be_n
+                        b_val = tl.load(be_ptrs)
+                        inner_n += b_val * a_vals[jj]  # a_vals[jj] is the scalar A_out for this j
+                inner += c_n * inner_n
+
+            # Now we have inner[BLOCK_J], add to acc (accumulate across j tiles). We can't reduce here because inner is per j.
+            # To accumulate G, we need a running sum per j: But our G is per (i, j, h). We need to compute G[i, j, h] per j.
+            # However, Triton requires storing per j. We'll store per j at the end.
+            pass  # placeholder; will be replaced by storing per j below
+
+        # Now store G[i, j, h] for all j in this tile
+        # We need to compute G[i, j, h] = inner[BLOCK_J] for each j in tile. Since we computed inner per j over loops, we need to construct.
+        # The above approach is complex. Simpler: compute per j directly.
+
+        # Alternative: compute per j directly, without vector inner. This is more straightforward.
+
+# Simplified approach: compute G per j directly in Triton, avoiding vector inner.
+
+@triton.jit
+def compute_G_per_j_kernel(
+    A_out_ptr, B_exp_ptr, C_exp_ptr, G_ptr,
+    B, C, S, H, N,
+    a_bs, a_cs, a_s, a_j, a_h,
+    be_bs, be_cs, be_j, be_h, be_n,
+    ce_bs, ce_cs, ce_i, ce_h, ce_n,
+    g_bs, g_cs, g_i, g_j, g_h,
+):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    i = tl.program_id(2)
+    h = tl.program_id(3)  # we launch grid (B, C, S, H) to compute per (i, h)
+
+    # Loop over j in tiles
+    BLOCK_J = 128  # since S=128
+    for j_start in range(0, S, BLOCK_J):
+        j_offsets = j_start + tl.arange(0, BLOCK_J)
+        mask_j = j_offsets < S
+
+        # Initialize G block accumulator
+        g_block = tl.zeros([BLOCK_J], dtype=tl.float32)
+
+        # Loop over n dimension
+        for n in range(0, N):
+            # Compute inner sum over j in this block: sum_j' (B_exp[b,c,j,h,n] * A_out[b,c,i,j,h])
+            inner = tl.zeros([BLOCK_J], dtype=tl.float32)
+            for jj in range(0, BLOCK_J):
+                j_idx = j_start + jj
+                if j_idx < S:
+                    # Load A_out scalar for this (i, j, h)
+                    a_ptrs = A_out_ptr + b * a_bs + c * a_cs + i * a_s + j_idx * a_j + h * a_h
+                    a_val = tl.load(a_ptrs)
+                    # Load B_exp scalar for this (j, n, h)
+                    be_ptrs = B_exp_ptr + b * be_bs + c * be_cs + j_idx * be_j + h * be_h + n * be_n
+                    b_val = tl.load(be_ptrs)
+                    inner[jj] = b_val * a_val
+
+            # Load C_exp scalar for this (i, n, h)
+            ce_ptrs = C_exp_ptr + b * ce_bs + c * ce_cs + i * ce_i + h * ce_h + n * ce_n
+            c_n = tl.load(ce_ptrs)
+            g_block += c_n * inner
+
+        # Store G[b, c, i, j, h] for this block
+        g_ptrs = G_ptr + b * g_bs + c * g_cs + i * g_i + j_offsets * g_j + h * g_h
+        tl.store(g_ptrs, g_block, mask=mask_j)
+
+# Triton kernel: compute Y_diag[b, c, i, h, d] = sum_j M[b, c, i, j, h] * hidden_states[b, c, j, h, d]
+# Inputs:
+#   M_ptr: [B, C, S, S, H] (float32)
+#   hidden_ptr: [B, C, S, H, D] (float32), contiguous along D at end
+#   Y_ptr: [B, C, S, H, D] (float32)
+# Grid: (B, C, S, H)
+@triton.jit
+def compute_Y_diag_kernel(
+    M_ptr, hidden_ptr, Y_ptr,
+    B, C, S, H, D,
+    m_bs, m_cs, m_i, m_j, m_h,
+    h_bs, h_cs, h_s, h_h, h_d,
+    y_bs, y_cs, y_i, y_h, y_d,
+    BLOCK_J: tl.constexpr,
+):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    i = tl.program_id(2)
+    h = tl.program_id(3)
+
+    # Reduce over j in tiles
+    for j_start in range(0, S, BLOCK_J):
+        j_offsets = j_start + tl.arange(0, BLOCK_J)
+        mask_j = j_offsets < S
+
+        # Initialize accumulator for this (b, c, i, h, d)
+        acc = tl.zeros([D], dtype=tl.float32)
+
+        # Loop over j
+        for jj in range(0, BLOCK_J):
+            j_idx = j_start + jj
+            if j_idx < S:
+                # Load M scalar M[b, c, i, j_idx, h]
+                m_ptrs = M_ptr + b * m_bs + c * m_cs + i * m_i + j_idx * m_j + h * m_h
+                m_val = tl.load(m_ptrs)
+
+                # Load hidden scalar hidden[b, c, j_idx, h, d] for all d
+                for d in range(0, D):
+                    h_ptrs = hidden_ptr + b * h_bs + c * h_cs + j_idx * h_s + h * h_h + d * h_d
+                    h_val = tl.load(h_ptrs)
+                    acc[d] += m_val * h_val
+
+        # Store Y[b, c, i, h, d] for this block
+        y_base = Y_ptr + b * y_bs + c * y_cs + i * y_i + h * y_h
+        for d in range(0, D):
+            y_ptrs = y_base + d * y_d
+            # acc[d] is already computed; store
+            tl.store(y_ptrs, acc[d])
+
+# Helper to create pointer grid with strides (we pass strides from tensors)
+def grid_launch_5d(B, C, S, H):
+    return (B, C, S, H)
+
+# ModelNew entry point
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, hidden_states: torch.Tensor, A_cumsum: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
+        # Extract shapes
+        Bsz, num_chunks, S, H, D = hidden_states.shape  # head_dim = D
+        # Ensure tensors on CUDA device
+        device = hidden_states.device
+        assert device.type == 'cuda', "ModelNew requires CUDA device for Triton kernels."
+
+        # Step 0: Compute L as exp(cumsum(A)) using PyTorch (to avoid Triton exp issues)
+        # A_cumsum: [B, H, C, S]
+        # We want L: [B, C, S, S, H] where L[i, j, h] = exp(sum_{t=0..j} A[b, h, c, t])
+        # Compute cumsum along last dim (S), per (b,h,c):
+        # Make A contiguous along S for simple cumsum
+        A = A_cumsum  # already [B,H,C,S]
+        # For each (b,h,c), cumsum along S:
+        cumsum_A = torch.cumsum(A, dim=-1)  # [B,H,C,S]
+        # Build L as exp(cumsum_A) with lower-triangular (i>=j) mask: we implement with PyTorch for reliability
+        # Since Triton exp may be problematic, we do it in PyTorch:
+        # L has shape [B,C,S,S,H]
+        L = torch.empty((Bsz, num_chunks, S, S, H), dtype=torch.float32, device=device)
+        for b in range(Bsz):
+            for c in range(num_chunks):
+                for h in range(H):
+                    # cumsum_A[b, h, c, :] is vector over S
+                    cs = cumsum_A[b, h, c, :]
+                    # Broadcast to [S,S] lower-triangular: i >= j
+                    i = torch.arange(S, device=device).view(S, 1)
+                    j = torch.arange(S, device=device).view(1, S)
+                    mask = (i >= j).to(cs.dtype)  # bool -> float
+                    # L[b, c, i, j, h] = exp(cs[j]) for i >= j, else 0
+                    L[b, c, :, :, h] = torch.exp(cs[j]) * mask
+
+        # Steps:
+        # 1) Build expanded B and C along H dimension: repeat_interleave(NUM_HEADS // N_GROUPS = 4) along dim=3.
+        # 2) Compute G in Triton: G[b, c, i, j, h] = sum over n of C_exp[b, c, i, h, n] * sum over j' of B_exp[b, c, j', h, n] * L[b, c, i, j', h].
+        #    But since L is lower-triangular, we can compute per (i, h) inner sum for each n and accumulate.
+
+        # Prepare expanded tensors
+        N_GROUPS = 8
+        N = B.shape[-1]  # state_size, typically 128
+
+        # B_expanded: [B, C, S, H, N] via repeat_interleave
+        B_exp = B.repeat_interleave(4, dim=3)  # expand heads
+        C_exp = C.repeat_interleave(4, dim=3)
+
+        # Ensure contiguous and float32
+        B_exp = B_exp.to(torch.float32).contiguous()
+        C_exp = C_exp.to(torch.float32).contiguous()
+        hidden_f32 = hidden_states.to(torch.float32).contiguous()
+
+        # Allocate G
+        G = torch.empty((Bsz, num_chunks, S, S, H), dtype=torch.float32, device=device)
+
+        # Launch Triton compute_G_per_j_kernel
+        # Strides for A_out (L), B_exp, C_exp, G
+        a_bs, a_cs, a_cs2, a_s, a_j, a_h = 0, 0, 0, L.stride(2), L.stride(3), L.stride(4)
+        be_bs, be_cs, be_j, be_h, be_n = B_exp.stride(0), B_exp.stride(1), B_exp.stride(2), B_exp.stride(3), B_exp.stride(4)
+        ce_bs, ce_cs, ce_i, ce_h, ce_n = C_exp.stride(0), C_exp.stride(1), C_exp.stride(2), C_exp.stride(3), C_exp.stride(4)
+        g_bs, g_cs, g_i, g_j, g_h = G.stride(0), G.stride(1), G.stride(2), G.stride(3), G.stride(4)
+
+        grid = (Bsz, num_chunks, S, H)
+        compute_G_per_j_kernel[grid](
+            L, B_exp, C_exp, G,
+            Bsz, num_chunks, S, H, N,
+            a_bs, a_cs, a_s, a_j, a_h,
+            be_bs, be_cs, be_j, be_h, be_n,
+            ce_bs, ce_cs, ce_i, ce_h, ce_n,
+            g_bs, g_cs, g_i, g_j, g_h,
+            num_warps=4, num_stages=2
+        )
+
+        # Now compute M = G * L (element-wise). Since G and L are both [B,C,S,S,H], M = G * L
+        M = G * L  # already float32
+
+        # Compute Y_diag = sum_j M[b, c, i, j, h] * hidden[b, c, j, h, d] for all d in [0..D-1]
+        # Y_diag: [B, C, S, H, D]
+        Y = torch.empty((Bsz, num_chunks, S, H, D), dtype=torch.float32, device=device)
+
+        # Launch Triton compute_Y_diag_kernel
+        # Strides for M, hidden, Y
+        m_bs, m_cs, m_i, m_j, m_h = M.stride(0), M.stride(1), M.stride(2), M.stride(3), M.stride(4)
+        h_bs, h_cs, h_s, h_h, h_d = hidden_f32.stride(0), hidden_f32.stride(1), hidden_f32.stride(2), hidden_f32.stride(3), hidden_f32.stride(4)
+        y_bs, y_cs, y_i, y_h, y_d = Y.stride(0), Y.stride(1), Y.stride(2), Y.stride(3), Y.stride(4)
+
+        grid_y = (Bsz, num_chunks, S, H)
+        compute_Y_diag_kernel[grid_y](
+            M, hidden_f32, Y,
+            Bsz, num_chunks, S, H, D,
+            m_bs, m_cs, m_i, m_j, m_h,
+            h_bs, h_cs, h_s, h_h, h_d,
+            y_bs, y_cs, y_i, y_h, y_d,
+            num_warps=4, num_stages=2
+        )
+
+        # Return in bfloat16 as original model does
+        return Y.to(torch.bfloat16)
+
+
+def run(*args):
+    return ModelNew()(*args)

@@ -1,0 +1,251 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# Kernel 1: compute logits = hidden_states @ weight^T + expert_bias
+# A: [M, K], row-major; W: [N, K], row-major; bias: [N]
+@triton.jit
+def linear_bias_kernel(
+    A_ptr,        # *fp32
+    W_ptr,        # *fp32
+    BIAS_ptr,     # *fp32
+    OUT_ptr,      # *fp32 logits: [M, N]
+    M, N, K,
+    stride_Am, stride_Ak,
+    stride_Wn, stride_Wk,
+    stride_Om, stride_On,
+):
+    pid = tl.program_id(axis=0)  # one program per token row
+    # Initialize accumulator for this token
+    acc = tl.zeros((), dtype=tl.float32)
+    # Loop over K dimension
+    for k in range(0, K):
+        # Load hidden state scalar for this token
+        a = tl.load(A_ptr + pid * stride_Am + k * stride_Ak)
+        # Load weight vector for all N experts at current k
+        w = tl.load(W_ptr + tl.arange(0, N) * stride_Wn + k * stride_Wk)
+        # Accumulate dot product
+        acc += tl.sum(a * w, axis=0)
+    # Add bias
+    bias = tl.load(BIAS_ptr + tl.arange(0, N))
+    out_vec = acc + bias
+    # Store output logits row
+    for n in range(0, N):
+        tl.store(OUT_ptr + pid * stride_Om + n * stride_On, out_vec[n])
+
+
+# Kernel 2: scores = sigmoid(logits) + expert_bias
+@triton.jit
+def sigmoid_bias_kernel(
+    LOGITS_ptr,   # *fp32 [M, N]
+    BIAS_ptr,     # *fp32 [N]
+    OUT_ptr,      # *fp32 [M, N]
+    M, N,
+    stride_Lm, stride_Ln,
+    stride_B,
+    stride_Om, stride_On,
+):
+    pid = tl.program_id(axis=0)
+    # For this token row, compute sigmoid and add bias
+    for n in range(0, N):
+        logit = tl.load(LOGITS_ptr + pid * stride_Lm + n * stride_Ln)
+        # Sigmoid: 1 / (1 + exp(-x))
+        sig = 1.0 / (1.0 + tl.exp(-logit))
+        bias = tl.load(BIAS_ptr + n * stride_B)
+        tl.store(OUT_ptr + pid * stride_Om + n * stride_On, sig + bias)
+
+
+# Kernel 3: select top-4 groups per token (sorted=False)
+@triton.jit
+def select_top4_groups_kernel(
+    SCORES_ptr,           # *fp32 [M, N]
+    SELECTED_GROUPS_ptr,  # *int32 [M, 4]
+    M, N, n_groups, g_per_group,
+    stride_Sm, stride_Sn,
+    stride_Gm, stride_Gg,
+):
+    pid = tl.program_id(axis=0)  # one program per token
+    scores = tl.load(SCORES_ptr + pid * stride_Sm + tl.arange(0, N) * stride_Sn)
+    selected = tl.zeros((4,), dtype=tl.int32)  # indices in [0..N-1]
+    # Iterative elimination for top-4 groups
+    for t in tl.static_range(4):
+        # Find max score index among unselected
+        max_val = -1.0e30
+        max_idx = -1
+        for i in range(0, N):
+            selected_flag = (selected == i).any()
+            if not selected_flag:
+                val = scores[i]
+                if val > max_val:
+                    max_val = val
+                    max_idx = i
+        # Mark selected
+        selected[t] = max_idx
+    # Store selected group indices
+    for t in tl.static_range(4):
+        tl.store(SELECTED_GROUPS_ptr + pid * stride_Gm + t * stride_Gg, selected[t])
+
+
+# Kernel 4: mask scores with selected groups (set non-selected groups to -inf)
+@triton.jit
+def mask_scores_with_groups_kernel(
+    SCORES_ptr,                # *fp32 [M, N]
+    SELECTED_GROUPS_ptr,       # *int32 [M, 4]
+    MASKED_SCORES_ptr,         # *fp32 [M, N]
+    M, N, n_groups, g_per_group,
+    stride_Sm, stride_Sn,
+    stride_Gm, stride_Gg,
+    stride_Mm, stride_Mn,
+):
+    pid = tl.program_id(axis=0)  # one program per token
+    scores = tl.load(SCORES_ptr + pid * stride_Sm + tl.arange(0, N) * stride_Sn)
+    # For each group, if not selected, set that group's experts to -inf
+    for t in tl.static_range(4):
+        idx = tl.load(SELECTED_GROUPS_ptr + pid * stride_Gm + t * stride_Gg)
+        start = idx * g_per_group
+        end = start + g_per_group
+        for i in range(0, N):
+            group_id = i // g_per_group
+            if (group_id != idx):
+                tl.store(MASKED_SCORES_ptr + pid * stride_Mm + i * stride_Mn, -1.0e30)
+            else:
+                tl.store(MASKED_SCORES_ptr + pid * stride_Mm + i * stride_Mn, scores[i])
+
+
+# Kernel 5: select top-8 experts from masked scores and compute weight using original logits
+@triton.jit
+def select_top8_experts_and_compute_weight_kernel(
+    LOGITS_ptr,               # *fp32 [M, N]
+    MASKED_SCORES_ptr,        # *fp32 [M, N]
+    TOPK_IDX_ptr,             # *int32 [M, 8]
+    TOPK_WEIGHT_ptr,          # *fp32 [M, 8]
+    M, N,
+    scaling_factor,           # fp32 scalar
+    stride_Lm, stride_Ln,
+    stride_Mm, stride_Mn,
+    stride_I0m, stride_Ik,
+    stride_Wm, stride_Wk,
+):
+    pid = tl.program_id(axis=0)  # one program per token
+    # Prepare selected indices and accumulate numerator = routed_scaling_factor * sum(selected_logits)
+    numerator = tl.zeros((), dtype=tl.float32)
+    selected_idx = tl.zeros((8,), dtype=tl.int32)
+    # Iterative elimination to pick top-8
+    for t in tl.static_range(8):
+        max_val = -1.0e30
+        max_idx = -1
+        for i in range(0, N):
+            # For non-selected indices, masked_scores sets them to -inf; for selected ones, use their masked_score
+            # But we need original logit for weight normalization; we can read masked_score and rely on selected_idx logic below
+            # For now, directly read masked_score for comparison
+            ms = tl.load(MASKED_SCORES_ptr + pid * stride_Mm + i * stride_Mn)
+            if ms > max_val:
+                max_val = ms
+                max_idx = i
+        # Mark selected
+        selected_idx[t] = max_idx
+        # For weight computation, we need original logits of selected indices
+        logit = tl.load(LOGITS_ptr + pid * stride_Lm + max_idx * stride_Ln)
+        numerator += logit  # Using original logits
+    # Compute weight = scaling_factor * (numerator / (numerator + eps)), eps = 1e-20
+    eps = 1e-20
+    denom = numerator + eps
+    weight = (numerator / denom) * scaling_factor
+    # Store topk_idx and topk_weight
+    for t in tl.static_range(8):
+        tl.store(TOPK_IDX_ptr + pid * stride_I0m + t * stride_Ik, selected_idx[t])
+        tl.store(TOPK_WEIGHT_ptr + pid * stride_Wm + t * stride_Wk, weight)
+
+# ==================== Host-side ModelNew ====================
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, hidden_states: torch.Tensor, weight: torch.Tensor, expert_bias: torch.Tensor, routed_scaling_factor: float):
+        # Ensure device and dtype
+        assert hidden_states.is_cuda and weight.is_cuda and expert_bias.is_cuda, "Inputs must be on CUDA for Triton kernels."
+        device = hidden_states.device
+        M = hidden_states.shape[0]
+        K = hidden_states.shape[1]
+        N = weight.shape[0]  # num_experts
+        assert N == 256, "This implementation assumes num_experts=256."
+        # Cast to float32 for computation
+        A = hidden_states.to(torch.float32)  # [M, K]
+        W = weight.to(torch.float32)         # [N, K]
+        bias = expert_bias.to(torch.float32) # [N]
+
+        # Allocate outputs
+        logits = torch.empty((M, N), dtype=torch.float32, device=device)          # [M, N]
+        scores = torch.empty((M, N), dtype=torch.float32, device=device)          # [M, N]
+        selected_groups = torch.empty((M, 4), dtype=torch.int32, device=device)   # [M, 4]
+        masked_scores = torch.empty((M, N), dtype=torch.float32, device=device)   # [M, N]
+        topk_idx = torch.empty((M, 8), dtype=torch.int32, device=device)          # [M, 8]
+        topk_weight = torch.empty((M, 8), dtype=torch.float32, device=device)     # [M, 8]
+
+        # Launch kernels
+        # 1) logits = A @ W^T + bias
+        grid1 = (M,)
+        linear_bias_kernel[grid1](
+            A, W, bias, logits,
+            M, N, K,
+            A.stride(0), A.stride(1),
+            W.stride(0), W.stride(1),
+            logits.stride(0), logits.stride(1),
+            num_warps=4, num_stages=2,
+        )
+
+        # 2) scores = sigmoid(logits) + bias
+        grid2 = (M,)
+        sigmoid_bias_kernel[grid2](
+            logits, bias, scores,
+            M, N,
+            logits.stride(0), logits.stride(1),
+            bias.stride(0),
+            scores.stride(0), scores.stride(1),
+            num_warps=4, num_stages=2,
+        )
+
+        # 3) select top-4 groups per token
+        grid3 = (M,)
+        select_top4_groups_kernel[grid3](
+            scores, selected_groups,
+            M, N, 8, 32,
+            scores.stride(0), scores.stride(1),
+            selected_groups.stride(0), selected_groups.stride(1),
+            num_warps=2, num_stages=2,
+        )
+
+        # 4) mask scores with selected groups (set non-selected groups to -inf)
+        grid4 = (M,)
+        mask_scores_with_groups_kernel[grid4](
+            scores, selected_groups, masked_scores,
+            M, N, 8, 32,
+            scores.stride(0), scores.stride(1),
+            selected_groups.stride(0), selected_groups.stride(1),
+            masked_scores.stride(0), masked_scores.stride(1),
+            num_warps=2, num_stages=2,
+        )
+
+        # 5) select top-8 from masked_scores and compute weight using original logits
+        grid5 = (M,)
+        select_top8_experts_and_compute_weight_kernel[grid5](
+            logits, masked_scores, topk_idx, topk_weight,
+            M, N,
+            routed_scaling_factor,
+            logits.stride(0), logits.stride(1),
+            masked_scores.stride(0), masked_scores.stride(1),
+            topk_idx.stride(0), topk_idx.stride(1),
+            topk_weight.stride(0), topk_weight.stride(1),
+            num_warps=4, num_stages=2,
+        )
+
+        # Cast indices to int64 to match original return type
+        topk_idx = topk_idx.to(torch.int64)
+        return topk_idx, topk_weight
+
+
+def run(*args):
+    return ModelNew()(*args)

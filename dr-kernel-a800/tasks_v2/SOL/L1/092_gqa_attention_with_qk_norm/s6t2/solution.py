@@ -1,0 +1,411 @@
+import torch
+import triton
+import triton.language as tl
+
+
+# ---------------------------
+# Triton kernels
+# ---------------------------
+
+@triton.jit
+def triton_batched_matmul_no_bias(
+    A_ptr,        # *fp32, shape [M, K]
+    Bt_ptr,       # *fp32, shape [N, K] (B^T)
+    C_ptr,        # *fp32, shape [M, N]
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    stride_am, stride_ak,   # A strides (row, col)
+    stride_bn, stride_bk,   # B^T strides (row, col)
+    stride_cm, stride_cn,   # C strides (row, col)
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        # A tile: [BLOCK_M, BLOCK_K]
+        a = tl.load(
+            A_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak),
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
+            other=0.0
+        )
+        # B^T tile: [BLOCK_K, BLOCK_N]
+        b = tl.load(
+            Bt_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn),
+            mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0
+        )
+        acc += tl.dot(a, b)
+
+    # Write C
+    tl.store(
+        C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn),
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N)
+    )
+
+
+@triton.jit
+def triton_rmsnorm_inplace_rowwise(
+    X_ptr,          # *fp32, 1D row (length D)
+    weight_ptr,     # *fp32, 1D (length D)
+    eps,            # fp32
+    M,              # number of rows (not used since we process one row per call)
+    D,              # row length
+    stride_xm, stride_xn,  # strides for X (row, col) — but we use 1D
+    BLOCK_D: tl.constexpr
+):
+    # Process one row (vectorized over D)
+    # Load row
+    offs = tl.arange(0, BLOCK_D)
+    mask = offs < D
+    x = tl.load(X_ptr + offs * stride_xn, mask=mask, other=0.0)
+    # Compute sum of squares
+    sum_sq = tl.sum(x * x)
+    mean = sum_sq / D
+    inv = 1.0 / tl.sqrt(mean + eps)
+    # Normalize and scale by weight
+    w = tl.load(weight_ptr + offs, mask=mask, other=0.0)
+    y = x * inv * w
+    tl.store(X_ptr + offs * stride_xn, y, mask=mask)
+
+
+@triton.jit
+def triton_attn_score_matmul(
+    Q_ptr,      # *fp32, shape [M, S] (M = B*num_heads)
+    K_ptr,      # *fp32, shape [M, S]
+    Out_ptr,    # *fp32, shape [M, S]
+    M, S,
+    stride_qm, stride_qs,  # Q strides
+    stride_km, stride_ks,  # K strides
+    stride_om, stride_os,  # Out strides
+    scaling,               # fp32 scalar
+    BLOCK_M: tl.constexpr, BLOCK_S: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+
+    # Accumulator per output row over S
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    # Loop over S in tiles
+    for s0 in range(0, S, BLOCK_S):
+        cur_s = s0 + tl.arange(0, BLOCK_S)
+        # Load Q rows and K rows
+        q = tl.load(
+            Q_ptr + (offs_m[:, None] * stride_qm + cur_s[None, :] * stride_qs),
+            mask=(offs_m[:, None] < M) & (cur_s[None, :] < S),
+            other=0.0
+        )
+        k = tl.load(
+            K_ptr + (offs_m[:, None] * stride_km + cur_s[None, :] * stride_ks),
+            mask=(offs_m[:, None] < M) & (cur_s[None, :] < S),
+            other=0.0
+        )
+        # acc += sum over s of Q[:, s] * K[:, s]
+        acc += tl.sum(q * k, axis=1)
+
+    # Scale
+    acc *= scaling
+    # Store
+    tl.store(
+        Out_ptr + (offs_m * stride_om + offs_s * stride_os),
+        acc[:, None],
+        mask=(offs_m[:, None] < M) & (offs_s[None, :] < S)
+    )
+
+
+@triton.jit
+def triton_softmax_rows(
+    X_ptr,      # *fp32, shape [M, S] where M = B*num_heads
+    M, S,
+    stride_xm, stride_xs,
+    BLOCK_S: tl.constexpr
+):
+    # One program per row
+    pid_m = tl.program_id(0)
+    # If pid_m >= M, return
+    if pid_m >= M:
+        return
+    # First pass: compute max
+    max_val = -float('inf')
+    for s0 in range(0, S, BLOCK_S):
+        cur_s = s0 + tl.arange(0, BLOCK_S)
+        mask = cur_s < S
+        x = tl.load(X_ptr + pid_m * stride_xm + cur_s * stride_xs, mask=mask, other=-float('inf'))
+        block_max = tl.max(x, axis=0)
+        max_val = tl.maximum(max_val, block_max)
+
+    # Second pass: compute sum of exp(x - max)
+    sum_val = 0.0
+    for s0 in range(0, S, BLOCK_S):
+        cur_s = s0 + tl.arange(0, BLOCK_S)
+        mask = cur_s < S
+        x = tl.load(X_ptr + pid_m * stride_xm + cur_s * stride_xs, mask=mask, other=-float('inf'))
+        x = x - max_val
+        exp_x = tl.exp(x)
+        sum_val += tl.sum(exp_x, axis=0)
+
+    # Third pass: write normalized output
+    for s0 in range(0, S, BLOCK_S):
+        cur_s = s0 + tl.arange(0, BLOCK_S)
+        mask = cur_s < S
+        x = tl.load(X_ptr + pid_m * stride_xm + cur_s * stride_xs, mask=mask, other=-float('inf'))
+        x = x - max_val
+        y = tl.exp(x) / sum_val
+        tl.store(X_ptr + pid_m * stride_xm + cur_s * stride_xs, y, mask=mask)
+
+
+@triton.jit
+def triton_final_attn_out(
+    Softmax_ptr,  # *fp32, shape [M, S]
+    V_ptr,        # *fp32, shape [M, D] (M = B*num_heads, D = head_dim)
+    Out_ptr,      # *fp32, shape [M, D]
+    M, S, D,
+    stride_sm, stride_ss,
+    stride_vm, stride_vs,
+    stride_om, stride_od,
+    BLOCK_S: tl.constexpr, BLOCK_D: tl.constexpr
+):
+    pid_m = tl.program_id(0)  # one program per output row
+    if pid_m >= M:
+        return
+    # Accumulate over S columns
+    acc = tl.zeros((D,), dtype=tl.float32)
+    for s0 in range(0, S, BLOCK_S):
+        cur_s = s0 + tl.arange(0, BLOCK_S)
+        mask_s = cur_s < S
+        # Load softmax row segment
+        sm = tl.load(Softmax_ptr + pid_m * stride_sm + cur_s * stride_ss, mask=mask_s, other=0.0)
+        # Loop over D in tiles to compute dot with V
+        for d0 in range(0, D, BLOCK_D):
+            cur_d = d0 + tl.arange(0, BLOCK_D)
+            mask_d = cur_d < D
+            V_seg = tl.load(
+                V_ptr + pid_m * stride_vm + cur_d * stride_vs,
+                mask=mask_d,
+                other=0.0
+            )  # [BLOCK_D]
+            # Compute contribution: sum over s of sm[s] * V_seg[:, None] for each s
+            # We need sm[s] * V_seg for each s, then accumulate into acc
+            # But V_seg is [BLOCK_D]; sm is length BLOCK_S. We can compute for each s by looping:
+            for i in range(BLOCK_S):
+                s_i = cur_s[i]
+                if s_i < S:
+                    contrib = sm[i] * V_seg
+                    acc += contrib
+    # Store result
+    tl.store(Out_ptr + pid_m * stride_om + tl.arange(0, BLOCK_D) * stride_od, acc, mask=(tl.arange(0, BLOCK_D) < D))
+
+
+# ---------------------------
+# ModelNew: forward
+# ---------------------------
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, num_attention_heads=96, num_key_value_heads=8, head_dim=128, num_key_value_groups=12, rms_norm_eps=1e-5):
+        super().__init__()
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim
+        self.num_key_value_groups = num_key_value_groups
+        self.rms_norm_eps = rms_norm_eps
+
+    def forward(self, hidden_states, q_proj_weight, q_proj_bias, k_proj_weight, k_proj_bias, v_proj_weight, v_proj_bias,
+                o_proj_weight, q_norm_weight, k_norm_weight, cos, sin):
+        # hidden_states: [B, S, hidden_dim]
+        B, S, hidden_dim = hidden_states.shape
+        device = hidden_states.device
+
+        # 1) Compute Q, K, V via Triton batched GEMM (no bias)
+        # We assume q_proj_weight: [Q_out, hidden_dim], k_proj_weight: [K_out, hidden_dim], v_proj_weight: [V_out, hidden_dim]
+        # Output dims:
+        Q_out = q_proj_weight.shape[0]
+        K_out = k_proj_weight.shape[0]
+        V_out = v_proj_weight.shape[0]
+        assert K_out == V_out, "k_proj_weight and v_proj_weight output dims must match"
+        assert hidden_dim == self.head_dim, "hidden_dim must match head_dim"
+
+        # Flatten A to [M, hidden_dim]
+        M = B * S
+        A = hidden_states.reshape(M, hidden_dim).to(torch.float32).contiguous()
+
+        # Q
+        Bt_Q = q_proj_weight.t().contiguous().to(torch.float32)  # [hidden_dim, hidden_dim]
+        Q = torch.empty((M, Q_out), device=device, dtype=torch.float32)
+        grid_q = (triton.cdiv(M, 64), triton.cdiv(Q_out, 64))
+        triton_batched_matmul_no_bias(
+            A, Bt_Q, Q,
+            M, Q_out, hidden_dim,
+            hidden_dim, 1,
+            Q_out, hidden_dim,
+            64, 64, 64,
+            grid=grid_q
+        )
+
+        # K
+        Bt_K = k_proj_weight.t().contiguous().to(torch.float32)
+        K = torch.empty((M, K_out), device=device, dtype=torch.float32)
+        grid_k = (triton.cdiv(M, 64), triton.cdiv(K_out, 64))
+        triton_batched_matmul_no_bias(
+            A, Bt_K, K,
+            M, K_out, hidden_dim,
+            hidden_dim, 1,
+            K_out, hidden_dim,
+            64, 64, 64,
+            grid=grid_k
+        )
+
+        # V
+        Bt_V = v_proj_weight.t().contiguous().to(torch.float32)
+        V = torch.empty((M, V_out), device=device, dtype=torch.float32)
+        grid_v = (triton.cdiv(M, 64), triton.cdiv(V_out, 64))
+        triton_batched_matmul_no_bias(
+            A, Bt_V, V,
+            M, V_out, hidden_dim,
+            hidden_dim, 1,
+            V_out, hidden_dim,
+            64, 64, 64,
+            grid=grid_v
+        )
+
+        # Reshape to heads
+        Q = Q.view(B, S, Q_out).view(B, S, self.num_attention_heads, self.head_dim)
+        K = K.view(B, S, self.num_key_value_heads, self.head_dim)
+        V = V.view(B, S, self.num_key_value_heads, self.head_dim)
+
+        # 2) RMSNorm for Q and K (per head across head_dim)
+        q_norm_w = q_norm_weight.to(torch.float32).contiguous()
+        k_norm_w = k_norm_weight.to(torch.float32).contiguous()
+
+        # Normalize query heads
+        for h in range(self.num_attention_heads):
+            Xh = Q[:, :, h, :]
+            Xh_flat = Xh.contiguous().view(B * S, self.head_dim)
+            triton_rmsnorm_inplace_rowwise(
+                Xh_flat, q_norm_w, self.rms_norm_eps, B * S, self.head_dim,
+                1, 1, 1,
+                BLOCK_D=128
+            )
+            Q[:, :, h, :] = Xh_flat.view(B, S, self.head_dim)
+
+        # Normalize key heads
+        for h in range(self.num_key_value_heads):
+            Xh = K[:, :, h, :]
+            Xh_flat = Xh.contiguous().view(B * S, self.head_dim)
+            triton_rmsnorm_inplace_rowwise(
+                Xh_flat, k_norm_w, self.rms_norm_eps, B * S, self.head_dim,
+                1, 1, 1,
+                BLOCK_D=128
+            )
+            K[:, :, h, :] = Xh_flat.view(B, S, self.head_dim)
+
+        # 3) Transpose to [B, num_heads, S, head_dim]
+        Q = Q.transpose(1, 2)  # [B, num_heads, S, head_dim]
+        K = K.transpose(1, 2)  # [B, num_key_value_heads, S, head_dim]
+        V = V.transpose(1, 2)  # [B, num_key_value_heads, S, head_dim]
+
+        # 4) Apply RotPE rotation
+        cos_exp = cos.to(torch.float32).unsqueeze(1)  # [B, 1, S, head_dim]
+        sin_exp = sin.to(torch.float32).unsqueeze(1)
+        for b in range(B):
+            for h in range(self.num_attention_heads):
+                q = Q[b, h, :, :]
+                q1 = q[:, :64]
+                q2 = q[:, 64:]
+                q_rot_half = torch.cat((-q2, q1), dim=1)
+                q = (q * cos_exp[b]) + (q_rot_half * sin_exp[b])
+                Q[b, h, :, :] = q
+            for h in range(self.num_key_value_heads):
+                k = K[b, h, :, :]
+                k1 = k[:, :64]
+                k2 = k[:, 64:]
+                k_rot_half = torch.cat((-k2, k1), dim=1)
+                k = (k * cos_exp[b]) + (k_rot_half * sin_exp[b])
+                K[b, h, :, :] = k
+
+        # 5) Grouped Query Attention: expand KV heads across groups to 96 attention heads
+        K_exp = K[:, :, None, :, :].expand(B, self.num_key_value_heads, self.num_key_value_groups, S, self.head_dim).reshape(B, self.num_attention_heads, S, self.head_dim)
+        V_exp = V[:, :, None, :, :].expand(B, self.num_key_value_heads, self.num_key_value_groups, S, self.head_dim).reshape(B, self.num_attention_heads, S, self.head_dim)
+        K = K_exp
+        V = V_exp
+
+        # 6) Compute attention scores S = Q @ K^T per (batch, head)
+        # M = B * num_attention_heads
+        M_attn = B * self.num_attention_heads
+        scaling = 1.0 / (self.head_dim ** 0.5)
+        # Flatten Q and K to [M, S]
+        Q_flat = Q.reshape(M_attn, S).contiguous()
+        K_flat = K.reshape(M_attn, S).contiguous()
+        S_attn = torch.empty((M_attn, S), device=device, dtype=torch.float32)
+        grid_sc = (triton.cdiv(M_attn, 64), triton.cdiv(S, 64))
+        triton_attn_score_matmul(
+            Q_flat, K_flat, S_attn,
+            M_attn, S,
+            S_attn.stride(0), S_attn.stride(1),
+            K_flat.stride(0), K_flat.stride(1),
+            S_attn.stride(0), S_attn.stride(1),
+            scaling,
+            64, 64,
+            grid=grid_sc
+        )
+
+        # 7) Softmax over last dim (sequence) per row: Triton softmax
+        grid_soft = (M_attn,)
+        triton_softmax_rows(
+            S_attn, M_attn, S,
+            S_attn.stride(0), S_attn.stride(1),
+            64,
+            grid=grid_soft
+        )
+
+        # 8) Compute final attention output O = softmax @ V via Triton (no bias)
+        # M = B * num_attention_heads, D = head_dim
+        Out = torch.empty((M_attn, self.head_dim), device=device, dtype=torch.float32)
+        grid_final = (M_attn,)
+        triton_final_attn_out(
+            S_attn, V.reshape(M_attn, self.head_dim).contiguous(),
+            Out,
+            M_attn, S, self.head_dim,
+            S_attn.stride(0), S_attn.stride(1),
+            V.reshape(M_attn, self.head_dim).stride(0), V.reshape(M_attn, self.head_dim).stride(1),
+            Out.stride(0), Out.stride(1),
+            64, 128,
+            grid=grid_final
+        )
+
+        # 9) Reshape and output projection (o_proj_weight: [out_features, in_features] = [hidden_dim, num_attention_heads*head_dim])
+        # Out is [B*num_attention_heads, head_dim]; we reshape to [B, S, head_dim] then flatten to [B, S, num_attention_heads*head_dim] and linear.
+        # However, original code's output shape is [B, S, num_attention_heads*head_dim], and uses o_proj_weight of shape [hidden_dim, num_attention_heads*head_dim] (e.g., [128, 12288]).
+        # We'll reshape Out to [B, S, head_dim] then apply linear (but we already have o_proj on [B*S, hidden_dim] as final).
+        # Given the original signature, we need to return [B, S, num_attention_heads*head_dim]. We can recover by viewing Out as [B, S, head_dim] and multiplying by o_proj_weight across heads.
+
+        # Instead of doing a PyTorch linear here (which would violate TRITON-only), we perform the final GEMM in Triton.
+        # Prepare A and W: A is Out[M, hidden_dim], W is o_proj_weight[hidden_dim, num_attention_heads*head_dim]. We need to transpose W to [num_attention_heads*head_dim, hidden_dim].
+        W_o_t = o_proj_weight.t().contiguous().to(torch.float32)  # [num_attention_heads*head_dim, hidden_dim]
+        A_final = Out  # [M, hidden_dim]
+        Output = torch.empty((M, W_o_t.shape[0]), device=device, dtype=torch.float32)
+        grid_o = (triton.cdiv(M, 64), triton.cdiv(W_o_t.shape[0], 64))
+        triton_batched_matmul_no_bias(
+            A_final, W_o_t, Output,
+            M, W_o_t.shape[0], self.head_dim,
+            A_final.stride(0), A_final.stride(1),
+            W_o_t.stride(0), W_o_t.stride(1),
+            64, 64, 64,
+            grid=grid_o
+        )
+
+        # Reshape to [B, S, num_attention_heads*head_dim]
+        Output = Output.view(B, S, self.num_attention_heads * self.head_dim)
+        return Output
+
+
+def run(*args):
+    return ModelNew()(*args)

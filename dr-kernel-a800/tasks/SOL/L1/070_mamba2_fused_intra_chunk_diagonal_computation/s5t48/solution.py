@@ -1,0 +1,235 @@
+import torch
+import triton
+import triton.language as tl
+
+
+# Kernel 1: Build L mask [B, C, 128, 128, H]
+@triton.jit
+def build_L_kernel(A_ptr,
+                   L_ptr,
+                   A_stride_b, A_stride_c, A_stride_l, A_stride_h,
+                   L_stride_b, L_stride_c, L_stride_i, L_stride_j, L_stride_h,
+                   Bsz: tl.int32, Csz: tl.int32, H: tl.int32, L_len: tl.int32):
+    # program ids: (b, c, h, i, j)
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    h = tl.program_id(2)
+    i = tl.program_id(3)  # vectorized over 128
+    j = tl.program_id(4)  # vectorized over 128
+
+    # Accumulate cumsum over k in [0..L_len-1] for A[b, c, k, h]
+    total = 0.0
+    for k in range(0, L_len):
+        # compute address: A[b, c, k, h]
+        a_off = b * A_stride_b + c * A_stride_c + k * A_stride_l + h * A_stride_h
+        a_val = tl.load(A_ptr + a_off)
+        total += a_val
+
+    # Set L[i, j] = exp(total) if j <= i, else 0
+    # L is 128x128 per (b, c, h)
+    # Only one (i, j) is computed per program; i and j come from grid
+    # But grid spans all i,j; we just store for this (i, j)
+    # Ensure i, j in range [0, 127]
+    if (i < 128) and (j < 128) and (j <= i):
+        l_off = b * L_stride_b + c * L_stride_c + i * L_stride_i + j * L_stride_j + h * L_stride_h
+        tl.store(L_ptr + l_off, tl.exp(total))
+    else:
+        l_off = b * L_stride_b + c * L_stride_c + i * L_stride_i + j * L_stride_j + h * L_stride_h
+        tl.store(L_ptr + l_off, 0.0)
+
+
+# Kernel 2: Expand B from groups to heads (repeat_interleave along group dim)
+@triton.jit
+def expand_groups_repeat_interleave_B(B_groups_ptr, B_heads_ptr,
+                                      B_groups_stride_b, B_groups_stride_c, B_groups_stride_l, B_groups_stride_g, B_groups_stride_s,
+                                      B_heads_stride_b, B_heads_stride_c, B_heads_stride_l, B_heads_stride_h, B_heads_stride_s,
+                                      Bsz: tl.int32, Csz: tl.int32, L: tl.int32, H: tl.int32, S: tl.int32,
+                                      GROUP_EXPAND: tl.int32):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    i = tl.program_id(2)
+    h = tl.program_id(3)
+    s = tl.program_id(4)
+    # g iterates over groups mapped to heads
+    for g in range(0, GROUP_EXPAND):
+        h_out = h * GROUP_EXPAND + g
+        in_off = b * B_groups_stride_b + c * B_groups_stride_c + i * B_groups_stride_l + 0 * B_groups_stride_g + s * B_groups_stride_s
+        out_off = b * B_heads_stride_b + c * B_heads_stride_c + i * B_heads_stride_l + h_out * B_heads_stride_h + s * B_heads_stride_s
+        val = tl.load(B_groups_ptr + in_off)
+        tl.store(B_heads_ptr + out_off, val)
+
+
+# Kernel 3: Expand C from groups to heads (repeat_interleave along group dim)
+@triton.jit
+def expand_groups_repeat_interleave_C(C_groups_ptr, C_heads_ptr,
+                                      C_groups_stride_b, C_groups_stride_c, C_groups_stride_l, C_groups_stride_g, C_groups_stride_s,
+                                      C_heads_stride_b, C_heads_stride_c, C_heads_stride_l, C_heads_stride_h, C_heads_stride_s,
+                                      Bsz: tl.int32, Csz: tl.int32, L: tl.int32, H: tl.int32, S: tl.int32,
+                                      GROUP_EXPAND: tl.int32):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    i = tl.program_id(2)
+    h = tl.program_id(3)
+    s = tl.program_id(4)
+    for g in range(0, GROUP_EXPAND):
+        h_out = h * GROUP_EXPAND + g
+        in_off = b * C_groups_stride_b + c * C_groups_stride_c + i * C_groups_stride_l + 0 * C_groups_stride_g + s * C_groups_stride_s
+        out_off = b * C_heads_stride_b + c * C_heads_stride_c + i * C_heads_stride_l + h_out * C_heads_stride_h + s * C_heads_stride_s
+        val = tl.load(C_groups_ptr + in_off)
+        tl.store(C_heads_ptr + out_off, val)
+
+
+# Kernel 4: Compute G[b, c, i, j, h] = sum_s C_exp[b, c, i, h, s] * B_exp[b, c, j, h, s]
+@triton.jit
+def compute_G_kernel(B_heads_ptr, C_heads_ptr, G_ptr,
+                     B_stride_b, B_stride_c, B_stride_l, B_stride_h, B_stride_s,
+                     C_stride_b, C_stride_c, C_stride_l, C_stride_h, C_stride_s,
+                     G_stride_b, G_stride_c, G_stride_i, G_stride_j, G_stride_h,
+                     Bsz: tl.int32, Csz: tl.int32, L: tl.int32, H: tl.int32, S: tl.int32):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    i = tl.program_id(2)
+    j = tl.program_id(3)
+    h = tl.program_id(4)
+
+    acc = 0.0
+    # loop over state dimension S
+    for s in range(0, S):
+        B_val = tl.load(B_heads_ptr + b * B_stride_b + c * B_stride_c + j * B_stride_l + h * B_stride_h + s * B_stride_s)
+        C_val = tl.load(C_heads_ptr + b * C_stride_b + c * C_stride_c + i * C_stride_l + h * C_stride_h + s * C_stride_s)
+        acc += B_val * C_val
+    # store result
+    tl.store(G_ptr + b * G_stride_b + c * G_stride_c + i * G_stride_i + j * G_stride_j + h * G_stride_h, acc)
+
+
+# Kernel 5: Elementwise M = G * L
+@triton.jit
+def elementwise_M_kernel(G_ptr, L_ptr, M_ptr,
+                         G_stride_b, G_stride_c, G_stride_i, G_stride_j, G_stride_h,
+                         L_stride_b, L_stride_c, L_stride_i, L_stride_j, L_stride_h,
+                         M_stride_b, M_stride_c, M_stride_i, M_stride_j, M_stride_h,
+                         Bsz: tl.int32, Csz: tl.int32, L_len: tl.int32, H: tl.int32):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    i = tl.program_id(2)
+    j = tl.program_id(3)
+    h = tl.program_id(4)
+
+    gval = tl.load(G_ptr + b * G_stride_b + c * G_stride_c + i * G_stride_i + j * G_stride_j + h * G_stride_h)
+    lval = tl.load(L_ptr + b * L_stride_b + c * L_stride_c + i * L_stride_i + j * L_stride_j + h * L_stride_h)
+    mval = gval * lval
+    tl.store(M_ptr + b * M_stride_b + c * M_stride_c + i * M_stride_i + j * M_stride_j + h * M_stride_h, mval)
+
+
+# Kernel 6: Compute Y[b, c, i, h, s] = sum_j M[b, c, i, j, h] * hidden[b, c, j, h, s]
+@triton.jit
+def compute_Y_kernel(M_ptr, hidden_ptr, Y_ptr,
+                     M_stride_b, M_stride_c, M_stride_i, M_stride_j, M_stride_h,
+                     hidden_stride_b, hidden_stride_c, hidden_stride_l, hidden_stride_h, hidden_stride_s,
+                     Y_stride_b, Y_stride_c, Y_stride_i, Y_stride_h, Y_stride_s,
+                     Bsz: tl.int32, Csz: tl.int32, L_len: tl.int32, H: tl.int32, S: tl.int32):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    i = tl.program_id(2)
+    h = tl.program_id(3)
+    s = tl.program_id(4)
+
+    acc = 0.0
+    for j in range(0, L_len):
+        mval = tl.load(M_ptr + b * M_stride_b + c * M_stride_c + i * M_stride_i + j * M_stride_j + h * M_stride_h)
+        hval = tl.load(hidden_ptr + b * hidden_stride_b + c * hidden_stride_c + j * hidden_stride_l + h * hidden_stride_h + s * hidden_stride_s)
+        acc += mval * hval
+    tl.store(Y_ptr + b * Y_stride_b + c * Y_stride_c + i * Y_stride_i + h * Y_stride_h + s * Y_stride_s, acc)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor, A_cumsum: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
+        """
+        Triton-optimized forward implementing the original logic:
+        - Build L mask (128x128 lower-triangular, diagonal=-1) applied to A_cumsum.
+        - Expand B and C from groups to heads.
+        - Compute G via contraction over S.
+        - Apply causal mask L: M = G * L.
+        - Compute Y_diag via reduction over j: Y[b, c, i, h, s] = sum_j M[b, c, i, j, h] * hidden[b, c, j, h, s].
+        Returns output in bfloat16.
+        """
+        # Ensure tensors are on CUDA and contiguous
+        device = hidden_states.device
+        assert hidden_states.is_cuda and A_cumsum.is_cuda and B.is_cuda and C.is_cuda, "All tensors must be on CUDA for Triton."
+        hidden_f32 = hidden_states.to(torch.float32).contiguous()
+        A_f32 = A_cumsum.to(torch.float32).contiguous()
+        B_f32 = B.to(torch.float32).contiguous()
+        C_f32 = C.to(torch.float32).contiguous()
+
+        Bsz, Csz, L, H, S = hidden_f32.shape
+
+        # 1) Build L mask [B, C, 128, 128, H] using Triton
+        L_mat = torch.empty((Bsz, Csz, 128, 128, H), dtype=torch.float32, device=device)
+        # launch with 5D grid: (Bsz, Csz, H, 128, 128)
+        grid_L = (Bsz, Csz, H, 128, 128)
+        build_L_kernel[grid_L](
+            A_f32, L_mat,
+            A_f32.stride(0), A_f32.stride(1), A_f32.stride(2), A_f32.stride(3),
+            L_mat.stride(0), L_mat.stride(1), L_mat.stride(2), L_mat.stride(3), L_mat.stride(4),
+            Bsz, Csz, H, L
+        )
+
+        # 2) Expand B and C from groups to heads (repeat-interleave by GROUP_EXPAND = 4)
+        GROUP_EXPAND = 4
+        B_exp = torch.empty((Bsz, Csz, L, H * GROUP_EXPAND, S), dtype=torch.float32, device=device)
+        C_exp = torch.empty((Bsz, Csz, L, H * GROUP_EXPAND, S), dtype=torch.float32, device=device)
+
+        # grid over (Bsz, Csz, L, H, S) -> expand along group dim
+        grid_expand = (Bsz, Csz, L, H, S)
+        expand_groups_repeat_interleave_B[grid_expand](
+            B_f32, B_exp,
+            B_f32.stride(0), B_f32.stride(1), B_f32.stride(2), B_f32.stride(3), B_f32.stride(4),
+            B_exp.stride(0), B_exp.stride(1), B_exp.stride(2), B_exp.stride(3), B_exp.stride(4),
+            Bsz, Csz, L, H, S, GROUP_EXPAND
+        )
+        expand_groups_repeat_interleave_C[grid_expand](
+            C_f32, C_exp,
+            C_f32.stride(0), C_f32.stride(1), C_f32.stride(2), C_f32.stride(3), C_f32.stride(4),
+            C_exp.stride(0), C_exp.stride(1), C_exp.stride(2), C_exp.stride(3), C_exp.stride(4),
+            Bsz, Csz, L, H, S, GROUP_EXPAND
+        )
+
+        # 3) Compute G[b, c, i, j, h] via contraction over S in Triton
+        G = torch.empty((Bsz, Csz, L, L, H), dtype=torch.float32, device=device)
+        grid_G = (Bsz, Csz, L, L, H)
+        compute_G_kernel[grid_G](
+            B_exp, C_exp, G,
+            B_exp.stride(0), B_exp.stride(1), B_exp.stride(2), B_exp.stride(3), B_exp.stride(4),
+            C_exp.stride(0), C_exp.stride(1), C_exp.stride(2), C_exp.stride(3), C_exp.stride(4),
+            G.stride(0), G.stride(1), G.stride(2), G.stride(3), G.stride(4),
+            Bsz, Csz, L, H, S
+        )
+
+        # 4) Apply causal mask: M = G * L element-wise in Triton
+        M = torch.empty((Bsz, Csz, L, L, H), dtype=torch.float32, device=device)
+        grid_M = (Bsz, Csz, L, L, H)
+        elementwise_M_kernel[grid_M](
+            G, L_mat, M,
+            G.stride(0), G.stride(1), G.stride(2), G.stride(3), G.stride(4),
+            L_mat.stride(0), L_mat.stride(1), L_mat.stride(2), L_mat.stride(3), L_mat.stride(4),
+            M.stride(0), M.stride(1), M.stride(2), M.stride(3), M.stride(4),
+            Bsz, Csz, L, H
+        )
+
+        # 5) Compute Y_diag[b, c, i, h, s] = sum_j M[b, c, i, j, h] * hidden[b, c, j, h, s] in Triton
+        Y = torch.empty((Bsz, Csz, L, H * GROUP_EXPAND, S), dtype=torch.float32, device=device)
+        grid_Y = (Bsz, Csz, L, H * GROUP_EXPAND, S)
+        compute_Y_kernel[grid_Y](
+            M, hidden_f32, Y,
+            M.stride(0), M.stride(1), M.stride(2), M.stride(3), M.stride(4),
+            hidden_f32.stride(0), hidden_f32.stride(1), hidden_f32.stride(2), hidden_f32.stride(3), hidden_f32.stride(4),
+            Y.stride(0), Y.stride(1), Y.stride(2), Y.stride(3), Y.stride(4),
+            Bsz, Csz, L, H, S
+        )
+
+        # Return in bfloat16 as in original signature
+        return Y.to(torch.bfloat16)
+
+
+def run(*args):
+    return ModelNew()(*args)

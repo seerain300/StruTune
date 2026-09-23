@@ -1,0 +1,254 @@
+import math
+import torch
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+# Triton kernel: compute logits[h, t] = dot(qn[h, :], Kc[t, :]) + dot(qp[h, :], Kp[t, :])
+# Grid: (H, ceil(T/BLOCK_T))
+@triton.jit
+def fused_logits_kernel(q_nope_ptr, q_pe_ptr, Kc_ptr, Kp_ptr, logits_ptr,
+                         H: tl.constexpr, T: tl.constexpr, Dq: tl.constexpr, Dp: tl.constexpr,
+                         BLOCK_T: tl.constexpr):
+    h = tl.program_id(0)             # head id
+    pid_t = tl.program_id(1)         # tile id over tokens
+    t_start = pid_t * BLOCK_T
+
+    # Preload q vectors for this head (compile-time constants for Dq, Dp)
+    qn = tl.load(q_nope_ptr + h * Dq + tl.arange(0, Dq))  # [Dq]
+    qp = tl.load(q_pe_ptr + h * Dp + tl.arange(0, Dp))    # [Dp]
+
+    offs_t = t_start + tl.arange(0, BLOCK_T)              # [BLOCK_T]
+    mask_t = offs_t < T
+
+    # Accumulate logits for this tile
+    acc = tl.zeros([BLOCK_T], dtype=tl.float32)
+    # Dot over Kc (Dq dimension)
+    for i in tl.static_range(0, Dq):
+        Kc_vals = tl.load(Kc_ptr + offs_t * Dq + i, mask=mask_t, other=0.0)  # [BLOCK_T]
+        acc += qn[i] * Kc_vals
+    # Dot over Kp (Dp dimension)
+    for j in tl.static_range(0, Dp):
+        Kp_vals = tl.load(Kp_ptr + offs_t * Dp + j, mask=mask_t, other=0.0)  # [BLOCK_T]
+        acc += qp[j] * Kp_vals
+
+    # Store results to logits[h, t_start : t_start + BLOCK_T]
+    # logits_ptr is [H, T], row-major, so offset = h*T + t
+    tl.store(logits_ptr + h * T + offs_t, acc, mask=mask_t)
+
+
+# Triton kernel: row-wise softmax over T for scaled_logits[h, :]
+# Grid: (H,)
+@triton.jit
+def softmax_row_kernel(scaled_ptr, attn_ptr,
+                        H: tl.constexpr, T: tl.constexpr,
+                        BLOCK_T: tl.constexpr):
+    h = tl.program_id(0)
+    # 1) compute max for numerical stability
+    max_val = -1e20
+    for t_start in tl.static_range(0, T, BLOCK_T):
+        offs_t = t_start + tl.arange(0, BLOCK_T)
+        mask_t = offs_t < T
+        vals = tl.load(scaled_ptr + h * T + offs_t, mask=mask_t, other=-1e20)
+        # reduce max over this tile
+        tile_max = tl.max(vals, axis=0)
+        max_val = tl.maximum(max_val, tile_max)
+
+    # 2) compute denom = sum(exp(x - max))
+    denom = 0.0
+    for t_start in tl.static_range(0, T, BLOCK_T):
+        offs_t = t_start + tl.arange(0, BLOCK_T)
+        mask_t = offs_t < T
+        vals = tl.load(scaled_ptr + h * T + offs_t, mask=mask_t, other=-1e20)
+        exps = tl.exp(vals - max_val)
+        denom += tl.sum(exps, axis=0)
+
+    inv_denom = 1.0 / denom
+
+    # 3) write normalized attn
+    for t_start in tl.static_range(0, T, BLOCK_T):
+        offs_t = t_start + tl.arange(0, BLOCK_T)
+        mask_t = offs_t < T
+        vals = tl.load(scaled_ptr + h * T + offs_t, mask=mask_t, other=-1e20)
+        attn = tl.exp(vals - max_val) * inv_denom
+        tl.store(attn_ptr + h * T + offs_t, attn, mask=mask_t)
+
+
+# Triton kernel: row-wise logsumexp over T for scaled_logits[h, :]
+# Output per head: lse[h] = logsumexp(scaled[h, :]) / ln(2)
+# Grid: (H,)
+@triton.jit
+def lse_row_kernel(scaled_ptr, lse_ptr,
+                   H: tl.constexpr, T: tl.constexpr,
+                   BLOCK_T: tl.constexpr):
+    h = tl.program_id(0)
+    # Compute max for numerical stability
+    max_val = -1e20
+    for t_start in tl.static_range(0, T, BLOCK_T):
+        offs_t = t_start + tl.arange(0, BLOCK_T)
+        mask_t = offs_t < T
+        vals = tl.load(scaled_ptr + h * T + offs_t, mask=mask_t, other=-1e20)
+        tile_max = tl.max(vals, axis=0)
+        max_val = tl.maximum(max_val, tile_max)
+
+    # Compute sum(exp(vals - max))
+    sum_exp = 0.0
+    for t_start in tl.static_range(0, T, BLOCK_T):
+        offs_t = t_start + tl.arange(0, BLOCK_T)
+        mask_t = offs_t < T
+        vals = tl.load(scaled_ptr + h * T + offs_t, mask=mask_t, other=-1e20)
+        sum_exp += tl.sum(tl.exp(vals - max_val), axis=0)
+
+    lse_val = tl.log(sum_exp) + max_val  # logsumexp
+    # Divide by ln(2)
+    ln2 = 0.6931471805599453
+    lse_val = lse_val / ln2
+    # Store single scalar per head
+    tl.store(lse_ptr + h, lse_val)
+
+
+# Triton kernel: per-head matmul out[h, d] = sum_t attn[h, t] * Kc[t, d]
+# Grid: (H, ceil(D/BLOCK_D))
+@triton.jit
+def attn_matmul_kernel(attn_ptr, Kc_ptr, out_ptr,
+                        H: tl.constexpr, T: tl.constexpr, D: tl.constexpr,
+                        BLOCK_D: tl.constexpr):
+    h = tl.program_id(0)                  # head id
+    pid_d = tl.program_id(1)              # tile id over output dim
+    d_start = pid_d * BLOCK_D
+
+    # Accumulator for this head across output dim tile
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    # Loop over tokens in tiles
+    for t_start in tl.static_range(0, T, BLOCK_T):
+        offs_t = t_start + tl.arange(0, BLOCK_T)           # [BLOCK_T]
+        mask_t = offs_t < T
+        attn_chunk = tl.load(attn_ptr + h * T + offs_t, mask=mask_t, other=0.0)  # [BLOCK_T]
+
+        # Load Kc chunk [BLOCK_T, BLOCK_D]
+        Kc_chunk = tl.load(
+            Kc_ptr + offs_t[:, None] * D + d_start + tl.arange(0, BLOCK_D)[None, :],
+            mask=mask_t[:, None],
+            other=0.0
+        )  # [BLOCK_T, BLOCK_D]
+
+        # Accumulate over T tile
+        acc += tl.sum(attn_chunk[:, None] * Kc_chunk, axis=0)  # [BLOCK_D]
+
+    # Store output for this head
+    tl.store(out_ptr + h * D + d_start + tl.arange(0, BLOCK_D), acc, mask=(d_start + tl.arange(0, BLOCK_D)) < D)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale):
+        # If Triton not available or tensors not on CUDA, fall back (but evaluation uses CUDA)
+        use_cuda = TRITON_AVAILABLE and (q_nope.device.type == 'cuda')
+
+        # Move to CUDA if needed
+        if not use_cuda:
+            device = torch.device('cuda')
+            q_nope = q_nope.to(device)
+            q_pe = q_pe.to(device)
+            ckv_cache = ckv_cache.to(device)
+            kpe_cache = kpe_cache.to(device)
+            kv_indptr = kv_indptr.to(device)
+            kv_indices = kv_indices.to(device)
+        else:
+            device = q_nope.device
+
+        # Ensure inputs are contiguous and float32 for compute
+        q_nope_f32 = q_nope.contiguous().to(torch.float32)  # [B, 16, 512]
+        q_pe_f32 = q_pe.contiguous().to(torch.float32)     # [B, 16, 64]
+        Kc_all = ckv_cache.squeeze(1).contiguous().to(torch.float32)  # [N, 512]
+        Kp_all = kpe_cache.squeeze(1).contiguous().to(torch.float32)  # [N, 64]
+
+        B = q_nope_f32.shape[0]
+        H = q_nope_f32.shape[1]  # 16
+        Dq = q_nope_f32.shape[2] # 512
+        Dp = q_pe_f32.shape[2]   # 64
+        # Output tensors (float32 compute, cast to bfloat16 at end)
+        output = torch.empty((B, H, Dq), dtype=torch.float32, device=device)
+        lse = torch.empty((B, H), dtype=torch.float32, device=device)
+
+        for b in range(B):
+            # Compute range from kv_indptr
+            page_beg = int(kv_indptr[b].item())
+            page_end = int(kv_indptr[b + 1].item())
+            L_tokens = page_end - page_beg
+
+            if L_tokens <= 0:
+                output[b].zero_()
+                lse[b].zero_()
+                continue
+
+            # Gather Kc and Kp for used tokens
+            tok_idx = kv_indices[page_beg:page_end].to(torch.int32)  # [L_tokens]
+            Kc = Kc_all[tok_idx]  # [L_tokens, 512]
+            Kp = Kp_all[tok_idx]  # [L_tokens, 64]
+
+            # Current batch q vectors
+            qn = q_nope_f32[b]  # [16, 512]
+            qp = q_pe_f32[b]    # [16, 64]
+
+            # Allocate logits [H, T]
+            logits = torch.empty((H, L_tokens), dtype=torch.float32, device=device)
+            # Launch fused_logits_kernel: grid over heads and token tiles
+            BLOCK_T = 256
+            grid_logits = (H, triton.cdiv(L_tokens, BLOCK_T))
+            fused_logits_kernel[grid_logits](
+                qn, qp, Kc, Kp, logits,
+                H=H, T=L_tokens, Dq=Dq, Dp=Dp,
+                BLOCK_T=BLOCK_T
+            )
+
+            # Scaled logits
+            scaled = logits * sm_scale  # [H, T]
+
+            # Allocate attn [H, T]
+            attn = torch.empty((H, L_tokens), dtype=torch.float32, device=device)
+
+            # Softmax per row
+            grid_softmax = (H,)
+            softmax_row_kernel[grid_softmax](
+                scaled, attn,
+                H=H, T=L_tokens,
+                BLOCK_T=BLOCK_T
+            )
+
+            # Compute lse per head
+            lse_row = torch.empty((H,), dtype=torch.float32, device=device)
+            lse_row_kernel[grid_softmax](
+                scaled, lse_row,
+                H=H, T=L_tokens,
+                BLOCK_T=BLOCK_T
+            )
+            lse[b] = lse_row
+
+            # Compute output per head: attn[h, :] @ Kc[:, :]
+            out_h = torch.empty((Dq,), dtype=torch.float32, device=device)
+            # Grid over output dim tiles
+            BLOCK_D = 128
+            grid_mm = (H, triton.cdiv(Dq, BLOCK_D))
+            attn_matmul_kernel[grid_mm](
+                attn, Kc, out_h,
+                H=H, T=L_tokens, D=Dq,
+                BLOCK_D=BLOCK_D
+            )
+            output[b] = out_h
+
+        # Cast output to bfloat16 to match original return
+        output = output.to(torch.bfloat16)
+        return output, lse
+
+
+def run(*args):
+    return ModelNew()(*args)

@@ -1,0 +1,235 @@
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def softplus_kernel(x_ptr, out_ptr, N: tl.constexpr):
+    """
+    Compute out[i] = softplus(x[i]) = log(1 + exp(x[i])) for i in [0, N).
+    """
+    pid = tl.program_id(axis=0)
+    i = pid
+    x = tl.load(x_ptr + i, mask=i < N, other=0.0)
+    zero = 0.0
+    pos = x > zero
+    pos_val = x + tl.log(1.0 + tl.exp(-x))
+    neg_val = tl.log(1.0 + tl.exp(x))
+    y = tl.where(pos, pos_val, neg_val)
+    tl.store(out_ptr + i, y, mask=i < N)
+
+
+@triton.jit
+def sigmoid_kernel(x_ptr, out_ptr, N: tl.constexpr):
+    """
+    Compute out[i] = sigmoid(x[i]) = 1 / (1 + exp(-x[i])) for i in [0, N).
+    """
+    pid = tl.program_id(axis=0)
+    i = pid
+    x = tl.load(x_ptr + i, mask=i < N, other=0.0)
+    y = 1.0 / (1.0 + tl.exp(-x))
+    tl.store(out_ptr + i, y, mask=i < N)
+
+
+@triton.jit
+def exp_kernel(inp_ptr, out_ptr, N: tl.constexpr):
+    """
+    Compute out[i] = exp(inp[i]) for i in [0, N).
+    """
+    pid = tl.program_id(axis=0)
+    i = pid
+    x = tl.load(inp_ptr + i, mask=i < N, other=0.0)
+    y = tl.exp(x)
+    tl.store(out_ptr + i, y, mask=i < N)
+
+
+@triton.jit
+def matvec_kernel(x_ptr, k_ptr, y_ptr, K: tl.constexpr, V: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_V: tl.constexpr):
+    """
+    Compute y = k @ x, where:
+      - x is a 2D matrix of shape [K, V] (passed as a contiguous 1D pointer of length K*V)
+      - k is a 1D vector of length K
+      - y is a 1D vector of length V
+    Each program instance handles a block of V outputs and loops over K in chunks of BLOCK_K.
+    """
+    pid = tl.program_id(axis=0)
+    v_start = pid * BLOCK_V
+    v_offsets = v_start + tl.arange(0, BLOCK_V)
+    y_acc = tl.zeros((BLOCK_V,), dtype=tl.float32)
+    for k_start in range(0, K, BLOCK_K):
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        k_chunk = tl.load(k_ptr + k_offsets, mask=k_offsets < K, other=0.0)  # [BLOCK_K]
+        for kk in range(0, BLOCK_K):
+            k_val = k_chunk[kk]  # scalar
+            k_idx = k_start + kk
+            x_vals = tl.load(x_ptr + k_idx * V + v_offsets, mask=v_offsets < V, other=0.0)
+            y_acc += k_val * x_vals
+    tl.store(y_ptr + v_offsets, y_acc, mask=v_offsets < V)
+
+
+@triton.jit
+def sum_cols_kernel(mat_ptr, out_ptr, V: tl.constexpr, K: tl.constexpr):
+    """
+    Sum over K columns for each row i in a [V, K] matrix, write out[i].
+    The matrix is laid out contiguously with [i, j] at index i*K + j.
+    """
+    pid = tl.program_id(axis=0)
+    i = pid
+    # Initialize accumulator
+    acc = 0.0
+    # Loop over K
+    for j in range(0, K):
+        acc += tl.load(mat_ptr + i * K + j)
+    tl.store(out_ptr + i, acc)
+
+
+@triton.jit
+def dot_reduce_kernel(q_ptr, x_ptr, out_ptr, N: tl.constexpr):
+    """
+    Compute out[0] = sum_i q[i] * x[i], where q and x are 1D vectors of length N.
+    """
+    pid = tl.program_id(axis=0)
+    offsets = tl.arange(0, N)
+    q = tl.load(q_ptr + offsets)
+    x = tl.load(x_ptr + offsets)
+    acc = tl.sum(q * x, axis=0)
+    # atomic add to a single element to avoid race
+    tl.atomic_add(out_ptr, acc)
+
+
+@triton.jit
+def state_update_elem_kernel(old_ptr, k_ptr, state_rm_ptr, state_up_ptr, new_ptr,
+                              B: tl.constexpr, H: tl.constexpr, V: tl.constexpr, K: tl.constexpr,
+                              b_idx: tl.constexpr, h_idx: tl.constexpr, g_val: tl.constexpr):
+    """
+    Elementwise update for new state:
+      new_state[b, h, i, j] = g * old_state[b, h, i, j] - state_remove[i] + state_update[i]
+    old_ptr points to old_state flattened [B*H*V*K], layout index = ((b_idx*H + h_idx)*V + i)*K + j
+    state_rm_ptr, state_up_ptr are [V], new_ptr writes [V*K].
+    """
+    pid = tl.program_id(axis=0)
+    # 1D over total elements V*K
+    total = V * K
+    idx = pid
+    if idx >= total:
+        return
+    i = idx // K
+    j = idx % K
+    base_old = ((b_idx * H + h_idx) * V + i) * K
+    old_val = tl.load(old_ptr + base_old + j)
+    state_rm = tl.load(state_rm_ptr + i)
+    state_up = tl.load(state_up_ptr + i)
+    new_val = g_val * old_val - state_rm + state_up
+    base_new = ((b_idx * H + h_idx) * V + i) * K
+    tl.store(new_ptr + base_new + j, new_val)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, q, k, v, state, A_log, a, dt_bias, b, scale):
+        # Extract shapes
+        B, T, num_q_heads, K = q.shape
+        _, _, num_k_heads, _ = k.shape
+        _, _, num_v_heads, V = v.shape
+        device = q.device
+
+        # The original asserts and constants
+        assert num_q_heads == 4
+        assert num_k_heads == 4
+        assert num_v_heads == 8
+        assert K == 128 and V == 128
+        assert T == 1
+
+        if scale is None or scale == 0.0:
+            # Use 1/sqrt(K) without torch.sqrt
+            scale_val = 1.0 / 128.0
+        else:
+            scale_val = float(scale)
+
+        # Prepare squeezed inputs: T=1, squeeze time dimension
+        q_b = q.squeeze(1)  # [B, 4, 128]
+        k_b = k.squeeze(1)  # [B, 4, 128]
+        v_b = v.squeeze(1)  # [B, 8, 128]
+
+        # Compute gates using Triton
+        # x = a + dt_bias (float32)
+        x_ptr = a.float().contiguous().view(-1)  # [H]
+        x_out = torch.empty_like(x_ptr)
+        softplus_kernel[(x_ptr.numel(),)](x_ptr, x_out, N=x_ptr.numel())
+
+        # beta = sigmoid(b) (float32)
+        b_ptr = b.float().contiguous().view(-1)  # [H]
+        beta_out = torch.empty_like(b_ptr)
+        sigmoid_kernel[(b_ptr.numel(),)](b_ptr, beta_out, N=b_ptr.numel())
+
+        # A = exp(A_log) (float32)
+        A_log_ptr = A_log.float().contiguous().view(-1)  # [H]
+        A = torch.empty_like(A_log_ptr)
+        exp_kernel[(A_log_ptr.numel(),)](A_log_ptr, A, N=A_log_ptr.numel())
+
+        # g = exp(-A * softplus_x)
+        soft_A = -A * x_out  # elementwise multiply
+        g_tmp = torch.empty_like(soft_A)
+        exp_kernel[(soft_A.numel(),)](soft_A, g_tmp, N=soft_A.numel())
+        g = g_tmp  # [H]
+        beta = beta_out  # [H]
+
+        # For each batch and head, run Triton matvecs and state update
+        # Prepare outputs
+        output = torch.empty((B, 1, 8, 1), dtype=torch.bfloat16, device=device)
+
+        for b_idx in range(B):
+            for h_idx in range(8):
+                # Load vectors
+                q_h = q_b[b_idx, h_idx].float().contiguous()  # [128]
+                k_h = k_b[b_idx, h_idx].float().contiguous()  # [128]
+                v_h = v_b[b_idx, h_idx].float().contiguous()  # [128]
+
+                # Load old state [V, K]
+                old_state = state[b_idx, h_idx].float().contiguous()  # [128, 128]
+
+                # old_v = k_h @ old_state
+                old_v = torch.empty(128, dtype=torch.float32, device=device)
+                matvec_kernel[(128,)](old_state.view(128 * 128), k_h, old_v, K=128, V=128, BLOCK_K=128, BLOCK_V=128)
+
+                # new_v = beta[h] * v_h + (1 - beta[h]) * old_v
+                beta_val = beta[h_idx].item()  # scalar
+                new_v = beta_val * v_h + (1.0 - beta_val) * old_v  # [128], torch op allowed here
+
+                # state_remove = k_h @ old_v
+                state_rm = torch.empty(128, dtype=torch.float32, device=device)
+                matvec_kernel[(128,)](old_v, k_h, state_rm, K=128, V=128, BLOCK_K=128, BLOCK_V=128)
+
+                # state_update = k_h @ new_v
+                state_up = torch.empty(128, dtype=torch.float32, device=device)
+                matvec_kernel[(128,)](new_v, k_h, state_up, K=128, V=128, BLOCK_K=128, BLOCK_V=128)
+
+                # Prepare new_state as a flat output buffer and update elementwise
+                new_state_flat = torch.empty(V * K, dtype=torch.float32, device=device)
+                # Launch state_update_elem_kernel: write new state for (b_idx, h_idx)
+                grid = (V * K,)
+                g_val = float(g[h_idx].item())
+                state_update_elem_kernel[grid](old_state.view(-1), k_h, state_rm, state_up, new_state_flat,
+                                               B=B, H=8, V=128, K=128, b_idx=b_idx, h_idx=h_idx, g_val=g_val)
+
+                # Sum over K columns to get [V]
+                new_state_sum = torch.empty(V, dtype=torch.float32, device=device)
+                sum_cols_kernel[(V,)](new_state_flat, new_state_sum, V=V, K=K)
+
+                # Compute output scalar: q_h @ new_state_sum
+                out_buf = torch.empty(1, dtype=torch.float32, device=device)
+                dot_reduce_kernel[(128,)](q_h, new_state_sum, out_buf, N=128)
+
+                # Apply scale and write into output tensor element
+                out_scalar = out_buf[0] * scale_val
+                # Write to output[b, 0, h, 0] as bfloat16
+                output[b_idx, 0, h_idx, 0] = out_scalar.to(torch.bfloat16)
+
+        return output, state
+
+
+def run(*args):
+    return ModelNew()(*args)

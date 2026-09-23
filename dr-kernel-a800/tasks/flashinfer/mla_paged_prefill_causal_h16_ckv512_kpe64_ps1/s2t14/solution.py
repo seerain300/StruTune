@@ -1,0 +1,170 @@
+import torch
+import math
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _compute_forward_single_query(
+    # Inputs (pointers)
+    q_nope_ptr,       # *bf16, [total_q, 16, 512]
+    q_pe_ptr,         # *bf16, [total_q, 16, 64]
+    Kc_sel_ptr,       # *bf16, [kv_len, 512] per batch element (host prepares per b)
+    Kp_sel_ptr,       # *bf16, [kv_len, 64]  per batch element (host prepares per b)
+    output_ptr,       # *bf16, [total_q, 16, 512]
+    lse_ptr,          # *fp32, [total_q, 16]
+    # runtime scalars
+    q_start,          # int32: qo_indptr[b]
+    q_abs,            # int32: absolute query index (q_start + i)
+    # constexpr meta-parameters
+    q_len: tl.constexpr,           # number of queries in this batch element
+    kv_len: tl.constexpr,          # number of selected KV tokens (compile-time for this program)
+    sm_scale: tl.constexpr,        # fp32 scaling factor
+    ln2_inv: tl.constexpr,         # fp32 = 1.0 / ln(2.0)
+    NUM_HEADS: tl.constexpr,       # 16
+    HEAD_DIM_CKV: tl.constexpr,    # 512
+    HEAD_DIM_KPE: tl.constexpr,    # 64
+):
+    # Compute per-head outputs
+    for h in range(NUM_HEADS):
+        # Load qn[h, :] and qp[h, :] as fp32
+        qn = tl.zeros((HEAD_DIM_CKV,), dtype=tl.float32)
+        qp = tl.zeros((HEAD_DIM_KPE,), dtype=tl.float32)
+        # For bf16 inputs, Triton needs pointers; but we assume q_nope/q_pe are provided as bf16 and we cast in-kernel:
+        # We access them via linear indexing. However, Triton expects contiguous tensors. The clean approach is to pass them as fp32 already.
+        # In this implementation, we assume q_nope_ptr/q_pe_ptr point to fp32 tensors already (host code will cast before passing).
+        # So we directly load as fp32:
+        base_qn = q_start * (NUM_HEADS * HEAD_DIM_CKV) + h * HEAD_DIM_CKV
+        for k in range(HEAD_DIM_CKV):
+            qn[k] = tl.load(q_nope_ptr + base_qn + k)
+        base_qp = q_start * (NUM_HEADS * HEAD_DIM_KPE) + h * HEAD_DIM_KPE
+        for k in range(HEAD_DIM_KPE):
+            qp[k] = tl.load(q_pe_ptr + base_qp + k)
+
+        # Initialize logits vector
+        logits = tl.zeros((kv_len,), dtype=tl.float32)
+
+        # Compute logits for each j in [0, kv_len)
+        for j in range(kv_len):
+            # Load Kc_sel[j, :] and Kp_sel[j, :]
+            Kc_j = tl.load(Kc_sel_ptr + j * HEAD_DIM_CKV + tl.arange(0, HEAD_DIM_CKV), mask=tl.arange(0, HEAD_DIM_CKV) < HEAD_DIM_CKV, other=0.0).to(tl.float32)
+            Kp_j = tl.load(Kp_sel_ptr + j * HEAD_DIM_KPE + tl.arange(0, HEAD_DIM_KPE), mask=tl.arange(0, HEAD_DIM_KPE) < HEAD_DIM_KPE, other=0.0).to(tl.float32)
+            dot_qn = tl.sum(qn * Kc_j, axis=0)  # scalar
+            dot_qp = tl.sum(qp * Kp_j, axis=0)  # scalar
+            logits[j] = dot_qn + dot_qp
+
+        # Scale
+        logits = logits * sm_scale
+
+        # Causal mask: abs_pos = (kv_len - q_len) + i + 1; here i is known from q_abs, but not directly accessible in kernel.
+        # We reconstruct i using q_abs - q_start. Since grid second dim is q_len, we can compute i = q_abs - q_start.
+        i = q_abs - q_start
+        abs_pos = (kv_len - q_len) + i + 1
+        j_vec = tl.arange(0, kv_len)
+        causal_mask = j_vec >= abs_pos
+        logits = tl.where(causal_mask, logits, -float("inf"))
+
+        # logsumexp in base-2: lse = (log(sum exp(logit)) * ln2_inv) + max(logit)
+        m = tl.max(logits, axis=0)
+        sumexp = tl.sum(tl.exp(logits - m), axis=0)
+        lse_val = (tl.log(sumexp) * ln2_inv) + m  # scalar
+        # Store lse[q_abs, h]
+        tl.store(lse_ptr + q_abs * NUM_HEADS + h, lse_val)
+
+        # Softmax (stable)
+        exp_logits = tl.exp(logits - m)
+        sumexp = tl.sum(exp_logits, axis=0)
+        softmax = exp_logits / sumexp  # [kv_len]
+
+        # Output: out[h, :] = sum_j softmax[j] * Kc_sel[j, :]
+        out_vec = tl.zeros((HEAD_DIM_CKV,), dtype=tl.float32)
+        for j in range(kv_len):
+            Kc_j = tl.load(Kc_sel_ptr + j * HEAD_DIM_CKV + tl.arange(0, HEAD_DIM_CKV), mask=tl.arange(0, HEAD_DIM_CKV) < HEAD_DIM_CKV, other=0.0).to(tl.float32)
+            out_vec += softmax[j] * Kc_j
+
+        # Store output vector as bfloat16
+        out_store = out_vec.to(tl.bfloat16)
+        base_out = q_abs * (NUM_HEADS * HEAD_DIM_CKV) + h * HEAD_DIM_CKV
+        for k in range(HEAD_DIM_CKV):
+            tl.store(output_ptr + base_out + k, out_store[k])
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale):
+        # Shape assertions
+        assert q_nope.shape[1] == 16 and q_nope.shape[2] == 512, "q_nope must be [Q_total, 16, 512]"
+        assert q_pe.shape[1] == 16 and q_pe.shape[2] == 64, "q_pe must be [Q_total, 16, 64]"
+        assert ckv_cache.shape[1] == 1 and ckv_cache.shape[2] == 512, "ckv_cache must be [num_pages, 1, 512]"
+        assert kpe_cache.shape[1] == 1 and kpe_cache.shape[2] == 64, "kpe_cache must be [num_pages, 1, 64]"
+        assert qo_indptr.dim() == 1 and kv_indptr.dim() == 1, "indptrs must be 1D"
+
+        device = q_nope.device
+        total_q, num_qo_heads, head_dim_ckv = q_nope.shape
+        head_dim_kpe = q_pe.shape[2]
+        len_indptr = qo_indptr.shape[0]
+        batch_size = len_indptr - 1
+
+        # Output and LSE buffers
+        output = torch.empty((total_q, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=device)
+        lse = torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=device)
+
+        # Precompute ln2_inv
+        ln2_inv = float(1.0 / math.log(2.0))
+
+        # Prepare K_sel per batch element: Kc_sel_b and Kp_sel_b as bfloat16, then we cast to fp32 inside the kernel.
+        # We can pass K_sel as contiguous [kv_len, dim] tensors for each b. For simplicity and robustness, we create them here.
+        # Note: In a fully Triton-only approach, we would avoid creating these tensors on host; but to satisfy the large caches,
+        # we construct them for each b. Since len_indptr and kv_len are typically small relative to num_pages, this is fine for the benchmark.
+        Kc_sel_list = []
+        Kp_sel_list = []
+        for b in range(1, len_indptr):
+            page_beg = int(kv_indptr[b].item())
+            # tok_idx for this batch element
+            tok_idx = kv_indices[page_beg:(int(kv_indptr[b + 1].item()))]  # indices into cache
+            # Gather from ckv_cache and kpe_cache
+            Kc_sel_b = ckv_cache[tok_idx]  # [kv_len, 512], bf16
+            Kp_sel_b = kpe_cache[tok_idx]  # [kv_len, 64],  bf16
+            Kc_sel_list.append(Kc_sel_b)
+            Kp_sel_list.append(Kp_sel_b)
+
+        # Launch Triton kernel: one program per (b, i)
+        grid = (batch_size, q_len := qo_indptr[1].item() - qo_indptr[0].item())  # placeholder q_len; will be set below
+
+        # We need actual q_len per b. To use constexpr per program, we launch a loop over b and call the kernel per b.
+        for b in range(1, len_indptr):
+            q_start = int(qo_indptr[b - 1].item())
+            # q_len for this batch element
+            q_len = int(qo_indptr[b].item()) - q_start
+            # Compute q_len_kp = q_len for q_pe (same)
+            # Prepare pointers for this b
+            Kc_sel_b = Kc_sel_list[b - 1].contiguous()  # [kv_len, 512]
+            Kp_sel_b = Kp_sel_list[b - 1].contiguous()  # [kv_len, 64]
+
+            # Ensure q_nope/q_pe are fp32 for in-kernel math (host casts)
+            # We can pass them as bf16 and cast inside the kernel (already done). But for robustness, cast to fp32 before launch.
+            q_nope_fp32 = q_nope.to(torch.float32)
+            q_pe_fp32 = q_pe.to(torch.float32)
+
+            # Launch kernel: grid second dim is q_len
+            grid_b = (1, q_len)
+            _compute_forward_single_query[grid_b](
+                q_nope_fp32, q_pe_fp32,
+                Kc_sel_b, Kp_sel_b,
+                output, lse,
+                q_start, q_start,  # q_abs will be computed inside; we pass q_start; kernel recomputes i = q_abs - q_start
+                q_len=q_len,
+                kv_len=Kc_sel_b.shape[0],  # typically 1 in this benchmark
+                sm_scale=float(sm_scale),
+                ln2_inv=ln2_inv,
+                NUM_HEADS=16,
+                HEAD_DIM_CKV=512,
+                HEAD_DIM_KPE=64,
+                num_warps=4,
+                num_stages=2,
+            )
+
+        return output, lse
+
+
+def run(*args):
+    return ModelNew()(*args)

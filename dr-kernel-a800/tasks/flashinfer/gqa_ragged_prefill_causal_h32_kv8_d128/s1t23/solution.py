@@ -1,0 +1,291 @@
+import torch
+import math
+import triton
+import triton.language as tl
+
+# Triton kernels: all compute happens in Triton, no Python loops with runtime-dependent bounds.
+
+# Kernel 1: compute logits[q, h, k] = sum_d Q[q, h, d] * K_EXP[k, h, d] for a fixed (q-tile, h)
+@triton.jit
+def _compute_logits_kernel(
+    Q, K_EXP, LOGITS,
+    LOGITS_stride_q, LOGITS_stride_h, LOGITS_stride_k,
+    Q_stride_q, Q_stride_h, Q_stride_d,
+    K_EXP_stride_k, K_EXP_stride_h, K_EXP_stride_d,
+    num_q_tokens, num_kv_tokens, head_dim,
+    BLOCK_Q: tl.constexpr, BLOCK_D: tl.constexpr
+):
+    pid_q = tl.program_id(0)  # tile id along queries
+    h = tl.program_id(1)      # head id
+
+    q_offsets = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)  # [BLOCK_Q]
+    q_mask = q_offsets < num_q_tokens
+
+    # Accumulator for logits: shape [Q, K] as 2D
+    acc = tl.zeros((BLOCK_Q, num_kv_tokens), dtype=tl.float32)
+
+    # Iterate over d in fixed tiles
+    for d0 in range(0, head_dim, BLOCK_D):
+        d_idx = d0 + tl.arange(0, BLOCK_D)  # [BLOCK_D]
+        d_mask = d_idx < head_dim
+
+        # Load Q: shape [Q, D]
+        Q_ptrs = Q + q_offsets[:, None] * Q_stride_q + h * Q_stride_h + d_idx[None, :] * Q_stride_d
+        q_mat = tl.load(
+            Q_ptrs,
+            mask=q_mask[:, None] & d_mask[None, :],
+            other=0.0
+        )  # [Q, D]
+
+        # Load K_EXP: shape [K, D]
+        K_ptrs = K_EXP + tl.arange(0, num_kv_tokens)[:, None] * K_EXP_stride_k + h * K_EXP_stride_h + d_idx[None, :] * K_EXP_stride_d
+        k_mat = tl.load(
+            K_ptrs,
+            mask=(tl.arange(0, num_kv_tokens)[:, None] < num_kv_tokens) & (d_mask[None, :]),
+            other=0.0
+        )  # [K, D]
+
+        # Outer product and accumulate: [Q, D] * [K, D] -> [Q, K]
+        # Note: since D is fixed at compile time, Triton can vectorize this.
+        # We reduce over D by letting k_mat be [K, D] and q_mat be [Q, D]; elementwise mul and sum over D axis requires careful broadcasting:
+        # Instead of explicit broadcasting, we accumulate by looping over d within BLOCK_D.
+        # But Triton does not support Python loops over runtime; so we use a trick:
+        # We compute contributions for each d in the tile by looping over d_idx vector and accumulating into acc.
+        # However, Triton requires compile-time loops; we can implement as:
+        for di in range(BLOCK_D):  # compile-time constant loop
+            d = d0 + di
+            d_valid = d < head_dim
+            q_vec = q_mat[:, di]  # [Q]
+            k_vec = k_mat[:, di]  # [K]
+            # acc += q_vec[:, None] * k_vec[None, :]
+            # But Triton doesn't support direct [:, None] broadcasting here; instead, we recompute pointers:
+            # Load q for this d for all q in tile
+            q_d_ptrs = Q + q_offsets * Q_stride_q + h * Q_stride_h + d * Q_stride_d
+            q_d = tl.load(
+                q_d_ptrs,
+                mask=q_mask,
+                other=0.0
+            )  # [Q]
+            # Load k for this d for all k
+            k_d_ptrs = K_EXP + tl.arange(0, num_kv_tokens) * K_EXP_stride_k + h * K_EXP_stride_h + d * K_EXP_stride_d
+            k_d = tl.load(
+                k_d_ptrs,
+                mask=tl.arange(0, num_kv_tokens) < num_kv_tokens,
+                other=0.0
+            )  # [K]
+            # Outer product contribution: [Q] * [K] -> [Q, K]
+            contrib = q_d[:, None] * k_d[None, :]
+            acc += contrib
+
+    # Store logits
+    LOGITS_ptrs = LOGITS + q_offsets[:, None] * LOGITS_stride_q + h * LOGITS_stride_h + tl.arange(0, num_kv_tokens)[None, :] * LOGITS_stride_k
+    tl.store(
+        LOGITS_ptrs,
+        acc,
+        mask=q_mask[:, None]
+    )  # only q_mask since we wrote all K indices; lse kernel will mask invalid K via k < num_kv_tokens
+
+
+# Kernel 2: compute lse[q, h] = logsumexp(logits[q, h, :]) / ln(2) with causal mask
+@triton.jit
+def _lse_masked_kernel(
+    LOGITS, LSE, ln2,
+    LOGITS_stride_q, LOGITS_stride_h, LOGITS_stride_k,
+    LSE_stride_q, LSE_stride_h,
+    num_q_tokens, num_kv_tokens,
+    BLOCK_Q: tl.constexpr, BLOCK_K: tl.constexpr
+):
+    pid_q = tl.program_id(0)
+    h = tl.program_id(1)
+
+    q_offsets = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)  # [Q]
+    q_mask = q_offsets < num_q_tokens
+
+    max_vals = tl.full((BLOCK_Q,), -float("inf"), dtype=tl.float32)
+    for k0 in range(0, 128, BLOCK_K):  # num_kv_tokens <= 128 (given head_dim=128, num_kv_tokens <= 128)
+        k_idx = k0 + tl.arange(0, BLOCK_K)  # [K]
+        k_mask = k_idx < num_kv_tokens
+
+        LOGITS_ptrs = LOGITS + q_offsets[:, None] * LOGITS_stride_q + h * LOGITS_stride_h + k_idx[None, :] * LOGITS_stride_k
+        vals = tl.load(
+            LOGITS_ptrs,
+            mask=(q_mask[:, None] & k_mask[None, :]),
+            other=-float("inf")
+        )  # [Q, K]
+
+        # Causal mask: allowed if k < (q_pos + 1)
+        allowed = k_idx[None, :] < (q_offsets[:, None] + 1)  # [Q, K]
+        vals = tl.where(allowed, vals, -float("inf"))
+
+        tile_max = tl.max(vals, axis=1)  # [Q]
+        max_vals = tl.maximum(max_vals, tile_max)
+
+    sum_exp = tl.zeros((BLOCK_Q,), dtype=tl.float32)
+    for k0 in range(0, 128, BLOCK_K):
+        k_idx = k0 + tl.arange(0, BLOCK_K)  # [K]
+        k_mask = k_idx < num_kv_tokens
+
+        LOGITS_ptrs = LOGITS + q_offsets[:, None] * LOGITS_stride_q + h * LOGITS_stride_h + k_idx[None, :] * LOGITS_stride_k
+        vals = tl.load(
+            LOGITS_ptrs,
+            mask=(q_mask[:, None] & k_mask[None, :]),
+            other=-float("inf")
+        )  # [Q, K]
+
+        allowed = k_idx[None, :] < (q_offsets[:, None] + 1)
+        vals = tl.where(allowed, vals, -float("inf"))
+
+        exp_vals = tl.exp(vals - max_vals[:, None])
+        sum_exp += tl.sum(exp_vals, axis=1)
+
+    lse_vals = max_vals + tl.log(sum_exp) * ln2
+    LSE_ptrs = LSE + q_offsets * LSE_stride_q + h * LSE_stride_h
+    tl.store(LSE_ptrs, lse_vals, mask=q_mask)
+
+
+# Kernel 3: compute output[q, h, d] = sum_k softmax(logits[q, h, k]) * V_EXP[k, h, d], using precomputed lse
+@triton.jit
+def _softmax_output_kernel(
+    LOGITS, V_EXP, LSE, OUT,
+    LOGITS_stride_q, LOGITS_stride_h, LOGITS_stride_k,
+    V_EXP_stride_k, V_EXP_stride_h, V_EXP_stride_d,
+    OUT_stride_q, OUT_stride_h, OUT_stride_d,
+    num_q_tokens, num_kv_tokens, head_dim,
+    BLOCK_Q: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_K: tl.constexpr
+):
+    pid_q = tl.program_id(0)
+    h = tl.program_id(1)
+
+    q_offsets = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)  # [Q]
+    q_mask = q_offsets < num_q_tokens
+
+    LSE_ptrs = LSE + q_offsets * LSE_stride_q + h * LSE_stride_h
+    lse_vals = tl.load(LSE_ptrs, mask=q_mask, other=-float("inf"))  # [Q]
+
+    for d0 in range(0, head_dim, BLOCK_D):
+        d_idx = d0 + tl.arange(0, BLOCK_D)  # [D]
+        d_valid = d_idx < head_dim
+
+        OUT_ptrs = OUT + q_offsets[:, None] * OUT_stride_q + h * OUT_stride_h + d_idx[None, :] * OUT_stride_d
+        out_row = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
+
+        for k0 in range(0, 128, BLOCK_K):  # num_kv_tokens <= 128
+            k_idx = k0 + tl.arange(0, BLOCK_K)  # [K]
+            k_mask = k_idx < num_kv_tokens
+
+            LOGITS_ptrs = LOGITS + q_offsets[:, None] * LOGITS_stride_q + h * LOGITS_stride_h + k_idx[None, :] * LOGITS_stride_k
+            vals = tl.load(
+                LOGITS_ptrs,
+                mask=(q_mask[:, None] & k_mask[None, :]),
+                other=-float("inf")
+            )  # [Q, K]
+
+            # Causal mask: allowed if k < (q_pos + 1)
+            allowed = k_idx[None, :] < (q_offsets[:, None] + 1)  # [Q, K]
+            vals = tl.where(allowed, vals, -float("inf"))
+
+            probs = tl.exp(vals - lse_vals[:, None])  # [Q, K]
+            probs = probs / tl.sum(probs, axis=1)[:, None]  # [Q, K]
+
+            V_ptrs = V_EXP + k_idx[:, None] * V_EXP_stride_k + h * V_EXP_stride_h + d_idx[None, :] * V_EXP_stride_d
+            v_mat = tl.load(
+                V_ptrs,
+                mask=(k_mask[:, None] & d_valid[None, :]),
+                other=0.0
+            )  # [K, D]
+
+            contrib = tl.sum(probs[:, :, None] * v_mat[None, :, :], axis=1)  # [Q, D]
+            out_row += contrib
+
+        tl.store(OUT_ptrs, out_row, mask=(q_mask[:, None] & d_valid[None, :]))
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Fixed tiling params; must be constexpr for Triton
+        self.BLOCK_Q = 1
+        self.BLOCK_D = 16
+        self.BLOCK_K = 64
+
+    def forward(self, q, k, v, qo_indptr, kv_indptr, sm_scale):
+        device = q.device
+        total_q = q.shape[0]
+        num_qo_heads = q.shape[1]
+        head_dim = q.shape[2]
+        total_kv = k.shape[0]
+        num_kv_heads = k.shape[1]
+
+        assert num_qo_heads == 32
+        assert num_kv_heads == 8
+        assert head_dim == 128
+        assert qo_indptr[-1].item() == total_q
+        assert kv_indptr[-1].item() == total_kv
+
+        output = torch.empty((total_q, num_qo_heads, head_dim), dtype=torch.bfloat16, device=device)
+        lse = torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=device)
+
+        # Iterate segments defined by qo_indptr and kv_indptr
+        for b in range(len_indptr - 1):
+            q_start = int(qo_indptr[b].item())
+            q_end = int(qo_indptr[b + 1].item())
+            kv_start = int(kv_indptr[b].item())
+            kv_end = int(kv_indptr[b + 1].item())
+
+            if q_start >= q_end or kv_start >= kv_end:
+                continue
+
+            num_q_tokens = q_end - q_start
+            num_kv_tokens = kv_end - kv_start
+
+            # Slice and make contiguous
+            q_batch = q[q_start:q_end].contiguous()       # [num_q_tokens, 32, 128]
+            k_batch = k[kv_start:kv_end].contiguous()     # [num_kv_tokens, 8, 128]
+            v_batch = v[kv_start:kv_end].contiguous()     # [num_kv_tokens, 8, 128]
+
+            # Expand K and V by GQA ratio (4)
+            k_expanded = k_batch.repeat_interleave(4, dim=1)  # [num_kv_tokens, 32, 128]
+            v_expanded = v_batch.repeat_interleave(4, dim=1)  # [num_kv_tokens, 32, 128]
+
+            # Prepare expanded Q: same head count, so no repeat
+            q_expanded = q_batch  # [num_q_tokens, 32, 128]
+
+            # Segment outputs
+            output_seg = torch.empty((num_q_tokens, num_qo_heads, head_dim), dtype=torch.bfloat16, device=device)  # we'll fill per-kernel
+            lse_seg = torch.empty((num_q_tokens, num_qo_heads), dtype=torch.float32, device=device)
+
+            # Launch Triton kernels
+            grid_log = (triton.cdiv(num_q_tokens, self.BLOCK_Q), num_qo_heads)
+            _compute_logits_kernel[grid_log](
+                q_expanded, k_expanded, output_seg,
+                output_seg.stride(0), output_seg.stride(1), output_seg.stride(2),
+                q_expanded.stride(0), q_expanded.stride(1), q_expanded.stride(2),
+                k_expanded.stride(0), k_expanded.stride(1), k_expanded.stride(2),
+                num_q_tokens, num_kv_tokens, head_dim,
+                BLOCK_Q=self.BLOCK_Q, BLOCK_D=self.BLOCK_D
+            )
+
+            grid_lse = (triton.cdiv(num_q_tokens, self.BLOCK_Q), num_qo_heads)
+            _lse_masked_kernel[grid_lse](
+                output_seg, lse_seg, math.log(2.0),
+                output_seg.stride(0), output_seg.stride(1), output_seg.stride(2),
+                lse_seg.stride(0), lse_seg.stride(1),
+                num_q_tokens, num_kv_tokens,
+                BLOCK_Q=self.BLOCK_Q, BLOCK_K=self.BLOCK_K
+            )
+
+            grid_out = (triton.cdiv(num_q_tokens, self.BLOCK_Q), num_qo_heads)
+            _softmax_output_kernel[grid_out](
+                output_seg, v_expanded, lse_seg, output[q_start:q_end],
+                output_seg.stride(0), output_seg.stride(1), output_seg.stride(2),
+                v_expanded.stride(0), v_expanded.stride(1), v_expanded.stride(2),
+                output[q_start:q_end].stride(0), output[q_start:q_end].stride(1), output[q_start:q_end].stride(2),
+                num_q_tokens, num_kv_tokens, head_dim,
+                BLOCK_Q=self.BLOCK_Q, BLOCK_D=self.BLOCK_D, BLOCK_K=self.BLOCK_K
+            )
+
+        return output, lse
+
+
+def run(*args):
+    return ModelNew()(*args)

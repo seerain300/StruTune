@@ -1,0 +1,296 @@
+import math
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv2d_stride2_pad1_4d_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    B, Ci, H, W, Co, Kh, Kw, Ho, Wo,
+    x_s0, x_s1, x_s2, x_s3,
+    w_s0, w_s1, w_s2, w_s3,
+    y_s0, y_s1, y_s2, y_s3,
+):
+    # program ids: (batch, out_channel, out_h, out_w)
+    b_id = tl.program_id(0)
+    co_id = tl.program_id(1)
+    ho_id = tl.program_id(2)
+    wo_id = tl.program_id(3)
+
+    # accumulate in fp32
+    acc = tl.zeros((), dtype=tl.float32)
+
+    # loop over input channels and kernel
+    for ci in range(Ci):
+        for kh in range(Kh):
+            hi = ho_id * 2 + 1 - kh
+            for kw in range(Kw):
+                wi = wo_id * 2 + 1 - kw
+                in_bounds = (hi >= 0) & (hi < H) & (wi >= 0) & (wi < W)
+                x_off = b_id * x_s0 + ci * x_s1 + hi * x_s2 + wi * x_s3
+                x_val = tl.load(x_ptr + x_off, mask=in_bounds, other=0.0)
+                w_off = co_id * w_s0 + ci * w_s1 + kh * w_s2 + kw * w_s3
+                w_val = tl.load(w_ptr + w_off)
+                acc += x_val.to(tl.float32) * w_val.to(tl.float32)
+
+    # add bias
+    b_val = tl.load(b_ptr + co_id).to(tl.float32)
+    acc += b_val
+
+    y_off = b_id * y_s0 + co_id * y_s1 + ho_id * y_s2 + wo_id * y_s3
+    # store as fp32; y_ptr dtype should match desired output dtype, typically same as x
+    tl.store(y_ptr + y_off, acc)
+
+
+@triton.jit
+def gelu_tanh_4d_kernel(
+    x_ptr, y_ptr,
+    B, Ci, H, W, Co, Kh, Kw, Ho, Wo,
+    x_s0, x_s1, x_s2, x_s3,
+    y_s0, y_s1, y_s2, y_s3,
+):
+    b_id = tl.program_id(0)
+    co_id = tl.program_id(1)
+    ho_id = tl.program_id(2)
+    wo_id = tl.program_id(3)
+
+    x_off = b_id * x_s0 + co_id * x_s1 + ho_id * x_s2 + wo_id * x_s3
+    x_val = tl.load(x_ptr + x_off).to(tl.float32)
+
+    c = 0.7978845608028654  # sqrt(2/pi)
+    x3 = x_val * x_val * x_val
+    gelu = 0.5 * x_val * (1.0 + tl.math.tanh(c * (x_val + 0.044715 * x3)))
+
+    y_off = b_id * y_s0 + co_id * y_s1 + ho_id * y_s2 + wo_id * y_s3
+    tl.store(y_ptr + y_off, gelu)
+
+
+@triton.jit
+def gather_conv3_to_BTW_1d_kernel(
+    src_ptr, dst_ptr,
+    B, Co, Ho3, Wo3, Tafter,
+    src_s0, src_s1, src_s2, src_s3,
+    dst_s0, dst_s1, dst_s2,
+):
+    # Linear index over total elements: idx in [0, B * Tafter * (Co*Ho3*Wo3))
+    idx = tl.program_id(0)
+    # Decompose idx into (b, t, k)
+    b_idx = idx // (Tafter * (Co * Ho3 * Wo3))
+    t_idx = (idx // (Co * Ho3 * Wo3)) % Tafter
+    k_idx = idx % (Co * Ho3 * Wo3)
+
+    # Map k to (co, ho, wo) in src: k = co*Ho3*Wo3 + ho*Wo3 + wo
+    co = k_idx // (Ho3 * Wo3)
+    rem = k_idx % (Ho3 * Wo3)
+    ho = rem // Wo3
+    wo = rem % Wo3
+
+    # src offset
+    src_off = b_idx * src_s0 + co * src_s1 + ho * src_s2 + wo * src_s3
+    # dst offset
+    dst_off = b_idx * dst_s0 + t_idx * dst_s1 + k_idx * dst_s2
+
+    val = tl.load(src_ptr + src_off).to(tl.float32)
+    tl.store(dst_ptr + dst_off, val)
+
+
+@triton.jit
+def linear_proj_1d_kernel(
+    x_ptr, w_ptr, y_ptr,
+    B, Tafter, K, D,
+    x_s0, x_s1, x_s2,  # x strides for (B, Tafter, K)
+    w_s0, w_s1,        # w strides for (D, K)
+    y_s0, y_s1, y_s2,  # y strides for (B, Tafter, D)
+):
+    # one program per output element (b, t, d)
+    pid = tl.program_id(0)
+    total = B * Tafter * D
+    b_idx = pid // (Tafter * D)
+    t_idx = (pid // D) % Tafter
+    d_idx = pid % D
+
+    acc = tl.zeros((), dtype=tl.float32)
+    for k in range(0, K):  # K=3840
+        x_off = b_idx * x_s0 + t_idx * x_s1 + k * x_s2
+        x_val = tl.load(x_ptr + x_off).to(tl.float32)
+        w_off = d_idx * w_s0 + k * w_s1
+        w_val = tl.load(w_ptr + w_off).to(tl.float32)
+        acc += x_val * w_val
+
+    y_off = b_idx * y_s0 + t_idx * y_s1 + d_idx * y_s2
+    tl.store(y_ptr + y_off, acc)
+
+
+@triton.jit
+def add_pos_scale_2d_kernel(
+    out_ptr, pos_ptr, scale,
+    B, Tafter, D,
+    out_s0, out_s1, out_s2,
+    pos_s0, pos_s1,
+):
+    # 2D grid: (B*Tafter, D)
+    pid_row = tl.program_id(0)
+    pid_col = tl.program_id(1)
+    b_idx = pid_row // Tafter
+    t_idx = pid_row % Tafter
+    d_idx = pid_col
+
+    out_off = b_idx * out_s0 + t_idx * out_s1 + d_idx * out_s2
+    out_val = tl.load(out_ptr + out_off).to(tl.float32)
+
+    pos_off = t_idx * pos_s0 + d_idx * pos_s1
+    pos_val = tl.load(pos_ptr + pos_off).to(tl.float32)
+
+    new_val = out_val + pos_val * scale
+    tl.store(out_ptr + out_off, new_val)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, conv2d1_weight, conv2d1_bias, conv2d2_weight, conv2d2_bias, conv2d3_weight, conv2d3_bias, conv_out_weight, positional_embedding, embed_scale):
+        super().__init__()
+        # Register buffers (not trainable); keep original devices/dtypes
+        self.register_buffer("conv2d1_weight", conv2d1_weight)  # (384, 1, 3, 3)
+        self.register_buffer("conv2d1_bias", conv2d1_bias)      # (384,)
+        self.register_buffer("conv2d2_weight", conv2d2_weight)  # (384, 384, 3, 3)
+        self.register_buffer("conv2d2_bias", conv2d2_bias)      # (384,)
+        self.register_buffer("conv2d3_weight", conv2d3_weight)  # (384, 384, 3, 3)
+        self.register_buffer("conv2d3_bias", conv2d3_bias)      # (384,)
+        self.register_buffer("conv_out_weight", conv_out_weight)  # (1024, 3840)
+        self.register_buffer("positional_embedding", positional_embedding)  # (1500, 1024)
+        self.embed_scale = float(embed_scale)  # 32.0
+
+    def forward(self, input_features):
+        # Ensure input is contiguous (B, 1, 80, T0), bfloat16
+        x0 = input_features.contiguous()
+        B, Ci, H, W = x0.shape  # Ci=1
+        # conv1: output (B, 384, 40, W1) with W1 = W//2
+        Co1 = self.conv2d1_weight.shape[0]
+        Kh1, Kw1 = 3, 3
+        Ho1 = (H + 2 * 1 - Kh1) // 2 + 1
+        Wo1 = (W + 2 * 1 - Kw1) // 2 + 1
+
+        x1 = torch.empty((B, Co1, Ho1, Wo1), device=x0.device, dtype=torch.float32)
+        grid1 = (B, Co1, Ho1, Wo1)
+        conv2d_stride2_pad1_4d_kernel[grid1](
+            x0, self.conv2d1_weight, self.conv2d1_bias, x1,
+            B, Ci, H, W, Co1, Kh1, Kw1, Ho1, Wo1,
+            x0.stride(0), x0.stride(1), x0.stride(2), x0.stride(3),
+            self.conv2d1_weight.stride(0), self.conv2d1_weight.stride(1), self.conv2d1_weight.stride(2), self.conv2d1_weight.stride(3),
+            x1.stride(0), x1.stride(1), x1.stride(2), x1.stride(3),
+            num_warps=4, num_stages=2
+        )
+
+        # GELU on conv1 output
+        x1_gelu = torch.empty_like(x1)  # same shape, fp32
+        grid_gelu1 = (B, Co1, Ho1, Wo1)
+        gelu_tanh_4d_kernel[grid_gelu1](
+            x1, x1_gelu,
+            B, Ci, H, W, Co1, Kh1, Kw1, Ho1, Wo1,
+            x1.stride(0), x1.stride(1), x1.stride(2), x1.stride(3),
+            x1_gelu.stride(0), x1_gelu.stride(1), x1_gelu.stride(2), x1_gelu.stride(3),
+            num_warps=4, num_stages=2
+        )
+
+        # conv2: (384 -> 384), output (B, 384, 20, Wo1//2)
+        Co2 = self.conv2d2_weight.shape[0]
+        Ho2 = (Ho1 + 2 * 1 - 3) // 2 + 1
+        Wo2 = (Wo1 + 2 * 1 - 3) // 2 + 1
+
+        x2 = torch.empty((B, Co2, Ho2, Wo2), device=x0.device, dtype=torch.float32)
+        grid2 = (B, Co2, Ho2, Wo2)
+        conv2d_stride2_pad1_4d_kernel[grid2](
+            x1_gelu, self.conv2d2_weight, self.conv2d2_bias, x2,
+            B, Co1, Ho1, Wo1, Co2, 3, 3, Ho2, Wo2,
+            x1_gelu.stride(0), x1_gelu.stride(1), x1_gelu.stride(2), x1_gelu.stride(3),
+            self.conv2d2_weight.stride(0), self.conv2d2_weight.stride(1), self.conv2d2_weight.stride(2), self.conv2d2_weight.stride(3),
+            x2.stride(0), x2.stride(1), x2.stride(2), x2.stride(3),
+            num_warps=4, num_stages=2
+        )
+
+        # GELU on conv2 output
+        x2_gelu = torch.empty_like(x2)
+        grid_gelu2 = (B, Co2, Ho2, Wo2)
+        gelu_tanh_4d_kernel[grid_gelu2](
+            x2, x2_gelu,
+            B, Co1, Ho1, Wo1, Co2, 3, 3, Ho2, Wo2,
+            x2.stride(0), x2.stride(1), x2.stride(2), x2.stride(3),
+            x2_gelu.stride(0), x2_gelu.stride(1), x2_gelu.stride(2), x2_gelu.stride(3),
+            num_warps=4, num_stages=2
+        )
+
+        # conv3: (384 -> 384), output (B, 384, 10, Wo2//2) = (B, 384, 10, Tafter)
+        Co3 = self.conv2d3_weight.shape[0]
+        Ho3 = (Ho2 + 2 * 1 - 3) // 2 + 1
+        Wo3 = (Wo2 + 2 * 1 - 3) // 2 + 1  # Tafter
+
+        x3 = torch.empty((B, Co3, Ho3, Wo3), device=x0.device, dtype=torch.float32)
+        grid3 = (B, Co3, Ho3, Wo3)
+        conv2d_stride2_pad1_4d_kernel[grid3](
+            x2_gelu, self.conv2d3_weight, self.conv2d3_bias, x3,
+            B, Co2, Ho2, Wo2, Co3, 3, 3, Ho3, Wo3,
+            x2_gelu.stride(0), x2_gelu.stride(1), x2_gelu.stride(2), x2_gelu.stride(3),
+            self.conv2d3_weight.stride(0), self.conv2d3_weight.stride(1), self.conv2d3_weight.stride(2), self.conv2d3_weight.stride(3),
+            x3.stride(0), x3.stride(1), x3.stride(2), x3.stride(3),
+            num_warps=4, num_stages=2
+        )
+
+        # GELU on conv3 output
+        x3_gelu = torch.empty_like(x3)
+        grid_gelu3 = (B, Co3, Ho3, Wo3)
+        gelu_tanh_4d_kernel[grid_gelu3](
+            x3, x3_gelu,
+            B, Co2, Ho2, Wo2, Co3, 3, 3, Ho3, Wo3,
+            x3.stride(0), x3.stride(1), x3.stride(2), x3.stride(3),
+            x3_gelu.stride(0), x3_gelu.stride(1), x3_gelu.stride(2), x3_gelu.stride(3),
+            num_warps=4, num_stages=2
+        )
+
+        # Reshape to (B, Tafter, 3840) without torch
+        # Here Ci_next = 384, Ho3 = 10, Wo3 = Tafter
+        K_total = Co3 * Ho3 * Wo3  # 384 * 10 * Tafter = 3840
+        x3_gelu_bt = torch.empty((B, Wo3, K_total), device=x0.device, dtype=torch.float32)
+        grid_gather = (B * Wo3 * K_total,)
+        gather_conv3_to_BTW_1d_kernel[grid_gather](
+            x3_gelu, x3_gelu_bt,
+            B, Co3, Ho3, Wo3, Wo3,
+            x3_gelu.stride(0), x3_gelu.stride(1), x3_gelu.stride(2), x3_gelu.stride(3),
+            x3_gelu_bt.stride(0), x3_gelu_bt.stride(1), x3_gelu_bt.stride(2),
+            num_warps=4, num_stages=2
+        )
+
+        # Linear projection: (B, Tafter, 3840) @ (1024, 3840) -> (B, Tafter, 1024)
+        D = 1024
+        x_lin = torch.empty((B, Wo3, D), device=x0.device, dtype=torch.float32)
+        grid_lin = (B * Wo3 * D,)
+        linear_proj_1d_kernel[grid_lin](
+            x3_gelu_bt, self.conv_out_weight, x_lin,
+            B, Wo3, K_total, D,
+            x3_gelu_bt.stride(0), x3_gelu_bt.stride(1), x3_gelu_bt.stride(2),
+            self.conv_out_weight.stride(0), self.conv_out_weight.stride(1),
+            x_lin.stride(0), x_lin.stride(1), x_lin.stride(2),
+            num_warps=4, num_stages=2
+        )
+
+        # Scale by embed_scale
+        out = x_lin  # already computed in fp32; scale in-place
+        # Add positional embedding using Triton
+        # Broadcast: add pos[t, :] across batch dimension
+        out = out  # fp32 output from linear
+        # Prepare 2D grid (B*Tafter, D) for Triton
+        grid_add = (B * Wo3, D)
+        add_pos_scale_2d_kernel[grid_add](
+            out, self.positional_embedding, self.embed_scale,
+            B, Wo3, D,
+            out.stride(0), out.stride(1), out.stride(2),
+            self.positional_embedding.stride(0), self.positional_embedding.stride(1),
+            num_warps=4, num_stages=2
+        )
+
+        return out
+
+# Original get_inputs function is used to prepare inputs/weights/bias/positional_embedding.
+# ModelNew.forward takes these buffers and performs all computation in Triton.
+
+
+def run(*args):
+    return ModelNew()(*args)

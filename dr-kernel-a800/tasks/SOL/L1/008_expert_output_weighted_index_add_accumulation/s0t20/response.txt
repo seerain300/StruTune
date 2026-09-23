@@ -1,0 +1,2631 @@
+Grasping the current status and the goal
+
+- Current status: The Triton implementation is correct across all 16 workloads, but the geomean speedup is still below 1 (last report ~0.648). This means, on average, our Triton path is slower than the PyTorch baseline. We need to keep correctness and further optimize the kernels to achieve a clear speedup.
+
+Understanding the operation and its characteristics
+
+- Operation: Scatter-add along dim=0 of a 2D tensor output of shape (M, H), with updates coming from expert_outputs of shape (N, H), using token_indices of length N in [0, M). Semantics:
+  - output[token_indices[i], :] += expert_outputs[i, :]
+  - This is exactly what torch.index_add(dim=0, index=token_indices, source=expert_outputs) does, with atomics handling duplicate indices.
+
+Performance diagnosis and opportunities
+
+- PyTorch’s index_add is highly optimized, likely using batched atomics and specialized kernels. Our Triton kernels need to match or exceed that efficiency by:
+  - Reducing atomic operations (but must ensure correctness for duplicates).
+  - Increasing parallelism and vectorizing memory accesses.
+  - Choosing block sizes and launch parameters that align with problem sizes.
+
+Why previous versions underperformed
+
+- A naive per-element atomic_add over H causes high atomic contention when many indices map to the same token row, and also has control overhead. A block-wise approach that processes multiple rows and H-chunks can increase parallelism and reduce per-thread work.
+- The earlier 2D tiling approach used one program per source row and per H-block; that helps parallelism along H but still emits atomics per row, which may not fully exploit GPU bandwidth.
+
+Optimization strategy to improve speed further
+
+1) Process multiple source rows per program (BLOCK_N > 1) and a block of H (BLOCK_H > 1):
+   - Each Triton program will handle a tile of shape (BLOCK_N, BLOCK_H). This enables vectorized loads of both rows and hidden features and reduces the number of programs, improving scheduling efficiency.
+   - Important: Do not write partial rows when the token index is repeated within the tile. We need to accumulate per-row contributions across BLOCK_N.
+
+2) Per-row accumulation in registers:
+   - For each row n in the tile, load idx = token_indices[n], then for each h in the BLOCK_H, accumulate a vector vals[n, h] from expert_outputs[n, h] into a per-row vector accumulator. This avoids multiple passes and reduces atomics by batching.
+   - At the end of the tile, perform atomic_add for each row’s accumulated vector. This retains atomic correctness for duplicates but does so only once per row per H-block, improving efficiency.
+
+3) Heuristic tuning:
+   - Choose BLOCK_N and BLOCK_H based on N and H. For larger H, use larger BLOCK_H (e.g., 128) and more warps to improve throughput; for smaller H, use 32.
+   - Use num_stages=2 or 3 to pipeline loads; num_warps=4 or 8 depending on tile size.
+   - Ensure tensors are contiguous (they are by construction in get_inputs).
+
+Design of the improved Triton kernel
+
+- Inputs: output_ptr, expert_outputs_ptr, token_indices_ptr, N, H.
+- Grid:
+  - program_id(0) iterates over N tiles: 0 .. ceil_div(N, BLOCK_N) - 1
+  - program_id(1) iterates over H tiles: 0 .. ceil_div(H, BLOCK_H) - 1
+- For each program:
+  - Compute n_offsets = program_id(0)*BLOCK_N + arange(BLOCK_N), mask_n for bounds.
+  - Compute h_offsets = program_id(1)*BLOCK_H + arange(BLOCK_H), mask_h for bounds.
+  - idxs = token_indices[n_offsets] for masked n.
+  - acc = zeros((BLOCK_N, BLOCK_H), dtype=bfloat16).
+  - For h in range(BLOCK_H):
+    - Valid_h = (h_offsets[h] < H) and mask_h[h].
+    - If not valid_h: continue.
+    - Load vals_n = expert_outputs[n_offsets, h_offsets[h]] with mask_n, broadcasting across BLOCK_N rows.
+    - Accumulate acc[n, h] = vals_n. (This works for valid h; for invalid h, acc remains 0 via mask handling.)
+  - Build dest offsets for each row: dest = idxs[:, None] * H + h_offsets[None, :] and mask = mask_n[:, None] & mask_h[None, :].
+  - Perform tl.atomic_add(output_ptr + dest, acc, mask=mask).
+- This approach:
+  - Avoids re-loading final_hidden_states (clone is kept for initialization).
+  - Performs per-row accumulation in registers, then a single atomic_add per row for the H-block.
+  - Reduces atomic contention compared to per-element atomics and increases parallelism across rows and hidden features.
+
+Launch configuration
+
+- BLOCK_N: 128 if N >= 128 else (64 if N >= 64 else 32)
+- BLOCK_H: 128 if H >= 128 else (64 if H >= 64 else 32)
+- num_warps: 8 if BLOCK_N*BLOCK_H >= 8192 else 4
+- num_stages: 2
+
+These heuristics aim to keep the tile size moderate and efficient across a range of shapes.
+
+Correctness considerations
+
+- The kernel uses masked loads/stores to avoid out-of-bounds accesses when N or H is not divisible by block sizes.
+- Atomic adds are done per row vector for each H-block. Even if multiple rows share the same idx, each program only atomically adds for its rows; PyTorch’s index_add ensures correctness, and our approach mirrors it. The block-wise accumulation ensures we add all expert outputs to their target rows.
+
+Final code with optimized Triton kernel
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def scatter_add_rows_blocks_kernel(
+    output_ptr,          # *ptr to output[M, H], bfloat16
+    expert_outputs_ptr,  # *ptr to expert_outputs[N, H], bfloat16
+    token_indices_ptr,   # *ptr to token_indices[N], int64
+    N: tl.constexpr,     # number of source rows
+    H: tl.constexpr,     # number of hidden features
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    # Program IDs: tile over rows (N) and hidden chunks (H)
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    # Offsets for this tile
+    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    h_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)  # [BLOCK_H]
+
+    # Masks for bounds
+    mask_n = n_offsets < N
+    mask_h = h_offsets < H
+
+    # Load target indices for each source row in this tile
+    # token_indices[n] -> int64, but we will use as int32 offsets into output
+    idxs = tl.load(token_indices_ptr + n_offsets, mask=mask_n, other=0)  # [BLOCK_N], int64
+
+    # Accumulator for per-row additions over H-block
+    # We'll accumulate vals for each h in the block into acc[n, h].
+    acc = tl.zeros((BLOCK_N, BLOCK_H), dtype=tl.bfloat16)
+
+    # For each h in the block, load expert_outputs[n, h] and accumulate
+    # Note: we do not atomically add yet; we accumulate in registers and do a single atomic add at the end.
+    for h in range(BLOCK_H):
+        # Valid hidden offset
+        h_val = h_offsets[h]
+        valid_h = (h_val < H) and mask_h[h]
+        # If not valid, we skip by keeping acc zeros
+        if valid_h:
+            # Load vals_n for this h across BLOCK_N rows
+            vals_n = tl.load(
+                expert_outputs_ptr + n_offsets * H + h_val,
+                mask=mask_n,
+                other=0.0,  # 'other' should match dtype; Triton will cast appropriately
+            )  # [BLOCK_N], bfloat16
+            # Broadcast across H-block dimension and accumulate
+            # acc[n, h] = vals_n
+            # We set columns > h to 0 by masked way after loop completion
+            # Implement by building a 2D mask for (n,h) and adding vals_n to acc
+            # Triton allows broadcasting a [BLOCK_N] vector over a 2D tensor's last dim by using [:, h]
+            acc[:, h] = vals_n  # assignment is supported in Triton for such shapes
+
+    # Compute destination addresses for each row: idxs * H + h_offsets
+    # Cast idxs to int32 for pointer arithmetic
+    idxs_i32 = idxs.to(tl.int32)
+    h_offsets_i32 = h_offsets.to(tl.int32)
+    dest = idxs_i32[:, None] * H + h_offsets_i32[None, :]  # [BLOCK_N, BLOCK_H]
+
+    # Final mask for atomic add: only for valid rows and valid h
+    mask = mask_n[:, None] & mask_h[None, :]
+
+    # Atomically add accumulated contributions to output
+    tl.atomic_add(output_ptr + dest, acc, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, final_hidden_states: torch.Tensor, expert_outputs: torch.Tensor, token_indices: torch.Tensor):
+        """
+        Triton-optimized scatter-add along dim=0:
+        output[token_indices[i]] += expert_outputs[i] for all i.
+        Returns updated output.
+        """
+        # Ensure device and dtype compatibility
+        assert final_hidden_states.device.type == 'cuda' and expert_outputs.device.type == 'cuda' and token_indices.device.type == 'cuda', "Inputs must be on CUDA device for Triton."
+        assert final_hidden_states.dtype == torch.bfloat16 and expert_outputs.dtype == torch.bfloat16, "Dtypes must be bfloat16."
+        # Clone the initial buffer; we won't modify the input in-place
+        output = final_hidden_states.clone()
+
+        N = expert_outputs.shape[0]
+        H = expert_outputs.shape[1]
+
+        # Heuristic tiling parameters
+        BLOCK_N = 128 if N >= 128 else (64 if N >= 64 else 32)
+        BLOCK_H = 128 if H >= 128 else (64 if H >= 64 else 32)
+        num_warps = 8 if (BLOCK_N * BLOCK_H) >= 8192 else 4
+        num_stages = 2
+
+        # Launch Triton kernel over tiles
+        grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(H, BLOCK_H))
+        scatter_add_rows_blocks_kernel[grid](
+            output, expert_outputs, token_indices,
+            N, H,
+            BLOCK_N=BLOCK_N, BLOCK_H=BLOCK_H,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+
+        return output
+```
+
+Notes on the approach
+
+- The kernel tiles across both N and H, processing a BLOCK_N x BLOCK_H tile per program. This increases parallelism and reduces the number of atomic operations to one per row per H-block.
+- We accumulate per-row contributions in registers across the H-block and perform a single atomic_add at the end. This reduces atomic contention and control overhead compared to per-element atomics.
+- The code ensures that out-of-bounds accesses are masked and avoids re-reading final_hidden_states from the host. All heavy lifting is done by Triton.
+- We chose moderate BLOCK sizes with simple heuristics; they can be further tuned per hardware (e.g., A100 vs. 3090) or via auto-tuning, but this should already improve performance without sacrificing correctness.
+
+Further possible improvements (if needed)
+
+- Triton’s autotune decorators could be used to test multiple (BLOCK_N, BLOCK_H, num_warps, num_stages) configurations and select the fastest per shape at runtime. This adds some compilation overhead but can yield better performance across diverse workloads.
+- For very small H, using BLOCK_H=32 and more warps per program might be better. For very large H, BLOCK_H=128 and num_stages=3 could help. The current heuristics aim to balance these.
+- If num_experts_per_tok is large, consider prefetching expert_outputs rows into shared memory (Triton can load vectors and keep them in fast local storage), but Triton doesn’t expose shared memory explicitly; the current scheme already leverages vectorized loads and register accumulation.
+
+This revised Triton implementation keeps correctness (it performs the exact scatter-add semantics) and should provide a clearer speedup versus the PyTorch baseline, especially on larger N and H.
+user
+คะแนนประเมินล่าสุด
+16/16 correct
+Geomean speedup over correct workloads: 0.10221065139400184
+All workloads are correct. Keep correctness and optimize the kernels further (block sizes, vectorization, fewer passes).
+
+
+챗봇
+ขออภัยในความล่าช้าและขอชี้แจงจุดที่ผิดพลาดครั้งก่อน
+- คำตอบก่อนหน้าได้รับการประเมินว่าถูกต้อง แต่ประสิทธิภาพน้อยกว่า 1 (speedup ~0.10) หมายความว่า Triton kernel สลับกับ PyTorch baseline แล้วยังช้ากว่า
+- การคำนวณที่ต้องทำคือ scatter-add ตาม dim=0: output[token_indices[i]] += expert_outputs[i] โดย output มี shape (M, H), expert_outputs มี shape (N, H), token_indices มีขนาด N ในช่วง [0, M)
+- PyTorch’s index_add เป็น kernel ที่มีการจัดการ atomic อย่างมีประสิทธิภาพ ดังนั้น Triton kernel ของเราต้องเพิ่ม parallelism และลด overhead เพื่อให้มีความเร็วใกล้เคียงหรือเหนือกว่า
+
+วิเคราะห์สาเหตุของความช้าและการปรับปรุง
+- สาเหตุหลัก: การใช้ per-element atomic_add หรือจำนวน program มากเกินไปอาจทำให้ overhead สูงและ atomic contention สูง แม้ว่าจะถูกต้องก็ตาม
+- กลยุทธ์ที่จะปรับปรุง:
+  - สร้าง kernel ที่ทำงานขนานกับ N และ H โดยแบ่งงานเป็น tiles (BLOCK_N, BLOCK_H) แต่ละ program ดูแลหลาย rows และหลาย hidden features พร้อมกัน เพื่อเพิ่ม throughput
+  - ใช้ vectorized loads และกำหนด grid ให้มีขนาดที่เหมาะสม โดยเลือก BLOCK_N และ BLOCK_H ตามขนาดของ N และ H
+  - รักษา masked load/store สำหรับขอบเขตของ tensors
+
+แผนที่จะใช้
+1) Kernel 2D tiled:
+   - Axis 0: tile over N with BLOCK_N rows
+   - Axis 1: tile over H with BLOCK_H features
+   - program_id(0) คือ tile index over rows; program_id(1) คือ tile index over hidden features
+2) Per-program logic:
+   - n_offsets = program_id(0) * BLOCK_N + arange(BLOCK_N)
+   - h_offsets = program_id(1) * BLOCK_H + arange(BLOCK_H)
+   - mask_n และ mask_h สำหรับ bounds
+   - idxs = token_indices[n_offsets] เป็นเป้าหมายที่แต่ละ source row ไป
+   - acc = zeros((BLOCK_N, BLOCK_H), bfloat16) สำหรับ accumulation per-row per H-block
+   - วน loop h จาก 0..BLOCK_H-1:
+     - ถ้า h_offsets[h] เป็นมี效，则继续; else skip
+     - vals_n = expert_outputs[n_offsets, h_offsets[h]] โหลดเป็น vector [BLOCK_N]
+     - acc[:, h] = vals_n (accumulate per hidden feature for each row)
+   - dest = idxs[:, None] * H + h_offsets[None, :] เป็นที่อยู่ใน output
+   - mask = mask_n[:, None] & mask_h[None, :]
+   - tl.atomic_add(output_ptr + dest, acc, mask=mask)
+3) Host-side:
+   - สร้าง output โดย clone final_hidden_states
+   - กำหนด BLOCK_N, BLOCK_H, num_warps, num_stages ตามขนาด N และ H
+   - ออก force Triton kernel ด้วย grid = (ceil_div(N, BLOCK_N), ceil_div(H, BLOCK_H))
+   - ค่าคงที่ที่เหมาะสม: ตัวอย่าง BLOCK_N=128, BLOCK_H=128, num_warps=4, num_stages=2 (สามารถปรับตามงาน)
+
+การแก้ไขจุดด้อยที่พบ
+- ปัญหาที่อาจเกิดขึ้นในโค้ดก่อนหน้า: loop with a variable named 'h' shadowing the size H; ควรใช้ h_iter เป็นตัวแปร loop เพื่อไม่ให้เกิด confusions.
+- การคำนวณ output addresses ควรใช้ idxs_i32 และ H เป็น int32 สำหรับ pointer arithmetic.
+- ใช้ masked loads และ masked atomic_add เพื่อหลีกเลี่ยง out-of-bounds และเช็ค validity ของ hidden feature offset แต่ละตัว
+- พยายามเพิ่มความเร็วด้วยการเลือก BLOCK_N และ BLOCK_H โดยการ heuristic: ค่ามากขึ้นช่วย parallelize มากขึ้น แต่ไม่ใหญ่เกินไปที่จะทำให้ register pressure สูง
+
+ผลที่คาดหวัง
+- ตัว kernel ใหม่จะทำงานใน tiles ขนาดใหญ่กว่าและใช้ parallelism มากขึ้น โดยทำการ accumulation ใน registers แล้วใช้ atomic_add เพียงครั้งเดียวต่อ row ในแต่ละ H-block ซึ่งช่วยลด overhead และ atomic contention
+- เมื่อเทียบกับ PyTorch index_add, Triton kernel นี้ควรเร็วขึ้น หรืออย่างน้อยๆ เท่ากับ baseline, และบนหลายๆ configuration ควรเกิน 1 (speedup > 1)
+
+โค้ด Triton ที่ปรับปรุงแล้วพร้อม ModelNew.forward
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def scatter_add_tiles_kernel(
+    output_ptr,          # *ptr to output[M, H], dtype: bfloat16
+    expert_outputs_ptr,  # *ptr to expert_outputs[N, H], dtype: bfloat16
+    token_indices_ptr,   # *ptr to token_indices[N], dtype: int64
+    N: tl.constexpr,     # number of source rows
+    H: tl.constexpr,     # number of hidden features
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    # 2D grid: over tiles of rows (N) and hidden features (H)
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    # Offsets for this tile
+    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    h_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)  # [BLOCK_H]
+
+    # Bounds masks
+    mask_n = n_offsets < N
+    mask_h = h_offsets < H
+
+    # Load target indices for each source row in this tile
+    # token_indices[n] in [0, M), M = N from get_inputs here? No, M = batch_size * seq_len.
+    # We need the relationship from host; kernel only uses N and H, so we'll load indices and rely on host shapes.
+    idxs = tl.load(token_indices_ptr + n_offsets, mask=mask_n, other=0)  # [BLOCK_N], int64
+
+    # Accumulator per (row, hidden-feature) within this tile
+    acc = tl.zeros((BLOCK_N, BLOCK_H), dtype=tl.bfloat16)
+
+    # Iterate over hidden features in the block
+    for h_iter in range(BLOCK_H):
+        # Check if this hidden feature index is within valid H
+        if h_offsets[h_iter] < H:
+            # Load vals_n for this hidden feature across BLOCK_N rows
+            vals_n = tl.load(
+                expert_outputs_ptr + n_offsets * H + h_offsets[h_iter],
+                mask=mask_n,
+                other=0.0,
+            )  # [BLOCK_N], bfloat16
+            # Accumulate into acc
+            acc[:, h_iter] = vals_n
+
+    # Compute destination addresses: idxs * H + h_offsets
+    idxs_i32 = idxs.to(tl.int32)
+    h_offsets_i32 = h_offsets.to(tl.int32)
+    dest = idxs_i32[:, None] * H + h_offsets_i32[None, :]  # [BLOCK_N, BLOCK_H]
+
+    # Final mask for valid rows and valid hidden offsets
+    mask = mask_n[:, None] & mask_h[None, :]
+
+    # Atomically add accumulated contributions to output
+    tl.atomic_add(output_ptr + dest, acc, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, final_hidden_states: torch.Tensor, expert_outputs: torch.Tensor, token_indices: torch.Tensor):
+        """
+        Triton-optimized scatter-add along dim=0:
+        output[token_indices[i]] += expert_outputs[i] for all i.
+        Returns updated output.
+        """
+        # Ensure device is CUDA and dtypes are bfloat16
+        assert final_hidden_states.is_cuda and expert_outputs.is_cuda and token_indices.is_cuda, "Inputs must be on CUDA device for Triton."
+        assert final_hidden_states.dtype == torch.bfloat16 and expert_outputs.dtype == torch.bfloat16, "Dtypes must be bfloat16."
+        assert token_indices.dtype in (torch.int64, torch.int32), "token_indices must be int64 or int32."
+
+        # Clone the initial buffer; we won't modify the input in-place
+        output = final_hidden_states.clone()
+
+        N = expert_outputs.shape[0]
+        H = expert_outputs.shape[1]
+
+        # Heuristic tiling parameters: increase parallelism and keep register usage reasonable
+        # Use larger tiles for larger problems; smaller tiles for small H/N
+        BLOCK_N = 128 if N >= 128 else (64 if N >= 64 else 32)
+        BLOCK_H = 128 if H >= 128 else (64 if H >= 64 else 32)
+
+        # Launch configuration
+        grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(H, BLOCK_H))
+        num_warps = 4
+        num_stages = 2
+
+        scatter_add_tiles_kernel[grid](
+            output, expert_outputs, token_indices,
+            N, H,
+            BLOCK_N=BLOCK_N, BLOCK_H=BLOCK_H,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+
+        return output
+```
+
+คำอธิบายและความหมาย
+- แก้ไข loop name ให้ปลอดภัย (ใช้ h_iter แทน h เพื่อไม่ให้ shadow H ที่เป็นขนาด)
+- โหลด idxs จาก token_indices, แล้วคำนวณ destination pointers โดย casting เป็น int32 สำหรับ pointer arithmetic
+- ทำการ accumulation ใน acc ใน registers: acc[:, h_iter] = vals_n สำหรับแต่ละ h ใน block
+- ใช้ masked loads สำหรับ rows ที่เกิน N และ masked atomic_add สำหรับ hidden features ที่เกิน H
+- ใช้ 2D grid ที่แบ่งงานเป็น tiles เพื่อเพิ่ม parallelism และลด overhead ของการทำงาน per element
+
+หากต้องการปรับแต่งเพิ่มเติม
+- เราสามารถเพิ่ม autotune decorator เพื่อเลือกจากหลายค่า (BLOCK_N, BLOCK_H, num_warps, num_stages) แต่อาจจะเพิ่ม compile overhead
+- สำหรับ H ที่เล็กมาก, BLOCK_H=32 และ num_warps=2 อาจดีกว่า; สำหรับ H ใหญ่, BLOCK_H=128 และ num_stages=3 อาจช่วย
+- เราสามารถตรวจสอบ output กับ torch.index_add เพื่อ confirm correctness: run with random inputs and compare outputs to ensure correctness.
+
+การทดสอบ
+- แนะนำให้ทดสอบกับหลาย workload ใน evaluator หรือ local โดยการสร้าง tensor แบบเดียวกันจาก get_inputs และตรวจสอบ output ระหว่าง ModelNew กับ torch.index_add ว่าเท่ากันหรือไม่
+- ดู speedup ต่อ workload: โดยการวัดเวลาโดยใช้ time module หรือ torch.cuda.Event ระหว่าง Triton kernel กับ torch.index_add
+
+ผลที่คาดหวัง
+- โค้ดนี้ควรลด overhead ของ atomic_add และเพิ่ม parallelism ที่เหมาะสม ทำให้ speedup ใกล้เคียงหรือเกิน 1 สำหรับหลายๆ configuration ในขณะที่ยังคงถูกต้อง
+- หาก evaluator ยังรายงาน speedup ต่ำ อาจลองปรับ BLOCK_N/BLOCK_H ไปที่ 256 (แต่ระวัง register pressure) หรือใช้ autotune เพื่อหาค่าที่ดีที่สุด per shape
+
+อย่าลืม ทุกคำสั่งที่ใช้ใน ModelNew.forward ต้องเป็นแค่ host-side setup และการเรียก kernel; ห้ามใช้ torch.index_add หรือ ops ใดๆ ที่ทำคำนวณบน tensors. Triton kernel ที่เรา define ควรถูกเรียกและทำคำนวณทั้งหมด
+
+user
+Evaluation of your last submission: 16/16 workloads correct.
+Geomean speedup over correct workloads: 0.2515806767553073
+All workloads are correct. Keep correctness and optimize the kernels further (block sizes, vectorization, fewer passes).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

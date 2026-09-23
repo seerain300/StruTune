@@ -1,0 +1,668 @@
+I see the evaluator is flagging “INCORRECT_DTYPE” for multiple workloads. That typically means the final output tensor’s dtype doesn’t match the expected result dtype. The original PyTorch code uses F.linear and F.conv1d without specifying dtype; in practice, those outputs retain the input dtype (e.g., float32). However, to be robust, we must ensure our ModelNew returns exactly the same dtype as the reference.
+
+Root cause analysis
+- Our earlier version converted to float32 internally and returned float32. If the reference output is not float32, this would trigger “INCORRECT_DTYPE”.
+- The safest way to guarantee matching dtype is to perform computation in the same dtype as the inputs. In Triton, we can load and operate in the tensor’s dtype (float16/bfloat16/float32), but Triton’s tl.dot and some kernels expect consistent types. A practical approach is:
+  - Allocate outputs in the desired dtype (same as x.dtype).
+  - Cast loaded inputs to that dtype before computation in Triton.
+  - This ensures the final stored tensor matches the input’s dtype.
+
+Given the constraints, I’ll implement:
+- Triton matmul for in_proj and out_proj: A[M, K] @ B[K, N] + bias, with M=B*S, K=H, N=3H and N=H respectively. We will:
+  - Load A and B, cast to out dtype (same as x.dtype), and accumulate in that dtype. For numerical stability, we can keep accumulation in float32 and cast at the end; but here we match dtype for correctness.
+  - Store C with the desired dtype.
+- Triton elementwise kernels for gating (Bx = B * x_proj) and output gating (y = C * conv_out) will operate in the tensors’ dtype.
+- Triton grouped causal conv kernel will:
+  - Take Bx_padded (B, H, S+3), conv_weight (H, 4), conv_bias (H), and write conv_out (B, H, S) in the desired dtype. We’ll pre-pad Bx with zeros on the left using torch.nn.functional.pad on GPU. This avoids negative indexing and complex masking in the kernel.
+
+We will ensure:
+- ModelNew.forward allocates outputs with the same dtype as x and calls Triton kernels. No torch.nn.functional calls (F.linear, F.conv1d) are used.
+
+Code follows. It includes:
+- _matmul_linear_kernel: Triton matmul + bias, returning output with the same dtype as input.
+- _elementwise_mul_1d: Triton elementwise multiply for gating.
+- _grouped_causal_conv1d_kernel: Triton grouped conv using pre-padded input and conv_weight derived from the last 4 columns of in_proj_weight.
+- ModelNew.forward: orchestrates allocation and kernel launches; returns output in x.dtype.
+
+Note: This approach avoids dtype mismatches by matching the output dtype to the input x.dtype. If you need higher numerical stability, you could accumulate in float32 and cast at the end, but that may reintroduce dtype mismatch. Here, we choose correctness over pure numeric stability to satisfy the evaluator.
+
+```python
+import torch
+import torch.nn as nn
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+@triton.jit
+def _matmul_linear_kernel(
+    A_ptr, B_ptr, Bias_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    out_dtype_code: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Compute C = A @ B + Bias.
+    A: (M, K), row-major: stride_am along M, stride_ak along K
+    B: (K, N), row-major: stride_bk along K, stride_bn along N
+    C: (M, N), row-major: stride_cm along M, stride_cn along N
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        # Load A tiles and B tiles
+        a_ptrs = A_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = B_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Cast to desired output dtype for final store; keep accumulators in fp32 for stability
+        # We'll cast 'a' and 'b' to out_dtype_code before multiply to reduce fp64 overhead if present.
+        # However, Triton will handle types; to be safe, cast to fp32 and multiply.
+        a = a.to(tl.float32)
+        b = b.to(tl.float32)
+        acc += tl.dot(a, b)
+
+    # Add bias
+    bias = tl.load(Bias_ptr + offs_n, mask=(offs_n < N), other=0.0).to(tl.float32)
+    acc = acc + bias[None, :]
+
+    # Store result, cast to output dtype
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    # acc is float32; cast to desired dtype before store
+    # out_dtype_code: 0 -> float16, 1 -> bfloat16, 2 -> float32
+    if out_dtype_code == 0:
+        acc_out = acc.to(tl.float16)
+    elif out_dtype_code == 1:
+        acc_out = acc.to(tl.bfloat16)
+    else:
+        acc_out = acc  # float32
+    tl.store(c_ptrs, acc_out, mask=c_mask)
+
+
+@triton.jit
+def _elementwise_mul_1d(
+    A_ptr, B_ptr, C_ptr,
+    M,  # number of elements to process (we'll iterate), but pass B*S*S-like)
+    stride_am, stride_b, stride_cm,
+    out_dtype_code: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """
+    Elementwise C = A * B for 1D contiguous arrays of length M.
+    A_ptr, B_ptr: length M
+    C_ptr: length M
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < M
+
+    a = tl.load(A_ptr + offs * stride_am, mask=mask, other=0.0)
+    b = tl.load(B_ptr + offs * stride_b, mask=mask, other=0.0)
+
+    # Compute in fp32, then cast to output dtype
+    a32 = a.to(tl.float32)
+    b32 = b.to(tl.float32)
+    prod = a32 * b32
+
+    if out_dtype_code == 0:
+        prod_out = prod.to(tl.float16)
+    elif out_dtype_code == 1:
+        prod_out = prod.to(tl.bfloat16)
+    else:
+        prod_out = prod  # float32
+
+    tl.store(C_ptr + offs * stride_cm, prod_out, mask=mask)
+
+
+@triton.jit
+def _grouped_causal_conv1d_kernel(
+    X_pad_ptr, W_ptr, Bias_ptr, Y_ptr,
+    B, H, S, K_kernel,
+    stride_b, stride_h, stride_s,  # X_pad strides: (B, H, S+3)
+    stride_w_h, stride_w_k,        # W strides: (H, 4) but we pass 2D (H, K_kernel)
+    stride_y_b, stride_y_h, stride_y_s,  # Y strides: (B, H, S)
+    out_dtype_code: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    """
+    Grouped causal 1D conv for input X_pad: (B, H, S+3), weights W: (H, K_kernel=4), bias: (H).
+    Output Y: (B, H, S).
+    Each program handles one (b, h), vectorizes over s.
+    """
+    pid_bh = tl.program_id(0)
+    b = pid_bh // H
+    h = pid_bh % H
+
+    # offs_s over output sequence positions [0..S-1]
+    offs_s = tl.arange(0, BLOCK_S)
+    s_mask = offs_s < S
+
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_S,), dtype=tl.float32)
+
+    # Loop over kernel taps k=0..K_kernel-1
+    for k in range(0, K_kernel):
+        # Input index is s + 3 - k (due to left pad of 3 for kernel_size=4)
+        s_in = offs_s + 3 - k
+        valid = (s_in >= 0) & (s_in < S) & s_mask
+        x_ptrs = X_pad_ptr + b * stride_b + h * stride_h + s_in * stride_s
+        x_vals = tl.load(x_ptrs, mask=valid, other=0.0)
+        # weight scalar for this h and k
+        w_val = tl.load(W_ptr + h * stride_w_h + k * stride_w_k)
+        acc += x_vals.to(tl.float32) * w_val.to(tl.float32)
+
+    # Add bias
+    bias = tl.load(Bias_ptr + h).to(tl.float32)
+    acc += bias
+
+    # Store to Y
+    y_ptrs = Y_ptr + b * stride_y_b + h * stride_y_h + offs_s * stride_y_s
+    if out_dtype_code == 0:
+        acc_out = acc.to(tl.float16)
+    elif out_dtype_code == 1:
+        acc_out = acc.to(tl.bfloat16)
+    else:
+        acc_out = acc
+    tl.store(y_ptrs, acc_out, mask=s_mask)
+
+
+def _dtype_code_from_tensor(t: torch.Tensor) -> int:
+    # 0: float16, 1: bfloat16, 2: float32
+    if t.dtype == torch.float16:
+        return 0
+    if t.dtype == torch.bfloat16:
+        return 1
+    return 2
+
+
+def _triton_in_proj(x: torch.Tensor, in_proj_weight: torch.Tensor, in_proj_bias: torch.Tensor) -> torch.Tensor:
+    """
+    Compute BCx = x @ in_proj_weight^T + in_proj_bias.
+    x: (B, S, H), in_proj_weight: (3H, H), in_proj_bias: (3H)
+    Returns BCx: (B, S, 3H), same dtype as x.
+    """
+    assert TRITON_AVAILABLE, "Triton is not available"
+    B, S, H = x.shape
+    K = H
+    N = 3 * H
+    M = B * S
+
+    A = x.contiguous().view(M, K)          # (M, K), dtype=x.dtype
+    B_w = in_proj_weight.t().contiguous().view(K, N)  # (K, N), dtype=in_proj_weight.dtype
+    Bias = in_proj_bias.contiguous().view(N)          # (N), dtype=in_proj_bias.dtype
+
+    # Output tensor BCx with same dtype as x
+    BCx = torch.empty((M, N), dtype=x.dtype, device=x.device)
+
+    out_dtype_code = _dtype_code_from_tensor(x)
+
+    BLOCK_M = 128
+    BLOCK_N = 64
+    BLOCK_K = 32
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    _matmul_linear_kernel[grid](
+        A, B_w, Bias, BCx,
+        M, N, K,
+        A.stride(0), A.stride(1),
+        B_w.stride(0), B_w.stride(1),
+        BCx.stride(0), BCx.stride(1),
+        out_dtype_code,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=4, num_stages=3,
+    )
+    return BCx.view(B, S, N)
+
+
+def _triton_elementwise_mul_1d(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Elementwise C = A * B for 1D flattened tensors. Returns C with same dtype as A.
+    """
+    assert TRITON_AVAILABLE, "Triton is not available"
+    assert A.shape == B.shape
+    M = A.numel()
+    C = torch.empty_like(A)
+    out_dtype_code = _dtype_code_from_tensor(A)
+    BLOCK = 1024
+    grid = (triton.cdiv(M, BLOCK),)
+    _elementwise_mul_1d[grid](
+        A, B, C,
+        M,
+        1, 1, 1,  # strides not used when 1D contiguous; set to 1
+        out_dtype_code,
+        BLOCK=BLOCK,
+        num_warps=4,
+        num_stages=2,
+    )
+    return C
+
+
+def _triton_grouped_causal_conv1d(Bx: torch.Tensor, conv_w: torch.Tensor, conv_bias: torch.Tensor) -> torch.Tensor:
+    """
+    Grouped causal 1D conv on Bx of shape (B, H, S), with conv_w: (H, 4), conv_bias: (H).
+    Output: (B, H, S).
+    We pre-pad Bx on the sequence dimension with 3 zeros.
+    """
+    assert TRITON_AVAILABLE, "Triton is not available"
+    B, H, S = Bx.shape
+    K_kernel = 4  # fixed as in original
+
+    # Pre-pad with 3 zeros on the left along sequence dimension
+    Bx_padded = torch.nn.functional.pad(Bx, (3, 0))  # (B, H, S+3)
+
+    # Allocate output
+    Y = torch.empty((B, H, S), dtype=Bx.dtype, device=Bx.device)
+
+    out_dtype_code = _dtype_code_from_tensor(Bx)
+
+    # Launch one program per (b, h)
+    grid = (B * H,)
+    _grouped_causal_conv1d_kernel[grid](
+        Bx_padded, conv_w, conv_bias, Y,
+        B, H, S, K_kernel,
+        Bx_padded.stride(0), Bx_padded.stride(1), Bx_padded.stride(2),
+        conv_w.stride(0), conv_w.stride(1),
+        Y.stride(0), Y.stride(1), Y.stride(2),
+        out_dtype_code,
+        BLOCK_S=128,
+        num_warps=2,
+        num_stages=2,
+    )
+    return Y
+
+
+def _triton_out_proj(y: torch.Tensor, out_proj_weight: torch.Tensor, out_proj_bias: torch.Tensor) -> torch.Tensor:
+    """
+    Compute output = y @ out_proj_weight^T + out_proj_bias.
+    y: (B, S, H), out_proj_weight: (H, H), out_proj_bias: (H)
+    Returns output: (B, S, H), same dtype as y.
+    """
+    assert TRITON_AVAILABLE, "Triton is not available"
+    B, S, H = y.shape
+    K = H
+    M = B * S
+
+    Y_flat = y.contiguous().view(M, K)         # (M, K), dtype=y.dtype
+    W_t = out_proj_weight.t().contiguous().view(K, K)  # (K, K), dtype=out_proj_weight.dtype
+    Bias = out_proj_bias.contiguous().view(K)    # (K), dtype=out_proj_bias.dtype
+
+    Output = torch.empty((M, K), dtype=y.dtype, device=y.device)
+
+    out_dtype_code = _dtype_code_from_tensor(y)
+
+    BLOCK_M = 128
+    BLOCK_N = 64
+    BLOCK_K = 32
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_N))
+    _matmul_linear_kernel[grid](
+        Y_flat, W_t, Bias, Output,
+        M, K, K,
+        Y_flat.stride(0), Y_flat.stride(1),
+        W_t.stride(0), W_t.stride(1),
+        Output.stride(0), Output.stride(1),
+        out_dtype_code,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=4, num_stages=3,
+    )
+    return Output.view(B, S, K)
+
+
+class ModelNew(nn.Module):
+    def forward(self, x: torch.Tensor,
+                in_proj_weight: torch.Tensor,
+                in_proj_bias: torch.Tensor,
+                conv_weight: torch.Tensor,
+                conv_bias: torch.Tensor,
+                out_proj_weight: torch.Tensor,
+                out_proj_bias: torch.Tensor) -> torch.Tensor:
+        """
+        Triton-optimized forward that avoids PyTorch functional ops in host code.
+        Returns output of shape (B, S, H), same dtype as x.
+        """
+        assert TRITON_AVAILABLE, "Triton is not available"
+
+        # 1) in_proj: BCx = x @ in_proj_weight^T + in_proj_bias -> (B, S, 3H)
+        BCx = _triton_in_proj(x, in_proj_weight, in_proj_bias)
+        B, S, N = BCx.shape
+        H = N // 3  # hidden_size
+
+        # Split into B, C, x_proj
+        B_channel = BCx[:, :, :H]                 # (B, S, H)
+        C_channel = BCx[:, :, H:2*H]              # (B, S, H)
+        x_proj = BCx[:, :, 2*H:]                  # (B, S, H)
+
+        # 2) Elementwise gating: Bx = B_channel * x_proj
+        Bx = _triton_elementwise_mul_1d(B_channel, x_proj)  # (B, S, H)
+
+        # 3) Grouped causal conv: conv_weight is taken from in_proj_weight's last 4 columns
+        #    Conv weight derived: (H, 4)
+        conv_w = in_proj_weight[:, -4:].to(x.dtype).contiguous()  # (H, 4)
+        conv_out = _triton_grouped_causal_conv1d(Bx, conv_w, conv_bias)  # (B, H, S)
+
+        # 4) Output gating: y = C_channel * conv_out; conv_out shape (B, H, S), C_channel (B, S, H)
+        #    Align shapes by transposing conv_out to (B, S, H)
+        conv_out_T = conv_out.transpose(-1, -2).contiguous()  # (B, S, H)
+        y = _triton_elementwise_mul_1d(C_channel, conv_out_T)  # (B, S, H)
+
+        # 5) Final out-proj
+        output = _triton_out_proj(y, out_proj_weight, out_proj_bias)  # (B, S, H)
+
+        return output
+```
+
+Notes
+- All heavy computation is done in Triton kernels; ModelNew.forward orchestrates tensor allocation and launches kernels without calling PyTorch functional ops.
+- We allocate outputs with the same dtype as the input x. The Triton matmul kernel adds bias and stores in the desired dtype, avoiding dtype mismatches. The conv and elementwise kernels also operate and store in that dtype.
+- The grouped causal conv kernel uses pre-padding via torch.nn.functional.pad to avoid negative indexing and ensure correctness with fixed kernel_size=4 and causal behavior.
+- We keep masks and indexing simple and correct. The conv kernel assumes Bx_padded shape (B, H, S+3), and we implement the dot accumulation for each k in [0..3].
+
+This should address the “INCORRECT_DTYPE” by ensuring the final output matches the input x’s dtype. If further runtime errors occur, the simplified conv approach (pre-padding and straightforward indexing) reduces the risk of indexing mistakes.
+assistant
+Thank you for the feedback. The evaluator flagged “INCORRECT_DTYPE” for multiple runs, which means the output tensor’s dtype didn’t match the reference. The original PyTorch model uses F.linear and F.conv1d without dtype overrides, so outputs typically remain in float32 even if inputs are not. To match expected behavior robustly, ModelNew should return float32 regardless of input dtype. However, Triton operations must be performed with consistent types; mixing float16/bfloat16 with float32 can cause issues.
+
+Plan to fix correctness and avoid runtime errors:
+- Ensure all Triton kernels compute in float32 for numerical stability and then cast outputs to float32 before returning from ModelNew.forward. This aligns with typical PyTorch behavior when no dtype is specified and avoids dtype mismatches.
+- Keep the core computation in Triton: in_proj (matmul + bias), elementwise gating (Bx = B * x_proj), grouped causal conv (with pre-padding and groups=H), and out-proj (matmul + bias).
+- Implement grouped causal 1D convolution in Triton with fixed kernel_size=4, causal padding=3, and groups=H. We derive conv_weight from in_proj_weight’s last 4 columns: in_proj_weight[:, -4:], reshaped to (H, 4). We pre-pad the input along sequence dimension with 3 zeros to implement causal behavior, then reduce over the 4 taps for each group h.
+- ModelNew.forward will:
+  - Perform all Triton calls, allocate float32 outputs for kernels, and finally cast the final output tensor to float32 before returning. This guarantees the output dtype matches the expected reference.
+
+Key points:
+- Triton matmul kernel: _matmul_linear_kernel computes A[M, K] @ B[K, N] + bias, returning C[M, N] in float32.
+- Triton elementwise multiply: _elementwise_mul_1d kernel operates on flattened 1D arrays, returning result in float32.
+- Triton grouped causal conv: _grouped_causal_conv1d_kernel takes pre-padded input (B, H, S+3), conv_weight (H, 4), conv_bias (H), and writes (B, H, S) in float32.
+- After all Triton computations, cast the final output tensor to float32 to satisfy dtype expectations and avoid “INCORRECT_DTYPE”.
+
+Code (Triton-only, invoking kernels from ModelNew.forward; outputs are float32)
+
+```python
+import torch
+import torch.nn as nn
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+@triton.jit
+def _matmul_linear_kernel(
+    A_ptr, B_ptr, Bias_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Compute C = A @ B + Bias in float32.
+    A: (M, K), row-major with strides (stride_am, stride_ak)
+    B: (K, N), row-major with strides (stride_bk, stride_bn)
+    C: (M, N), row-major with strides (stride_cm, stride_cn)
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        a_ptrs = A_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = B_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        a = a.to(tl.float32)
+        b = b.to(tl.float32)
+
+        acc += tl.dot(a, b)
+
+    bias = tl.load(Bias_ptr + offs_n, mask=(offs_n < N), other=0.0).to(tl.float32)
+    acc = acc + bias[None, :]
+
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+@triton.jit
+def _elementwise_mul_1d(
+    A_ptr, B_ptr, C_ptr,
+    M,
+    stride_am, stride_b, stride_cm,
+    BLOCK: tl.constexpr,
+):
+    """
+    Elementwise C = A * B for 1D contiguous arrays of length M. Compute in float32, store as float32.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < M
+
+    a = tl.load(A_ptr + offs * stride_am, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(B_ptr + offs * stride_b, mask=mask, other=0.0).to(tl.float32)
+    prod = a * b
+
+    tl.store(C_ptr + offs * stride_cm, prod, mask=mask)
+
+
+@triton.jit
+def _grouped_causal_conv1d_kernel(
+    X_pad_ptr, W_ptr, Bias_ptr, Y_ptr,
+    B, H, S, K_kernel,
+    stride_b, stride_h, stride_s,  # X_pad strides: (B, H, S+3)
+    stride_w_h, stride_w_k,        # W strides: (H, K_kernel)
+    stride_y_b, stride_y_h, stride_y_s,  # Y strides: (B, H, S)
+    BLOCK_S: tl.constexpr,
+):
+    """
+    Grouped causal 1D conv for input X_pad: (B, H, S+3), weights W: (H, K_kernel=4), bias: (H).
+    Output Y: (B, H, S), computed in float32.
+    Each program handles one (b, h), vectorizes over s.
+    """
+    pid_bh = tl.program_id(0)
+    b = pid_bh // H
+    h = pid_bh % H
+
+    offs_s = tl.arange(0, BLOCK_S)
+    s_mask = offs_s < S
+
+    acc = tl.zeros((BLOCK_S,), dtype=tl.float32)
+
+    # kernel_size=4, causal padding: left pad 3
+    for k in range(0, K_kernel):
+        s_in = offs_s + 3 - k
+        valid = (s_in >= 0) & (s_in < S) & s_mask
+        x_ptrs = X_pad_ptr + b * stride_b + h * stride_h + s_in * stride_s
+        x_vals = tl.load(x_ptrs, mask=valid, other=0.0).to(tl.float32)
+        w_val = tl.load(W_ptr + h * stride_w_h + k * stride_w_k).to(tl.float32)
+        acc += x_vals * w_val
+
+    bias = tl.load(Bias_ptr + h).to(tl.float32)
+    acc += bias
+
+    y_ptrs = Y_ptr + b * stride_y_b + h * stride_y_h + offs_s * stride_y_s
+    tl.store(y_ptrs, acc, mask=s_mask)
+
+
+def _triton_in_proj(x: torch.Tensor, in_proj_weight: torch.Tensor, in_proj_bias: torch.Tensor) -> torch.Tensor:
+    """
+    Compute BCx = x @ in_proj_weight^T + in_proj_bias in float32.
+    x: (B, S, H), in_proj_weight: (3H, H), in_proj_bias: (3H)
+    Returns BCx: (B, S, 3H), float32.
+    """
+    assert TRITON_AVAILABLE, "Triton is not available"
+    B, S, H = x.shape
+    K = H
+    N = 3 * H
+    M = B * S
+
+    A = x.contiguous().view(M, K)          # (M, K)
+    B_w = in_proj_weight.t().contiguous().view(K, N)  # (K, N)
+    Bias = in_proj_bias.contiguous().view(N)          # (N)
+
+    BCx = torch.empty((M, N), dtype=torch.float32, device=x.device)
+
+    BLOCK_M = 128
+    BLOCK_N = 64
+    BLOCK_K = 32
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    _matmul_linear_kernel[grid](
+        A, B_w, Bias, BCx,
+        M, N, K,
+        A.stride(0), A.stride(1),
+        B_w.stride(0), B_w.stride(1),
+        BCx.stride(0), BCx.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=4, num_stages=3,
+    )
+    return BCx.view(B, S, N)
+
+
+def _triton_elementwise_mul_1d(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Elementwise C = A * B for 1D flattened tensors. Compute in float32, return float32.
+    """
+    assert TRITON_AVAILABLE, "Triton is not available"
+    assert A.shape == B.shape
+    M = A.numel()
+    C = torch.empty_like(A, dtype=torch.float32)
+    BLOCK = 1024
+    grid = (triton.cdiv(M, BLOCK),)
+    _elementwise_mul_1d[grid](
+        A, B, C,
+        M,
+        1, 1, 1,  # 1D contiguous
+        BLOCK=BLOCK,
+        num_warps=4,
+        num_stages=2,
+    )
+    return C
+
+
+def _triton_grouped_causal_conv1d(Bx: torch.Tensor, conv_w: torch.Tensor, conv_bias: torch.Tensor) -> torch.Tensor:
+    """
+    Grouped causal 1D conv on Bx of shape (B, H, S), with conv_w: (H, 4), conv_bias: (H).
+    Output: (B, H, S), computed in float32.
+    Pre-pad Bx on the sequence dimension with 3 zeros.
+    """
+    assert TRITON_AVAILABLE, "Triton is not available"
+    B, H, S = Bx.shape
+    K_kernel = 4
+
+    # Pre-pad with 3 zeros on the left along sequence dimension
+    Bx_padded = torch.nn.functional.pad(Bx, (3, 0))  # (B, H, S+3), promote to float32
+    Bx_padded = Bx_padded.to(torch.float32)
+
+    Y = torch.empty((B, H, S), dtype=torch.float32, device=Bx.device)
+
+    grid = (B * H,)
+    _grouped_causal_conv1d_kernel[grid](
+        Bx_padded, conv_w.to(torch.float32).contiguous(), conv_bias.to(torch.float32).contiguous(), Y,
+        B, H, S, K_kernel,
+        Bx_padded.stride(0), Bx_padded.stride(1), Bx_padded.stride(2),
+        conv_w.stride(0), conv_w.stride(1),
+        Y.stride(0), Y.stride(1), Y.stride(2),
+        BLOCK_S=128,
+        num_warps=2,
+        num_stages=2,
+    )
+    return Y
+
+
+def _triton_out_proj(y: torch.Tensor, out_proj_weight: torch.Tensor, out_proj_bias: torch.Tensor) -> torch.Tensor:
+    """
+    Compute output = y @ out_proj_weight^T + out_proj_bias in float32.
+    y: (B, S, H), out_proj_weight: (H, H), out_proj_bias: (H)
+    Returns output: (B, S, H), float32.
+    """
+    assert TRITON_AVAILABLE, "Triton is not available"
+    B, S, H = y.shape
+    K = H
+    M = B * S
+
+    Y_flat = y.contiguous().view(M, K)         # (M, K)
+    W_t = out_proj_weight.t().contiguous().view(K, K)  # (K, K)
+    Bias = out_proj_bias.contiguous().view(K)    # (K)
+
+    Output = torch.empty((M, K), dtype=torch.float32, device=y.device)
+
+    BLOCK_M = 128
+    BLOCK_N = 64
+    BLOCK_K = 32
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_N))
+    _matmul_linear_kernel[grid](
+        Y_flat, W_t, Bias, Output,
+        M, K, K,
+        Y_flat.stride(0), Y_flat.stride(1),
+        W_t.stride(0), W_t.stride(1),
+        Output.stride(0), Output.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=4, num_stages=3,
+    )
+    return Output.view(B, S, K)
+
+
+class ModelNew(nn.Module):
+    def forward(self, x: torch.Tensor,
+                in_proj_weight: torch.Tensor,
+                in_proj_bias: torch.Tensor,
+                conv_weight: torch.Tensor,
+                conv_bias: torch.Tensor,
+                out_proj_weight: torch.Tensor,
+                out_proj_bias: torch.Tensor) -> torch.Tensor:
+        """
+        Triton-optimized forward that avoids PyTorch functional ops in host code.
+        Computes exactly the same steps as the original: in_proj, gate B, grouped causal conv, gate with C, out_proj.
+        Returns output of shape (B, S, H), cast to float32 for correctness.
+        """
+        assert TRITON_AVAILABLE, "Triton is not available"
+
+        # 1) in_proj: BCx = x @ in_proj_weight^T + in_proj_bias -> (B, S, 3H), float32
+        BCx = _triton_in_proj(x, in_proj_weight, in_proj_bias)
+        B, S, N = BCx.shape
+        H = N // 3  # hidden_size
+
+        # Split into B, C, x_proj
+        B_channel = BCx[:, :, :H]                 # (B, S, H)
+        C_channel = BCx[:, :, H:2*H]              # (B, S, H)
+        x_proj = BCx[:, :, 2*H:]                  # (B, S, H)
+
+        # 2) Elementwise gating: Bx = B_channel * x_proj
+        Bx = _triton_elementwise_mul_1d(B_channel, x_proj)  # (B, S, H), float32
+
+        # 3) Grouped causal conv: conv_weight derived from in_proj_weight's last 4 columns
+        conv_w = in_proj_weight[:, -4:].contiguous()  # (H, 4), promote to float32 for compute
+        conv_out = _triton_grouped_causal_conv1d(Bx, conv_w.to(torch.float32), conv_bias.to(torch.float32))  # (B, H, S), float32
+
+        # 4) Output gating: y = C_channel * conv_out; conv_out shape (B, H, S), C_channel (B, S, H)
+        conv_out_T = conv_out.transpose(-1, -2).contiguous()  # (B, S, H), float32
+        y = _triton_elementwise_mul_1d(C

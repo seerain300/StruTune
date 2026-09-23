@@ -1,0 +1,86 @@
+import torch
+import triton
+import triton.language as tl
+
+# Triton kernel: per-row RMS scaling with weight.
+# One program per row. We read x twice: once to compute sum of squares, once to write output.
+@triton.jit
+def _rms_scale_kernel(
+    hidden_ptr,        # *float32, pointer to hidden_states (cast to float32)
+    weight_ptr,        # *float32, pointer to weight (cast to float32)
+    out_ptr,           # *T_out, pointer to output (will store casted result)
+    batch_size,        # int32
+    hidden_size,       # int32
+    eps,               # float32
+    out_dtype_code: tl.constexpr,  # 0: fp32, 1: fp16, 2: bf16
+    BLOCK_SIZE: tl.constexpr        # e.g., 1024
+):
+    row_id = tl.program_id(0)  # one program per row
+
+    # First pass: accumulate sum of squares across the row
+    sumsq = 0.0
+    for col in range(0, hidden_size, BLOCK_SIZE):
+        offs = col + tl.arange(0, BLOCK_SIZE)
+        mask = offs < hidden_size
+        x = tl.load(hidden_ptr + row_id * hidden_size + offs, mask=mask, other=0.0)
+        sumsq += tl.sum(x * x, axis=0)
+    mean = sumsq / hidden_size
+    inv_rms = tl.rsqrt(mean + eps)
+
+    # Second pass: scale and write output
+    for col in range(0, hidden_size, BLOCK_SIZE):
+        offs = col + tl.arange(0, BLOCK_SIZE)
+        mask = offs < hidden_size
+        x = tl.load(hidden_ptr + row_id * hidden_size + offs, mask=mask, other=0.0)
+        w = tl.load(weight_ptr + offs, mask=mask, other=0.0)
+        y = x * inv_rms * w
+        # Cast to target dtype
+        if out_dtype_code == 0:
+            y_cast = y
+        elif out_dtype_code == 1:
+            y_cast = y.to(tl.float16)
+        else:  # out_dtype_code == 2 (bf16)
+            y_cast = y.to(tl.bfloat16)
+        tl.store(out_ptr + row_id * hidden_size + offs, y_cast, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states, weight):
+        # Ensure tensors are on CUDA and contiguous
+        assert hidden_states.is_cuda and weight.is_cuda, "Tensors must be on CUDA device"
+        hidden_states = hidden_states.contiguous()
+        weight = weight.contiguous()
+
+        batch_size, hidden_size = hidden_states.shape
+        assert hidden_size == 4096, "hidden_size must be 4096"
+
+        # Compute in float32 for numerical stability
+        hidden_f32 = hidden_states.to(torch.float32)
+        weight_f32 = weight.to(torch.float32)
+
+        # Output dtype follows input hidden_states dtype
+        out = torch.empty_like(hidden_states)
+        # Encode dtype for kernel
+        if out.dtype == torch.float32:
+            out_dtype_code = 0
+        elif out.dtype == torch.float16:
+            out_dtype_code = 1
+        elif out.dtype == torch.bfloat16:
+            out_dtype_code = 2
+        else:
+            raise RuntimeError("Unsupported output dtype")
+
+        # Launch Triton kernel: one program per row
+        grid = (batch_size,)
+        _rms_scale_kernel[grid](
+            hidden_f32, weight_f32, out,
+            batch_size, hidden_size, 1e-5, out_dtype_code,
+            BLOCK_SIZE=1024,
+            num_warps=8,
+            num_stages=4,
+        )
+        return out
+
+
+def run(*args):
+    return ModelNew()(*args)

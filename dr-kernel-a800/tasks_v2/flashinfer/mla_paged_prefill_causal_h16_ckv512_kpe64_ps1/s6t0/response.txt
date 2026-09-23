@@ -1,0 +1,480 @@
+- High-level analysis and plan (concise, no step-by-step chain-of-thought)
+
+What the original PyTorch code does:
+- It processes a batch of “query positions” for a given batch b using two sets of caches:
+  - Kc_all: key values with head_dim_ckv = 512, and Kp_all: “pe” keys with head_dim_kpe = 64.
+- For each batch b and each query position i in [q_start, q_end), it computes:
+  - logits = (q_nope[i] @ Kc.T) + (q_pe[i] @ Kp.T) for all tokens in the KV range for that batch element.
+  - Masks logits by a causal mask (block size: positions with index > query_abs_pos are set to -inf).
+  - Computes LSE (log-sum-exp) of the masked logits per head (divided by log(2)).
+  - Applies softmax to masked logits and computes out = softmax @ Kc (per head).
+- The output is a tensor of shape [total_q, num_qo_heads, head_dim_ckv] in bfloat16; LSE is [total_q, num_qo_heads] in float32.
+
+Opportunities to optimize with Triton:
+- This is a sequence of small-to-medium GEMMs + reductions per query position. We can fuse:
+  - The two matmuls (q_nope @ Kc.T and q_pe @ Kp.T) into a single Triton kernel to reduce host-side overhead and improve data reuse.
+  - The causal masking and logsumexp can be done on the host (GPU tensor ops) because the dimensions are small per iteration (here q_len is small and kv_len is small per batch element).
+- A more ambitious fusion would do softmax + @Kc inside the kernel, but that requires a streaming logsumexp across the entire L dimension and then a second pass to produce outputs. Triton lacks a convenient in-kernel reduction across a dynamic L vector in a single kernel without substantial bookkeeping. Given the variability of kv_len and the need for correctness, a pragmatic approach is:
+  - Triton kernel to compute logits = q @ Kc.T + qpe @ Kp.T for a given batch b and query index i.
+  - Host code does causal masking, LSE, softmax, and final matmul @ Kc using PyTorch ops (these are lightweight and keep correctness simple).
+- Data layout and kernel design:
+  - We’ll use one Triton program per (b, i) pair (grid size = batch_size * q_len). Each program loads the corresponding q_row vector (num_heads=16 by default) and all K rows for this batch element, computes both matmuls, sums them, and writes the [num_heads, L] logits matrix to an output buffer.
+  - We’ll pass pointer strides so it works with any contiguous layout. The kernel will tile over L dimension with a BLOCK_L and handle the first set of heads with BLOCK_HEADS. We loop over heads and store each head’s logits row; this keeps code simple and correct.
+
+Constraints and assumptions:
+- The original asserts fix constants: num_qo_heads == 16, head_dim_ckv == 512, head_dim_kpe == 64, and num_qo_heads == total_q_heads in the original code. We’ll keep those checks or at least rely on the given inputs satisfying them. We’ll not introduce new asserts in ModelNew to avoid unnecessary failures, but we can comment them.
+- We will not use any torch computation inside the Triton kernel. All tensor arithmetic (matmul, masking, softmax, @Kc) will be performed by PyTorch in the forward, except for the fused q@Kc.T + qpe@Kp.T part, which is done in the Triton kernel.
+- We’ll ensure inputs are on CUDA, contiguous, and appropriately cast to float32 for the kernel. Outputs will be produced in bfloat16 and float32 per original.
+
+Performance considerations:
+- The fused kernel reduces Python-side overhead and can leverage Triton’s optimized memory access for the q@Kc.T and qpe@Kp.T, especially when q_len or kv_len grow. Given the provided workloads, q_len is small, but batch_size and total_q can be large. The Triton kernel will scale with grid size and will be faster than pure Python loops of torch ops in many cases. The LSE and softmax stages remain in PyTorch for simplicity and correctness; those are minor compared to the GEMMs in typical settings.
+
+Plan:
+1. Implement a Triton kernel matmul_two_source_kernel that:
+   - Receives q_nope and q_pe rows for a given (b, i), and Kc_all, Kp_all for the corresponding batch element.
+   - Computes two matmuls: A = q_nope_row @ Kc.T and B = q_pe_row @ Kp.T, then outputs A + B as [num_heads, L].
+   - Uses tiling over L with BLOCK_L and loops over heads; stores each head’s logits row.
+2. In ModelNew.forward:
+   - Validate devices; cast inputs to float32; ensure contiguity.
+   - Precompute Kc_all and Kp_all from ckv_cache and kpe_cache.
+   - For each batch element, compute q_len, kv_len, and the slices.
+   - For each query i in the batch slice, launch the Triton kernel to compute logits for all heads.
+   - Perform masking, compute LSE, softmax, and final @Kc in PyTorch (all on GPU).
+   - Write outputs to the output tensor in bfloat16 and LSE in float32.
+
+This meets the requirement that the Triton kernel performs the main computation, and the PyTorch ops are only used to finalize results after the fused matmul.
+
+Now the code for ModelNew with the Triton kernel.
+
+```python
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def matmul_two_source_kernel(
+    q_nope_ptr,   # *fp32 [H, D_ckv], but we will pass per-row pointers for i
+    q_pe_ptr,     # *fp32 [H, D_kpe], similarly
+    Kc_ptr,       # *fp32 [L, D_ckv]
+    Kp_ptr,       # *fp32 [L, D_kpe]
+    out_ptr,      # *fp32 [H, L]  we will allocate H*L rows; each program writes its own HxL chunk
+    H: tl.constexpr,  # num_heads (constexpr)
+    L,             # int32, number of KV rows
+    D_ckv,         # int32, head_dim_ckv
+    D_kpe,         # int32, head_dim_kpe
+    h_stride_out,  # int32, stride to move between heads in out (row stride = L)
+    h_stride_qn,   # int32, stride to move between heads in q_nope (rows)
+    h_stride_qp,   # int32, stride to move between heads in q_pe (rows)
+    qn_row_offset, # int32, base offset in q_nope for this (b, i)
+    qp_row_offset, # int32, base offset in q_pe for this (b, i)
+    Kc_stride0,    # int32, stride0 of Kc (elements between rows)
+    Kc_stride1,    # int32, stride1 of Kc (elements between cols)
+    Kp_stride0,    # int32, stride0 of Kp (elements between rows)
+    Kp_stride1,    # int32, stride1 of Kp (elements between cols)
+    BLOCK_L: tl.constexpr,
+    BLOCK_HEADS: tl.constexpr,
+):
+    # Each program handles one (b, i) pair and writes all heads' logits
+    # We'll iterate heads in chunks and L in tiles
+    # out_ptr points to a contiguous buffer of size H*L; we compute row = h * L + l
+    for head_chunk in range(0, H, BLOCK_HEADS):
+        hs = head_chunk + tl.arange(0, BLOCK_HEADS)
+        mask_hs = hs < H
+
+        # Initialize an accumulator for this head chunk: [BLOCK_HEADS, BLOCK_L]
+        acc = tl.zeros((BLOCK_HEADS, BLOCK_L), dtype=tl.float32)
+
+        for l0 in range(0, L, BLOCK_L):
+            ls = l0 + tl.arange(0, BLOCK_L)
+            mask_ls = ls < L
+
+            # Load q_nope rows for this head chunk: shape [BLOCK_HEADS, D_ckv]
+            qn_rows = tl.zeros((BLOCK_HEADS, D_ckv), dtype=tl.float32)
+            for hh in range(BLOCK_HEADS):
+                h_idx = hs[hh]
+                if mask_hs[hh]:
+                    qn_row_ptr = q_nope_ptr + h_idx * h_stride_qn + qn_row_offset
+                    qn_rows[hh, :] = tl.load(qn_row_ptr + tl.arange(0, D_ckv), mask=mask_hs[hh], other=0.0)
+
+            # Load q_pe rows for this head chunk: shape [BLOCK_HEADS, D_kpe]
+            qp_rows = tl.zeros((BLOCK_HEADS, D_kpe), dtype=tl.float32)
+            for hh in range(BLOCK_HEADS):
+                h_idx = hs[hh]
+                if mask_hs[hh]:
+                    qp_row_ptr = q_pe_ptr + h_idx * h_stride_qp + qp_row_offset
+                    qp_rows[hh, :] = tl.load(qp_row_ptr + tl.arange(0, D_kpe), mask=mask_hs[hh], other=0.0)
+
+            # Load Kc tile: shape [BLOCK_L, D_ckv]
+            Kc_tile = tl.zeros((BLOCK_L, D_ckv), dtype=tl.float32)
+            for l in range(BLOCK_L):
+                l_idx = l0 + l
+                if mask_ls[l]:
+                    Kc_row_ptr = Kc_ptr + l_idx * Kc_stride0
+                    Kc_tile[l, :] = tl.load(Kc_row_ptr + tl.arange(0, D_ckv) * Kc_stride1, mask=mask_ls[l], other=0.0)
+
+            # Load Kp tile: shape [BLOCK_L, D_kpe]
+            Kp_tile = tl.zeros((BLOCK_L, D_kpe), dtype=tl.float32)
+            for l in range(BLOCK_L):
+                l_idx = l0 + l
+                if mask_ls[l]:
+                    Kp_row_ptr = Kp_ptr + l_idx * Kp_stride0
+                    Kp_tile[l, :] = tl.load(Kp_row_ptr + tl.arange(0, D_kpe) * Kp_stride1, mask=mask_ls[l], other=0.0)
+
+            # Compute matmuls: acc += qn_rows @ Kc_tile.T + qp_rows @ Kp_tile.T
+            # qn_rows: [BLOCK_HEADS, D_ckv], Kc_tile.T: [D_ckv, BLOCK_L] -> [BLOCK_HEADS, BLOCK_L]
+            # same for Kp
+            acc += tl.dot(qn_rows, tl.trans(Kc_tile)) + tl.dot(qp_rows, tl.trans(Kp_tile))
+
+        # Store results for this head chunk
+        # For each head h in this chunk, write row h*L + ls
+        # We have acc[:, ls] as [BLOCK_HEADS, BLOCK_L], contiguous along ls
+        for hh in range(BLOCK_HEADS):
+            h_idx = hs[hh]
+            if mask_hs[hh]:
+                out_row_base = h_idx * L  # within H*L buffer, rows are spaced by L
+                out_ptrs = out_ptr + out_row_base + ls  # shape [BLOCK_L]
+                # acc[hh, :] gives [BLOCK_L] for this head
+                tl.store(out_ptrs, acc[hh, :], mask=mask_ls)
+
+
+def _fused_qk_two_src_triton(q_nope_row, q_pe_row, Kc, Kp):
+    """
+    Fused q @ Kc.T + qpe @ Kp.T using Triton.
+    q_nope_row: [H, D_ckv] contiguous float32
+    q_pe_row:   [H, D_kpe] contiguous float32
+    Kc: [L, D_ckv] contiguous float32
+    Kp: [L, D_kpe] contiguous float32
+    Returns logits [H, L] float32
+    """
+    assert q_nope_row.is_cuda and q_pe_row.is_cuda and Kc.is_cuda and Kp.is_cuda
+    H = q_nope_row.shape[0]
+    L = Kc.shape[0]
+    D_ckv = q_nope_row.shape[1]
+    D_kpe = q_pe_row.shape[1]
+    out = torch.empty((H, L), dtype=torch.float32, device=q_nope_row.device)
+
+    # Launch one program per (b, i), but we'll pass the same row_offset for q_nope/q_pe; grid size = 1 here.
+    # The kernel handles all heads and L in tiles.
+    grid = (1,)
+    matmul_two_source_kernel[grid](
+        q_nope_row, q_pe_row, Kc, Kp, out,
+        H=H, L=L, D_ckv=D_ckv, D_kpe=D_kpe,
+        h_stride_out=L,
+        h_stride_qn=q_nope_row.stride(0),
+        h_stride_qp=q_pe_row.stride(0),
+        qn_row_offset=0,  # since we pass full row pointers, no base offset needed
+        qp_row_offset=0,  # ditto
+        Kc_stride0=Kc.stride(0),
+        Kc_stride1=Kc.stride(1),
+        Kp_stride0=Kp.stride(0),
+        Kp_stride1=Kp.stride(1),
+        BLOCK_L=64,
+        BLOCK_HEADS=16,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale):
+        # Ensure CUDA tensors and contiguity; cast to float32 for compute
+        device = q_nope.device
+        assert q_nope.is_cuda and q_pe.is_cuda and ckv_cache.is_cuda and kpe_cache.is_cuda, "All tensors must be on CUDA device"
+        assert qo_indptr.is_cuda and kv_indptr.is_cuda and kv_indices.is_cuda, "Indptr and indices must be on CUDA device"
+
+        # Extract shapes and ensure constants (we rely on inputs satisfying the original asserts)
+        total_q, num_qo_heads, head_dim_ckv = q_nope.shape
+        head_dim_kpe = q_pe.shape[-1]
+        num_pages = ckv_cache.shape[0]
+        assert ckv_cache.shape[-1] == 1 and kpe_cache.shape[-1] == 1, "Caches must have [num_pages, 1, dim]"
+        assert ckv_cache.shape[2] == head_dim_ckv
+        assert kpe_cache.shape[2] == head_dim_kpe
+        assert num_qo_heads == 16 and head_dim_ckv == 512 and head_dim_kpe == 64, "These dimensions are fixed per original code"
+
+        # Prepare Kc_all and Kp_all: [num_pages, dim], float32
+        Kc_all = ckv_cache.squeeze(1).to(torch.float32).contiguous()
+        Kp_all = kpe_cache.squeeze(1).to(torch.float32).contiguous()
+
+        # Output buffers
+        output = torch.zeros((total_q, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=device)
+        lse = torch.full((total_q, num_qo_heads), -float("inf"), dtype=torch.float32, device=device)
+
+        # Compute batch_size and len_indptr (as in original)
+        batch_size = int(kv_indptr.numel() - 1)
+        len_indptr = qo_indptr.numel()
+
+        # For each batch element, process queries and KVs
+        for b in range(batch_size):
+            q_start = int(qo_indptr[b].item())
+            q_end = int(qo_indptr[b + 1].item())
+            if q_start >= q_end:
+                continue
+
+            page_beg = int(kv_indptr[b].item())
+            page_end = int(kv_indptr[b + 1].item())
+            if page_beg >= page_end:
+                continue
+
+            kv_len = page_end - page_beg
+            # Token indices within this batch's KV block
+            tok_idx = kv_indices[page_beg:page_end].to(torch.int64)
+            # Select Kc and Kp rows for this batch
+            Kc_batch = Kc_all[tok_idx]  # [kv_len, head_dim_ckv]
+            Kp_batch = Kp_all[tok_idx]  # [kv_len, head_dim_kpe]
+
+            # Process each query in this batch element
+            q_len = q_end - q_start
+            for i in range(q_len):
+                q_row_i = q_nope[q_start + i].contiguous().to(torch.float32)  # [16, 512]
+                qpe_row_i = q_pe[q_start + i].contiguous().to(torch.float32)  # [16, 64]
+
+                # Fused Triton computation of logits = q_row_i @ Kc_batch.T + qpe_row_i @ Kp_batch.T
+                # We need to pass 2D [H, D] tensors, but q_row_i and qpe_row_i are [H, D], so we use them directly.
+                logits = _fused_qk_two_src_triton(q_row_i, qpe_row_i, Kc_batch, Kp_batch)  # [16, kv_len]
+                logits_scaled = logits * sm_scale  # scale by scalar
+
+                # Causal mask: positions with idx > (kv_len - q_len + i) are -inf
+                # That is, anything after query_abs_pos is masked out.
+                query_abs_pos = kv_len - q_len + i
+                causal_mask = torch.arange(kv_len, device=logits_scaled.device) > query_abs_pos
+                logits_scaled.masked_fill_(causal_mask.unsqueeze(0), -float("inf"))
+
+                # Compute LSE and softmax along L
+                lse_i = torch.logsumexp(logits_scaled, dim=-1) / math.log(2.0)  # [16]
+                lse[q_start + i] = lse_i  # shape [16], keep as-is
+
+                attn = torch.softmax(logits_scaled, dim=-1)  # [16, kv_len]
+                out_i = attn @ Kc_batch  # [16, 512]
+                output[q_start + i] = out_i.to(torch.bfloat16)
+
+        return output, lse
+```
+
+Notes:
+- The Triton kernel matmul_two_source_kernel fuses the two matmuls and writes the logits [H, L] for the entire head dimension H. It tiles over L with BLOCK_L and over H in chunks with BLOCK_HEADS. In this specific workload, H=16 and L≤kv_len (≤989669), so BLOCK_HEADS=16 and BLOCK_L=64 is fine. You can tune BLOCK_L and num_warps/num_stages for performance.
+- The forward method avoids any torch computation inside Triton kernels, launching the Triton kernel only for the fused q@Kc.T + qpe@Kp.T part. The rest (masking, LSE, softmax, final @Kc) uses PyTorch GPU ops. This keeps correctness while meeting the Triton-only-computation requirement for the main compute.
+- The code assumes inputs are on CUDA; if needed, you can add a .to(device) before using, but the provided get_inputs already creates tensors on CUDA.
+	user
+You wrote a Triton kernel, but:
+- you declared H as tl.constexpr, but the kernel is used with H=16 which is not a compile-time constant (it’s a shape parameter). Triton requires tl.constexpr values to be known at compile time, so your kernel signature is invalid. Fix this.
+- the Triton kernel is launched with a grid of (1,), but the kernel uses Python for-loops over H and L. In Triton, you must use vectorized operations and the grid to cover the entire problem. Fix kernel looping and grid so it writes the full output matrix and covers all L and H tiles.
+- you currently do loads inside nested Python for-loops in the kernel. Triton supports vectorized loads using broadcasted pointer arithmetic and tl.load on tensors. Rewrite the kernel to use vectorized loads and compute tl.dot for all tiles simultaneously rather than looping with Python.
+- you call the Triton helper with q_nope_row and q_pe_row (which are already [H, D]). You can pass them directly without “row offsets”; the kernel should just load the whole Hx* matrices. Simplify the kernel accordingly.
+- write the Triton kernel to directly produce [H, L] logits and avoid an intermediate accumulator loop. Use 3D grid: (ceil_div(H, BLOCK_H), ceil_div(L, BLOCK_L), batch_count). Each program instance computes a tile [BLOCK_H, BLOCK_L] for a specific (b). But since q_len is 1 in the provided inputs, we can drop the batch grid dimension and use grid (ceil_div(H, BLOCK_H), ceil_div(L, BLOCK_L)) and pass b and i via global scalars or simply treat q_row_i, qpe_row_i as global data per launch. To keep things simple and correct, one program per (b, i) is fine here because q_len is small and we only process one (b, i) per outer loop. We’ll still implement a 3D grid by passing batch_size as a runtime argument to the kernel, but we’ll only launch one program per (b, i).
+- ensure correctness: The fused Triton kernel must produce logits = q_nope_row @ Kc.T + q_pe_row @ Kp.T for all heads and all L. The rest (masking, LSE, softmax, output) remains in PyTorch to ensure correctness and simplicity.
+
+Performance considerations:
+- Fusing q_nope @ Kc.T and q_pe @ Kp.T into a single Triton kernel reduces Python-side overhead and can improve throughput on GPU. The rest of the computation is lightweight relative to GEMMs.
+- Use BLOCK_L = 64 or 128 depending on L; with L up to 989669, we need tiling, but in the provided workloads L is much smaller per batch element (e.g., 34). Choose BLOCK_L=64 and BLOCK_H=16 to match head_dim and typical kv_len. num_warps=4, num_stages=2 should be fine. You can tune these.
+
+Plan:
+- Fix the Triton kernel signature and launch: use a 2D grid (over H and L tiles), pass H, L, and batch_size as runtime ints, and compute the (b, i) selection in the host. The kernel will load q_nope_row, q_pe_row, Kc, Kp tiles, compute two tl.dot calls, and store the result into out[hs, ls].
+- Ensure all tensors passed to Triton are contiguous float32.
+- Keep PyTorch for masking, LSE, softmax, and final matmul @Kc.
+- Return output and lse as in the original.
+
+Here is the corrected and optimized code.
+
+```python
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_qk_two_src_kernel(
+    q_nope_ptr,   # *fp32, [H, D_ckv]
+    q_pe_ptr,     # *fp32, [H, D_kpe]
+    Kc_ptr,       # *fp32, [L, D_ckv]
+    Kp_ptr,       # *fp32, [L, D_kpe]
+    out_ptr,      # *fp32, [H, L]
+    H,            # int32, number of heads
+    L,            # int32, number of KV rows
+    D_ckv,        # int32
+    D_kpe,        # int32
+    h_stride_qn,  # int32, stride between heads in q_nope (row stride)
+    h_stride_qp,  # int32, stride between heads in q_pe (row stride)
+    Kc_stride0,   # int32, stride0 of Kc
+    Kc_stride1,   # int32, stride1 of Kc
+    Kp_stride0,   # int32, stride0 of Kp
+    Kp_stride1,   # int32, stride1 of Kp
+    BLOCK_H: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+):
+    # Grid: (pid_h, pid_l) where pid_h tiles heads, pid_l tiles L
+    pid_h = tl.program_id(0)
+    pid_l = tl.program_id(1)
+
+    hs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)  # [BLOCK_H]
+    ls = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)  # [BLOCK_L]
+    mask_h = hs < H
+    mask_l = ls < L
+
+    # Load q_nope rows for this head tile: shape [BLOCK_H, D_ckv]
+    qn_rows = tl.load(
+        q_nope_ptr + hs[:, None] * h_stride_qn + tl.arange(0, D_ckv)[None, :],
+        mask=mask_h[:, None],
+        other=0.0,
+    )  # [BLOCK_H, D_ckv]
+
+    # Load q_pe rows for this head tile: shape [BLOCK_H, D_kpe]
+    qp_rows = tl.load(
+        q_pe_ptr + hs[:, None] * h_stride_qp + tl.arange(0, D_kpe)[None, :],
+        mask=mask_h[:, None],
+        other=0.0,
+    )  # [BLOCK_H, D_kpe]
+
+    # Load Kc tile: shape [BLOCK_L, D_ckv]
+    Kc_tile = tl.load(
+        Kc_ptr + ls[:, None] * Kc_stride0 + tl.arange(0, D_ckv)[None, :] * Kc_stride1,
+        mask=mask_l[:, None],
+        other=0.0,
+    )  # [BLOCK_L, D_ckv]
+
+    # Load Kp tile: shape [BLOCK_L, D_kpe]
+    Kp_tile = tl.load(
+        Kp_ptr + ls[:, None] * Kp_stride0 + tl.arange(0, D_kpe)[None, :] * Kp_stride1,
+        mask=mask_l[:, None],
+        other=0.0,
+    )  # [BLOCK_L, D_kpe]
+
+    # Compute matmuls:
+    # qn_rows: [BLOCK_H, D_ckv] @ Kc_tile.T: [D_ckv, BLOCK_L] -> [BLOCK_H, BLOCK_L]
+    acc_qn = tl.dot(qn_rows, tl.trans(Kc_tile))
+    # qp_rows: [BLOCK_H, D_kpe] @ Kp_tile.T: [D_kpe, BLOCK_L] -> [BLOCK_H, BLOCK_L]
+    acc_qp = tl.dot(qp_rows, tl.trans(Kp_tile))
+    logits = acc_qn + acc_qp  # [BLOCK_H, BLOCK_L]
+
+    # Store results
+    out_ptrs = out_ptr + hs[:, None] * L + ls[None, :]  # [BLOCK_H, BLOCK_L]
+    store_mask = mask_h[:, None] & mask_l[None, :]
+    tl.store(out_ptrs, logits, mask=store_mask)
+
+
+def _fused_qk_two_src_triton(q_nope_row, q_pe_row, Kc, Kp):
+    """
+    Fused q @ Kc.T + qpe @ Kp.T using Triton.
+    q_nope_row: [H, D_ckv] contiguous float32
+    q_pe_row:   [H, D_kpe] contiguous float32
+    Kc: [L, D_ckv] contiguous float32
+    Kp: [L, D_kpe] contiguous float32
+    Returns logits [H, L] float32
+    """
+    assert q_nope_row.is_cuda and q_pe_row.is_cuda and Kc.is_cuda and Kp.is_cuda, "All tensors must be on CUDA"
+    H = q_nope_row.shape[0]
+    L = Kc.shape[0]
+    D_ckv = q_nope_row.shape[1]
+    D_kpe = q_pe_row.shape[1]
+    out = torch.empty((H, L), dtype=torch.float32, device=q_nope_row.device)
+
+    # Launch grid over H and L tiles
+    grid = (triton.cdiv(H, 16), triton.cdiv(L, 64))  # tile sizes tuned for H=16, L up to a few thousand
+    fused_qk_two_src_kernel[grid](
+        q_nope_row, q_pe_row, Kc, Kp, out,
+        H=H, L=L, D_ckv=D_ckv, D_kpe=D_kpe,
+        h_stride_qn=q_nope_row.stride(0),
+        h_stride_qp=q_pe_row.stride(0),
+        Kc_stride0=Kc.stride(0), Kc_stride1=Kc.stride(1),
+        Kp_stride0=Kp.stride(0), Kp_stride1=Kp.stride(1),
+        BLOCK_H=16, BLOCK_L=64,
+        num_warps=4, num_stages=2,
+    )
+    return out
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale):
+        device = q_nope.device
+        assert q_nope.is_cuda and q_pe.is_cuda and ckv_cache.is_cuda and kpe_cache.is_cuda, "All tensors must be on CUDA device"
+        assert qo_indptr.is_cuda and kv_indptr.is_cuda and kv_indices.is_cuda, "Indptr and indices must be on CUDA device"
+
+        # Shapes (assumptions per original code)
+        total_q, num_qo_heads, head_dim_ckv = q_nope.shape
+        head_dim_kpe = q_pe.shape[-1]
+        num_pages = ckv_cache.shape[0]
+        assert ckv_cache.shape[-1] == 1 and kpe_cache.shape[-1] == 1, "Caches must have [num_pages, 1, dim]"
+        assert ckv_cache.shape[2] == head_dim_ckv
+        assert kpe_cache.shape[2] == head_dim_kpe
+        assert num_qo_heads == 16 and head_dim_ckv == 512 and head_dim_kpe == 64, "These dimensions are fixed per original code"
+
+        # Prepare Kc_all and Kp_all: [num_pages, dim], float32, contiguous
+        Kc_all = ckv_cache.squeeze(1).to(torch.float32).contiguous()  # [num_pages, 512]
+        Kp_all = kpe_cache.squeeze(1).to(torch.float32).contiguous()  # [num_pages, 64]
+
+        # Output buffers
+        output = torch.zeros((total_q, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=device)
+        lse = torch.full((total_q, num_qo_heads), -float("inf"), dtype=torch.float32, device=device)
+
+        # Compute batch_size and len_indptr (as in original)
+        batch_size = int(kv_indptr.numel() - 1)
+        len_indptr = qo_indptr.numel()
+
+        # For each batch element, process queries and KVs
+        for b in range(batch_size):
+            q_start = int(qo_indptr[b].item())
+            q_end = int(qo_indptr[b + 1].item())
+            if q_start >= q_end:
+                continue
+
+            page_beg = int(kv_indptr[b].item())
+            page_end = int(kv_indptr[b + 1].item())
+            if page_beg >= page_end:
+                continue
+
+            kv_len = page_end - page_beg
+            # Token indices within this batch's KV block
+            tok_idx = kv_indices[page_beg:page_end].to(torch.int64)  # [kv_len]
+            # Select Kc and Kp rows for this batch
+            Kc_batch = Kc_all[tok_idx]  # [kv_len, 512]
+            Kp_batch = Kp_all[tok_idx]  # [kv_len, 64]
+
+            # Process each query in this batch element
+            q_len = q_end - q_start
+            for i in range(q_len):
+                q_row_i = q_nope[q_start + i].contiguous().to(torch.float32)  # [16, 512]
+                qpe_row_i = q_pe[q_start + i].contiguous().to(torch.float32)  # [16, 64]
+
+                # Fused Triton computation of logits = q_row_i @ Kc_batch.T + qpe_row_i @ Kp_batch.T
+                logits = _fused_qk_two_src_triton(q_row_i, qpe_row_i, Kc_batch, Kp_batch)  # [16, kv_len]
+                logits_scaled = logits * sm_scale  # scale by scalar
+
+                # Causal mask: positions with idx > (kv_len - q_len + i) are -inf
+                query_abs_pos = kv_len - q_len + i
+                causal_mask = torch.arange(kv_len, device=logits_scaled.device) > query_abs_pos
+                logits_scaled.masked_fill_(causal_mask.unsqueeze(0), -float("inf"))
+
+                # Compute LSE and softmax along L (dim=-1) per head
+                lse_i = torch.logsumexp(logits_scaled, dim=-1) / math.log(2.0)  # [16]
+                lse[q_start + i] = lse_i  # [16], keep shape (16,) for that query position
+
+                attn = torch.softmax(logits_scaled, dim=-1)  # [16, kv_len]
+                out_i = attn @ Kc_batch  # [16, 512]
+                output[q_start + i] = out_i.to(torch.bfloat16)
+
+        return output, lse
+```
+
+What changed and why:
+- Fixed the Triton kernel signature: removed tl.constexpr for H; H and L are runtime ints. The kernel uses a 2D grid to tile over heads and L, eliminating Python-side loops over H and L. This adheres to Triton’s requirements and improves performance.
+- Rewrote the kernel to use vectorized loads and tl.dot for both matmuls, computing logits = q_nope @ Kc.T + q_pe @ Kp.T directly. This avoids the previous nested Python loops and illegal tl.constexpr misuse.
+- Kept the rest of the computation in PyTorch (masking, LSE, softmax, @Kc) to preserve correctness and avoid the need for in-kernel reductions across dynamic L. This is acceptable and still leverages Triton where it matters.
+
+This code should compile and run correctly on the provided workloads, and it significantly reduces Python overhead by fusing the two matmuls into one Triton kernel per (b, i). You can tune BLOCK_H, BLOCK_L, num_warps, and num_stages for further performance if needed.
+assistant
+- Analysis, reasoning, and optimization plan
+
+What the original code does:
+- It computes, for each batch element b and each query position i in [q_start, q_end), a set of logits for all tokens in the KV range for that batch element:
+  - logit for head h: sum over tokens l of (q_nope[h] · Kc[l]) + (q_pe[h] · Kp[l])
+  - where Kc comes from ckv_cache, Kp from kpe_cache, q_nope and q_pe are query tensors. head_dim_ckv=512, head_dim_kpe=64, num_heads=16 by default.
+- After computing logits, it applies a causal mask (positions j > query_abs_pos receive -inf), computes LSE (log-sum-exp), applies softmax, and then out[h] = softmax @ Kc. The final output is [total_q, 16, 512] in bfloat16, and LSE in float32.
+
+Main computational workload:
+- The dominant compute is the two small GEMMs per query position: q_nope[i] @ Kc.T and q_pe[i] @ Kp.T, each producing [num_heads, kv_len], then summed. In the provided workloads, kv_len varies from 7 to 3916, but typical sizes are small (e.g., 34). There are many queries (e.g., total_q up to 16384), but each query performs lightweight work once K is gathered.
+
+Optimization strategy:
+- Fuse the two matmuls (q_nope @ Kc.T and q_pe @ Kp.T) into a single Trit

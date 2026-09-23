@@ -1,0 +1,402 @@
+import torch
+import triton
+import triton.language as tl
+
+
+# Kernel 1: Stable sort of flattened [selected_experts, routing_weights, token_ids] by keys (selected_experts).
+# Inputs: keys_ptr [T], vals_ptr [T], tok_ptr [T], outputs: out_keys [T], out_vals [T], out_tok [T].
+# T is the number of token-expert assignments (num_tokens * num_experts_per_tok). BLOCK is next power-of-two >= T.
+@triton.jit
+def sort_by_keys_stable_kernel(keys_ptr, vals_ptr, tok_ptr,
+                               out_keys_ptr, out_vals_ptr, out_tok_ptr,
+                               T: tl.constexpr, BLOCK: tl.constexpr):
+    idx = tl.arange(0, BLOCK)
+    a = tl.load(keys_ptr + idx, mask=idx < T, other=tl.max_int64)  # pad keys with max for easy sorting
+    b = tl.load(vals_ptr + idx, mask=idx < T, other=0.0)
+    c = tl.load(tok_ptr + idx, mask=idx < T, other=0)
+
+    # Bitonic sort network (ascending) for BLOCK lanes. Stable tie-breaker by idx.
+    for stage in range(2, BLOCK + 1):
+        size = stage
+        for stride in range(2, size + 1, 2):
+            i = idx
+            j = i ^ (stride // 2)
+            asc = (i & size) == 0
+            ai = a[i]
+            aj = a[j]
+            # Compare and decide swap
+            cmp = tl.where(asc, ai > aj, ai < aj)
+            # Stable tie-breaker for equal keys: smaller idx first
+            cmp |= (ai == aj) & (i > j)
+            ai_new = tl.where(cmp, aj, ai)
+            aj_new = tl.where(cmp, ai, aj)
+            bi_new = tl.where(cmp, b[j], b[i])
+            bj_new = tl.where(cmp, b[i], b[j])
+            ci_new = tl.where(cmp, c[j], c[i])
+            cj_new = tl.where(cmp, c[i], c[j])
+            # Assign updated values back to positions i and j
+            a = tl.where(i == idx, ai_new, a)
+            a = tl.where(j == idx, aj_new, a)
+            b = tl.where(i == idx, bi_new, b)
+            b = tl.where(j == idx, bj_new, b)
+            c = tl.where(i == idx, ci_new, c)
+            c = tl.where(j == idx, cj_new, c)
+    tl.store(out_keys_ptr + idx, a, mask=idx < T)
+    tl.store(out_vals_ptr + idx, b, mask=idx < T)
+    tl.store(out_tok_ptr + idx, c, mask=idx < T)
+
+
+# Kernel 2: Bincount of sorted_experts (int64). Produces counts [num_experts] via atomic adds.
+@triton.jit
+def bincount_kernel(keys_ptr, counts_ptr, T: tl.constexpr, BLOCK: tl.constexpr):
+    idx = tl.arange(0, BLOCK)
+    val = tl.load(keys_ptr + idx, mask=idx < T, other=0)
+    # Accumulate per unique index using atomic add
+    # We need to load counts for each val, but Triton will broadcast scalar updates. Use masked vectorized atomic_add.
+    # Note: counts_ptr is int32, val is int64; cast to int32 for indexing.
+    for i in range(T):
+        k = tl.load(keys_ptr + i)
+        k32 = k.to(tl.int32)
+        tl.atomic_add(counts_ptr + k32, 1)
+
+
+# Kernel 3: Inclusive prefix sum (cumsum) of counts -> starts [num_experts]
+@triton.jit
+def cumsum_inclusive_kernel(counts_ptr, starts_ptr, N: tl.constexpr):
+    # Single-program loop to compute prefix sums
+    acc = tl.zeros((), dtype=tl.int32)
+    for i in range(N):
+        cnt = tl.load(counts_ptr + i)
+        acc += cnt
+        tl.store(starts_ptr + i, acc)
+
+
+# Kernel 4: Compute capacity = ceil(1.25 * M_total / num_experts), where M_total = T, clamped to >= 1.
+@triton.jit
+def compute_capacity_kernel(M_total: tl.constexpr, num_experts: tl.constexpr, out_capacity_ptr):
+    cap = (M_total * 5) // (num_experts * 4)
+    cap = tl.maximum(cap, 1)
+    tl.store(out_capacity_ptr, cap)
+
+
+# Kernel 5: Scatter hidden states into expert_inputs[e, n, :] using v_exp, v_pos, v_tok, valid_mask.
+# Inputs: v_exp [M], v_pos [M], v_tok [M], valid_mask [M], hidden_states [num_tokens, hidden_size], expert_inputs [num_experts, capacity, hidden_size]
+@triton.jit
+def scatter_expert_inputs_kernel(v_exp_ptr, v_pos_ptr, v_tok_ptr, valid_mask_ptr,
+                                  hidden_states_ptr, expert_inputs_ptr,
+                                  num_experts: tl.constexpr, capacity: tl.constexpr, hidden_size: tl.constexpr,
+                                  stride_hs_m, stride_hs_k,
+                                  stride_ei_e, stride_ei_n, stride_ei_k,
+                                  M: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+    valid = tl.load(valid_mask_ptr + pid)
+    if not valid:
+        return
+    e = tl.load(v_exp_ptr + pid)
+    n = tl.load(v_pos_ptr + pid)
+    tok = tl.load(v_tok_ptr + pid)
+    hs_ptr = hidden_states_ptr + tok * stride_hs_m
+    k = tl.arange(0, hidden_size)
+    vals = tl.load(hs_ptr + k * stride_hs_k)
+    ei_base = expert_inputs_ptr + e * stride_ei_e + n * stride_ei_n
+    tl.store(ei_base + k, vals)
+
+
+# Kernel 6: Batched matmul for gate_out: expert_inputs [e, n, hidden_size] @ expert_gate_weights [e, hidden_size, intermediate_size] -> gate_out [e, n, intermediate_size]
+@triton.jit
+def bmm_gate_kernel(
+    A_ptr,  # expert_inputs flattened over (e,n)
+    B_ptr,  # expert_gate_weights
+    C_ptr,  # gate_out flattened over (e,n,intermediate_size)
+    NUM_EXPERTS: tl.constexpr, capacity: tl.constexpr, hidden_size: tl.constexpr, intermediate_size: tl.constexpr,
+    stride_A_e, stride_A_n, stride_A_k,
+    stride_B_e, stride_B_k, stride_B_j,
+    stride_C_e, stride_C_n, stride_C_j,
+    BLOCK_K: tl.constexpr, BLOCK_J: tl.constexpr
+):
+    e = tl.program_id(0)
+    n = tl.program_id(1)
+    base_a = e * capacity + n
+    base_c = e * capacity * intermediate_size + n * intermediate_size
+
+    acc = tl.zeros((BLOCK_J,), dtype=tl.bfloat16)
+
+    for k0 in range(0, hidden_size, BLOCK_K):
+        k_idx = k0 + tl.arange(0, BLOCK_K)
+        mask_k = k_idx < hidden_size
+        a_ptrs = A_ptr + base_a * stride_A_e + k_idx * stride_A_k
+        a = tl.load(a_ptrs, mask=mask_k, other=0.0)
+        b_ptrs = B_ptr + e * stride_B_e + k_idx[:, None] * stride_B_k + tl.arange(0, BLOCK_J)[None, :] * stride_B_j
+        b = tl.load(b_ptrs, mask=(mask_k[:, None]), other=0.0)
+        acc += tl.sum(b * a[:, None], axis=0)
+
+    c_ptrs = C_ptr + base_c + tl.arange(0, BLOCK_J) * stride_C_j
+    tl.store(c_ptrs, acc, mask=(tl.arange(0, BLOCK_J) < intermediate_size))
+
+
+# Kernel 7: up_out = expert_inputs @ expert_up_weights, same as gate_out kernel.
+@triton.jit
+def bmm_up_kernel(
+    A_ptr,
+    B_ptr,  # expert_up_weights
+    C_ptr,  # up_out flattened as [NUM_EXPERTS * capacity * intermediate_size]
+    NUM_EXPERTS: tl.constexpr, capacity: tl.constexpr, hidden_size: tl.constexpr, intermediate_size: tl.constexpr,
+    stride_A_e, stride_A_n, stride_A_k,
+    stride_B_e, stride_B_k, stride_B_j,
+    stride_C_e, stride_C_n, stride_C_j,
+    BLOCK_K: tl.constexpr, BLOCK_J: tl.constexpr
+):
+    e = tl.program_id(0)
+    n = tl.program_id(1)
+    base_a = e * capacity + n
+    base_c = e * capacity * intermediate_size + n * intermediate_size
+
+    acc = tl.zeros((BLOCK_J,), dtype=tl.bfloat16)
+
+    for k0 in range(0, hidden_size, BLOCK_K):
+        k_idx = k0 + tl.arange(0, BLOCK_K)
+        mask_k = k_idx < hidden_size
+        a_ptrs = A_ptr + base_a * stride_A_e + k_idx * stride_A_k
+        a = tl.load(a_ptrs, mask=mask_k, other=0.0)
+        b_ptrs = B_ptr + e * stride_B_e + k_idx[:, None] * stride_B_k + tl.arange(0, BLOCK_J)[None, :] * stride_B_j
+        b = tl.load(b_ptrs, mask=(mask_k[:, None]), other=0.0)
+        acc += tl.sum(b * a[:, None], axis=0)
+
+    c_ptrs = C_ptr + base_c + tl.arange(0, BLOCK_J) * stride_C_j
+    tl.store(c_ptrs, acc, mask=(tl.arange(0, BLOCK_J) < intermediate_size))
+
+
+# Kernel 8: Elementwise SiLU and multiply: activated = SiLU(gate_out) * up_out
+# Inputs: gate_out [total], up_out [total], activated [total]
+@triton.jit
+def silu_mul_kernel(gate_ptr, up_ptr, activated_ptr, total: tl.constexpr, BLOCK: tl.constexpr):
+    idx = tl.program_id(0)
+    for t in range(0, total, BLOCK):
+        offs = t + tl.arange(0, BLOCK)
+        mask = offs < total
+        g = tl.load(gate_ptr + offs, mask=mask, other=0.0)
+        u = tl.load(up_ptr + offs, mask=mask, other=0.0)
+        # SiLU(x) = x * sigmoid(x) with sigmoid(x) = 1 / (1 + exp(-x))
+        s = 1.0 / (1.0 + tl.exp(-g))
+        y = g * s * u
+        tl.store(activated_ptr + offs, y, mask=mask)
+
+
+# Kernel 9: Batched matmul for expert_outputs: activated [e, n, intermediate_size] @ expert_down_weights [e, intermediate_size, hidden_size] -> expert_outputs [e, n, hidden_size]
+@triton.jit
+def bmm_down_kernel(
+    A_ptr,  # activated
+    B_ptr,  # expert_down_weights
+    C_ptr,  # expert_outputs flattened over (e,n,hidden_size)
+    NUM_EXPERTS: tl.constexpr, capacity: tl.constexpr, intermediate_size: tl.constexpr, hidden_size: tl.constexpr,
+    stride_A_e, stride_A_n, stride_A_k,
+    stride_B_e, stride_B_k, stride_B_j,
+    stride_C_e, stride_C_n, stride_C_k,
+    BLOCK_K: tl.constexpr, BLOCK_J: tl.constexpr
+):
+    e = tl.program_id(0)
+    n = tl.program_id(1)
+    base_a = e * capacity + n
+    base_c = e * capacity * hidden_size + n * hidden_size
+
+    acc = tl.zeros((BLOCK_J,), dtype=tl.bfloat16)
+
+    for k0 in range(0, intermediate_size, BLOCK_K):
+        k_idx = k0 + tl.arange(0, BLOCK_K)
+        mask_k = k_idx < intermediate_size
+        a_ptrs = A_ptr + base_a * stride_A_e + k_idx * stride_A_k
+        a = tl.load(a_ptrs, mask=mask_k, other=0.0)
+        b_ptrs = B_ptr + e * stride_B_e + k_idx[:, None] * stride_B_k + tl.arange(0, BLOCK_J)[None, :] * stride_B_j
+        b = tl.load(b_ptrs, mask=(mask_k[:, None]), other=0.0)
+        acc += tl.sum(b * a[:, None], axis=0)
+
+    c_ptrs = C_ptr + base_c + tl.arange(0, BLOCK_J) * stride_C_k
+    tl.store(c_ptrs, acc, mask=(tl.arange(0, BLOCK_J) < hidden_size))
+
+
+# Kernel 10: Weighted scatter-add into final result: result[tok,:] += valid_out[tok,:] * weight[tok]
+# Inputs: v_exp [M], v_pos [M], v_tok [M], v_wt [M], valid_mask [M], expert_outputs [num_experts, capacity, hidden_size], result [num_tokens, hidden_size]
+@triton.jit
+def scatter_add_weighted_kernel(v_exp_ptr, v_pos_ptr, v_tok_ptr, v_wt_ptr, valid_mask_ptr,
+                                expert_outputs_ptr, result_ptr,
+                                num_experts: tl.constexpr, capacity: tl.constexpr, hidden_size: tl.constexpr,
+                                stride_eo_e, stride_eo_n, stride_eo_k,
+                                stride_res_m, stride_res_k,
+                                M: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+    valid = tl.load(valid_mask_ptr + pid)
+    if not valid:
+        return
+    e = tl.load(v_exp_ptr + pid)
+    n = tl.load(v_pos_ptr + pid)
+    tok = tl.load(v_tok_ptr + pid)
+    wt = tl.load(v_wt_ptr + pid)
+
+    base = expert_outputs_ptr + e * stride_eo_e + n * stride_eo_n
+    vals = tl.load(base + tl.arange(0, hidden_size) * stride_eo_k, mask=(tl.arange(0, hidden_size) < hidden_size), other=0.0)
+    # add weighted vals to result[tok,:]
+    res_base = result_ptr + tok * stride_res_m
+    res_vals = tl.load(res_base + tl.arange(0, hidden_size) * stride_res_k, mask=(tl.arange(0, hidden_size) < hidden_size), other=0.0)
+    res_vals += vals * wt
+    tl.store(res_base + tl.arange(0, hidden_size) * stride_res_k, res_vals, mask=(tl.arange(0, hidden_size) < hidden_size))
+
+
+def next_power_of_two(x: int) -> int:
+    return 1 << (x - 1).bit_length()
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor,
+                selected_experts: torch.Tensor,
+                routing_weights: torch.Tensor,
+                expert_gate_weights: torch.Tensor,
+                expert_up_weights: torch.Tensor,
+                expert_down_weights: torch.Tensor):
+        # Ensure on CUDA
+        assert hidden_states.is_cuda and selected_experts.is_cuda and routing_weights.is_cuda and expert_gate_weights.is_cuda and expert_up_weights.is_cuda and expert_down_weights.is_cuda, "All tensors must be on CUDA device"
+
+        device = hidden_states.device
+        dtype = hidden_states.dtype  # bfloat16
+        num_tokens = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[1]
+        num_experts = expert_gate_weights.shape[0]
+        intermediate_size = expert_gate_weights.shape[2]
+        num_experts_per_tok = selected_experts.shape[1]
+
+        # 1) Flatten
+        T = num_tokens * num_experts_per_tok
+        selected_experts_flat = selected_experts.reshape(-1)  # int64
+        routing_weights_flat = routing_weights.reshape(-1)    # bfloat16
+        token_ids_flat = torch.arange(T, device=device)       # int32
+
+        # Launch sort kernel
+        BLOCK = next_power_of_two(T)
+        sorted_experts = torch.empty(T, dtype=torch.int64, device=device)
+        sorted_weights = torch.empty(T, dtype=dtype, device=device)
+        sorted_token_ids = torch.empty(T, dtype=torch.int32, device=device)
+        sort_grid = (1,)  # 1D grid; BLOCK lanes per program
+        sort_by_keys_stable_kernel[sort_grid](selected_experts_flat, routing_weights_flat, token_ids_flat,
+                                              sorted_experts, sorted_weights, sorted_token_ids,
+                                              T=T, BLOCK=BLOCK)
+
+        # 2) Bincount of sorted_experts
+        counts = torch.zeros(num_experts, dtype=torch.int32, device=device)
+        bincount_grid = (1,)
+        bincount_kernel[bincount_grid](sorted_experts, counts, T=T, BLOCK=BLOCK)
+
+        # 3) Inclusive prefix sum (cumsum) of counts -> starts
+        starts = torch.empty(num_experts, dtype=torch.int32, device=device)
+        cumsum_grid = (1,)
+        cumsum_inclusive_kernel[cumsum_grid](counts, starts, num_experts)
+
+        # 4) capacity = ceil(1.25 * T / num_experts), clamped to >= 1
+        capacity = torch.empty((), dtype=torch.int32, device=device)
+        compute_capacity_kernel[(1,)](T, num_experts, capacity)
+        capacity_val = int(capacity.item())  # convert to python int
+        capacity = capacity_val
+
+        # 5) Compute valid masks: within_pos = index - starts[sorted_experts[index]]; valid if within_pos < capacity
+        # Prepare index vector
+        idx = torch.arange(T, device=device)
+        # Gather starts per sorted_experts index
+        starts_per_idx = starts[sorted_experts]  # int32
+        within_pos = idx - starts_per_idx        # int64
+        valid_mask = (within_pos < capacity)     # bool
+        # Flatten arrays
+        v_exp = sorted_experts[valid_mask].to(torch.int32)
+        v_pos = within_pos[valid_mask].to(torch.int32)
+        v_tok = sorted_token_ids[valid_mask].to(torch.int32)
+        v_wt = sorted_weights[valid_mask]
+
+        M = v_exp.numel()
+
+        # 6) Allocate expert_inputs [num_experts, capacity, hidden_size]
+        expert_inputs = torch.empty((num_experts, capacity, hidden_size), dtype=dtype, device=device)
+
+        # 7) Scatter hidden states into expert_inputs
+        stride_hs_m = hidden_states.stride(0)
+        stride_hs_k = hidden_states.stride(1)
+        stride_ei_e = expert_inputs.stride(0)
+        stride_ei_n = expert_inputs.stride(1)
+        stride_ei_k = expert_inputs.stride(2)
+        scatter_experts_grid = (M,)
+        scatter_expert_inputs_kernel[scatter_experts_grid](
+            v_exp, v_pos, v_tok, valid_mask.to(torch.int8),
+            hidden_states, expert_inputs,
+            num_experts, capacity, hidden_size,
+            stride_hs_m, stride_hs_k,
+            stride_ei_e, stride_ei_n, stride_ei_k,
+            M=M
+        )
+
+        # 8) Compute gate_out = expert_inputs @ expert_gate_weights
+        gate_out = torch.empty((num_experts, capacity, intermediate_size), dtype=dtype, device=device)
+        grid_bmm_gate = (num_experts, capacity, 1)
+        bmm_gate_kernel[grid_bmm_gate](
+            expert_inputs, expert_gate_weights,
+            gate_out,
+            num_experts, capacity, hidden_size, intermediate_size,
+            expert_inputs.stride(0), expert_inputs.stride(1), expert_inputs.stride(2),
+            expert_gate_weights.stride(0), expert_gate_weights.stride(1), expert_gate_weights.stride(2),
+            gate_out.stride(0), gate_out.stride(1), gate_out.stride(2),
+            BLOCK_K=64, BLOCK_J=128
+        )
+
+        # 9) Compute up_out = expert_inputs @ expert_up_weights
+        up_out = torch.empty_like(gate_out)
+        grid_bmm_up = (num_experts, capacity, 1)
+        bmm_up_kernel[grid_bmm_up](
+            expert_inputs, expert_up_weights,
+            up_out,
+            num_experts, capacity, hidden_size, intermediate_size,
+            expert_inputs.stride(0), expert_inputs.stride(1), expert_inputs.stride(2),
+            expert_up_weights.stride(0), expert_up_weights.stride(1), expert_up_weights.stride(2),
+            up_out.stride(0), up_out.stride(1), up_out.stride(2),
+            BLOCK_K=64, BLOCK_J=128
+        )
+
+        # 10) activated = SiLU(gate_out) * up_out (elementwise in Triton)
+        activated = torch.empty_like(gate_out)
+        total = num_experts * capacity * intermediate_size
+        silu_grid = (triton.cdiv(total, 1024),)
+        silu_mul_kernel[silu_grid](gate_out, up_out, activated, total, 1024)
+
+        # 11) Compute expert_outputs = activated @ expert_down_weights
+        expert_outputs = torch.empty((num_experts, capacity, hidden_size), dtype=dtype, device=device)
+        grid_bmm_down = (num_experts, capacity, 1)
+        bmm_down_kernel[grid_bmm_down](
+            activated, expert_down_weights,
+            expert_outputs,
+            num_experts, capacity, intermediate_size, hidden_size,
+            activated.stride(0), activated.stride(1), activated.stride(2),
+            expert_down_weights.stride(0), expert_down_weights.stride(1), expert_down_weights.stride(2),
+            expert_outputs.stride(0), expert_outputs.stride(1), expert_outputs.stride(2),
+            BLOCK_K=64, BLOCK_J=128
+        )
+
+        # 12) Weighted scatter-add into final result: result[tok,:] += valid_out[tok,:] * weight[tok]
+        result = torch.zeros((num_tokens, hidden_size), dtype=dtype, device=device)
+        stride_eo_e = expert_outputs.stride(0)
+        stride_eo_n = expert_outputs.stride(1)
+        stride_eo_k = expert_outputs.stride(2)
+        stride_res_m = result.stride(0)
+        stride_res_k = result.stride(1)
+        scatter_add_grid = (M,)
+        scatter_add_weighted_kernel[scatter_add_grid](
+            v_exp, v_pos, v_tok, v_wt, valid_mask.to(torch.int8),
+            expert_outputs, result,
+            num_experts, capacity, hidden_size,
+            stride_eo_e, stride_eo_n, stride_eo_k,
+            stride_res_m, stride_res_k,
+            M=M
+        )
+
+        return result
+
+
+def run(*args):
+    return ModelNew()(*args)

@@ -1,0 +1,328 @@
+import torch
+import torch.nn as nn
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+# 1) Triton linear kernel: Y = X @ W^T + B
+# X: [B*S, D_in], W: [D_out, D_in], B: [D_out], Y: [B*S, D_out]
+@triton.jit
+def linear_kernel(
+    X_ptr, W_ptr, B_ptr, Y_ptr,
+    BS, D_in, D_out,
+    stride_xm, stride_xk,       # X strides for m=BS and k=D_in
+    stride_w0, stride_w1,       # W strides for dim0=D_out and dim1=D_in
+    stride_ym, stride_yk,       # Y strides for m=BS and k=D_out
+):
+    m = tl.program_id(axis=0)  # row index in [0, BS)
+    n = tl.program_id(axis=1)  # output dim in [0, D_out)
+    acc = tl.zeros((), dtype=tl.float32)
+    for k0 in range(0, D_in, 64):
+        offs = k0 + tl.arange(0, 64)
+        mask = offs < D_in
+        x = tl.load(X_ptr + m * stride_xm + offs * stride_xk, mask=mask, other=0.0)  # [64]
+        w = tl.load(W_ptr + n * stride_w0 + offs * stride_w1, mask=mask, other=0.0)  # [64]
+        acc += tl.sum(x * w, axis=0)
+    b = tl.load(B_ptr + n)
+    acc += b
+    tl.store(Y_ptr + m * stride_ym + n * stride_yk, acc)
+
+
+# 2) Triton RMSNorm per element: Y[b, h, s, d] = X[b, h, s, d] * rsqrt(mean(x^2) + eps) * weight[d]
+# Inputs: X [B, H, S, D], W [D], Y [B, H, S, D]
+@triton.jit
+def rmsnorm_kernel(
+    X_ptr, W_ptr, Y_ptr,
+    B, H, S, D,
+    stride_xb, stride_xh, stride_xs, stride_xd,
+    stride_yb, stride_yh, stride_ys, stride_yd,
+    eps: tl.float32,
+):
+    b = tl.program_id(axis=0)
+    h = tl.program_id(axis=1)
+    s = tl.program_id(axis=2)
+    d = tl.program_id(axis=3)
+    x = tl.load(X_ptr + b * stride_xb + h * stride_xh + s * stride_xs + d * stride_xd).to(tl.float32)
+    sum_sq = x * x
+    mean_sq = tl.sum(sum_sq, axis=0) / D
+    inv_rms = tl.rsqrt(mean_sq + eps)
+    w = tl.load(W_ptr + d).to(tl.float32)
+    y = (x * inv_rms) * w
+    tl.store(Y_ptr + b * stride_yb + h * stride_yh + s * stride_ys + d * stride_yd, y)
+
+
+# 3) Triton rotation (RoPE) for Q: Qr = Q * cos + cat((-q2, q1), -1) * sin
+# X: [B, H, S, D], C: [S, 64], S: [S, 64], Y: [B, H, S, D], D=128
+@triton.jit
+def rotate_half_kernel(
+    X_ptr, C_ptr, S_ptr, Y_ptr,
+    B, H, S, D,
+    stride_xb, stride_xh, stride_xs, stride_xd,
+    stride_yb, stride_yh, stride_ys, stride_yd,
+    stride_c0, stride_c1,     # cos strides: [S, 64]
+    stride_s0, stride_s1,     # sin strides: [S, 64]
+):
+    b = tl.program_id(axis=0)
+    h = tl.program_id(axis=1)
+    s = tl.program_id(axis=2)
+    d = tl.program_id(axis=3)
+    offs = tl.arange(0, 128)  # assuming D==128, operate on the last dim
+    x = tl.load(X_ptr + b * stride_xb + h * stride_xh + s * stride_xs + d * stride_xd)
+    q1 = x[:64]
+    q2 = x[64:]
+    q_rot = (-q2) * tl.load(C_ptr + s * stride_c0 + 0 * stride_c1) + q1 * tl.load(S_ptr + s * stride_s0 + 0 * stride_s1)
+    x = q1 * tl.load(C_ptr + s * stride_c0 + 0 * stride_c1) + q2 * tl.load(S_ptr + s * stride_s0 + 0 * stride_s1)
+    y = x + q_rot
+    tl.store(Y_ptr + b * stride_yb + h * stride_yh + s * stride_ys + d * stride_yd, y)
+
+
+# 4) Triton compute attention scores: S[b, h, i, j] = sum_k Q_norm[b,h,i,k] * K_rot[b,h,j,k] * scaling
+# Q_norm: [B, H, S, D], K_rot: [B, H, S, D], S: [B, H, S, S]
+@triton.jit
+def attn_scores_kernel(
+    Q_ptr, K_ptr, S_ptr,
+    B, H, S, D,
+    stride_qb, stride_qh, stride_qs, stride_qd,
+    stride_kb, stride_kh, stride_ks, stride_kd,
+    stride_sb, stride_sh, stride_si, stride_sj,
+    scaling: tl.float32,
+):
+    b = tl.program_id(axis=0)
+    h = tl.program_id(axis=1)
+    i = tl.program_id(axis=2)
+    j = tl.program_id(axis=3)
+    acc = tl.zeros((), dtype=tl.float32)
+    for k0 in range(0, D, 64):
+        offs = k0 + tl.arange(0, 64)
+        mask = offs < D
+        q = tl.load(Q_ptr + b * stride_qb + h * stride_qh + i * stride_qs + offs * stride_qd, mask=mask, other=0.0)
+        k = tl.load(K_ptr + b * stride_kb + h * stride_kh + j * stride_ks + offs * stride_kd, mask=mask, other=0.0)
+        acc += tl.sum(q * k, axis=0)
+    acc *= scaling
+    tl.store(S_ptr + b * stride_sb + h * stride_sh + i * stride_si + j * stride_sj, acc)
+
+
+# 5) Triton softmax over columns for each (b, h): Soft[b, h, i, j] = exp(scores[i,j]) / sum_j exp(scores[i,j])
+# S: [B, H, S, S], Soft: [B, H, S, S]
+@triton.jit
+def softmax_cols_kernel(
+    S_ptr, Soft_ptr,
+    B, H, S,
+    stride_sb, stride_sh, stride_si, stride_sj,
+    stride_fb, stride_fh, stride_fi, stride_fj,
+):
+    # One program per (b, h, i) computing softmax over j in [0, S)
+    b = tl.program_id(axis=0)
+    h = tl.program_id(axis=1)
+    i = tl.program_id(axis=2)
+    # First pass: find max for numerical stability
+    maxv = tl.zeros((), dtype=tl.float32) - 1e30
+    for j in range(0, S):
+        s = tl.load(S_ptr + b * stride_sb + h * stride_sh + i * stride_si + j * stride_sj)
+        if s > maxv:
+            maxv = s
+    # Second pass: compute exp and sum
+    sum_exp = tl.zeros((), dtype=tl.float32)
+    for j in range(0, S):
+        s = tl.load(S_ptr + b * stride_sb + h * stride_sh + i * stride_si + j * stride_sj)
+        e = tl.exp(s - maxv)
+        sum_exp += e
+    # Third pass: write normalized softmax
+    for j in range(0, S):
+        s = tl.load(S_ptr + b * stride_sb + h * stride_sh + i * stride_si + j * stride_sj)
+        e = tl.exp(s - maxv)
+        soft = e / sum_exp
+        tl.store(Soft_ptr + b * stride_fb + h * stride_fh + i * stride_fi + j * stride_fj, soft)
+
+
+# 6) Triton compute output for each (b, h, i): Y[i] = sum_j Soft[i, j] * V[j, :]
+# Soft: [B, H, S, S], V: [B, H, S, D], Y: [B, H, S, D]
+@triton.jit
+def attn_output_kernel(
+    Soft_ptr, V_ptr, Y_ptr,
+    B, H, S, D,
+    stride_sb, stride_sh, stride_si, stride_sj,
+    stride_vb, stride_vh, stride_vs, stride_vd,
+    stride_yb, stride_yh, stride_yi, stride_yd,
+):
+    b = tl.program_id(axis=0)
+    h = tl.program_id(axis=1)
+    i = tl.program_id(axis=2)
+    for d in range(0, D):
+        acc = tl.zeros((), dtype=tl.float32)
+        for j in range(0, S):
+            soft = tl.load(Soft_ptr + b * stride_sb + h * stride_sh + i * stride_si + j * stride_sj)
+            v = tl.load(V_ptr + b * stride_vb + h * stride_vh + j * stride_vs + d * stride_vd)
+            acc += soft * v
+        tl.store(Y_ptr + b * stride_yb + h * stride_yh + i * stride_yi + d * stride_yd, acc)
+
+
+# 7) Triton final linear kernel: O = attn_output @ o_proj_weight^T + o_proj_bias
+# attn_output_flat: [B*S, D], W: [D_out, D], B: [D_out], Y: [B*S, D_out]
+@triton.jit
+def final_linear_kernel(
+    X_ptr, W_ptr, B_ptr, Y_ptr,
+    BS, D, D_out,
+    stride_xm, stride_xk,       # X strides for m=BS and k=D
+    stride_w0, stride_w1,       # W strides for dim0=D_out and dim1=D
+    stride_ym, stride_yk,       # Y strides for m=BS and k=D_out
+):
+    m = tl.program_id(axis=0)  # row index in [0, BS)
+    n = tl.program_id(axis=1)  # output dim in [0, D_out)
+    acc = tl.zeros((), dtype=tl.float32)
+    for k0 in range(0, D, 64):
+        offs = k0 + tl.arange(0, 64)
+        mask = offs < D
+        x = tl.load(X_ptr + m * stride_xm + offs * stride_xk, mask=mask, other=0.0)  # [64]
+        w = tl.load(W_ptr + n * stride_w0 + offs * stride_w1, mask=mask, other=0.0)  # [64]
+        acc += tl.sum(x * w, axis=0)
+    b = tl.load(B_ptr + n)
+    acc += b
+    tl.store(Y_ptr + m * stride_ym + n * stride_yk, acc)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, hidden_dim: int, head_dim: int, num_heads: int, num_kv_heads: int, num_kv_groups: int,
+                 rms_norm_eps: float):
+        super().__init__()
+        self.head_dim = head_dim  # 128
+        self.num_heads = num_heads  # 96
+        self.num_kv_heads = num_kv_heads  # 8
+        self.num_kv_groups = num_kv_groups  # 12
+        self.rms_norm_eps = rms_norm_eps
+        # We keep weights/bias as nn.Parameter so the module signature matches the original Model
+        # Note: actual weights are not provided in the prompt; they are passed as args at runtime.
+
+    def forward(self, hidden_states: torch.Tensor,
+                q_proj_weight: torch.Tensor, q_proj_bias: torch.Tensor,
+                k_proj_weight: torch.Tensor, k_proj_bias: torch.Tensor,
+                v_proj_weight: torch.Tensor, v_proj_bias: torch.Tensor,
+                o_proj_weight: torch.Tensor, o_proj_bias: torch.Tensor,
+                q_norm_weight: torch.Tensor, k_norm_weight: torch.Tensor,
+                cos: torch.Tensor, sin: torch.Tensor):
+        # Ensure dtype is float32 for Triton accumulation
+        device = hidden_states.device
+        dtype = torch.float32
+
+        # 0) Prepare shapes
+        B, S, D = hidden_states.shape  # hidden_states: [B, S, D]
+        assert D == 128, "This implementation assumes head_dim=128."
+        H = self.num_heads  # 96
+        # Compute query/key/value
+        # Flatten B*S to use linear kernel
+        BS = B * S
+
+        # 1) Linear for Q, K, V and then RMSNorm
+        # Q = linear(hidden_states, q_proj_weight, q_proj_bias)
+        q = torch.empty((BS, D), device=device, dtype=dtype)
+        linear_kernel[(BS, D)](
+            hidden_states.contiguous().view(BS, D), q_proj_weight.contiguous(), q_proj_bias.contiguous(),
+            q, BS, D, q_proj_weight.shape[1], D,  # D_in = q_proj_weight.shape[1]
+        )
+
+        # K = linear(hidden_states, k_proj_weight, k_proj_bias)
+        k = torch.empty((BS, D), device=device, dtype=dtype)
+        linear_kernel[(BS, D)](
+            hidden_states.contiguous().view(BS, D), k_proj_weight.contiguous(), k_proj_bias.contiguous(),
+            k, BS, D, k_proj_weight.shape[1], D,
+        )
+
+        # V = linear(hidden_states, v_proj_weight, v_proj_bias)
+        v = torch.empty((BS, D), device=device, dtype=dtype)
+        linear_kernel[(BS, D)](
+            hidden_states.contiguous().view(BS, D), v_proj_weight.contiguous(), v_proj_bias.contiguous(),
+            v, BS, D, v_proj_weight.shape[1], D,
+        )
+
+        # Reshape to [B, H, S, D]
+        q = q.view(B, S, D).unsqueeze(1).expand(B, H, S, D).contiguous()
+        k = k.view(B, S, D).unsqueeze(1).expand(B, H, S, D).contiguous()
+        v = v.view(B, S, D).unsqueeze(1).expand(B, H, S, D).contiguous()
+
+        # 2) RMSNorm for Q and K
+        q_norm = torch.empty_like(q, device=device, dtype=dtype)
+        rmsnorm_kernel[(B, H, S, D)](
+            q.contiguous(), q_norm_weight.contiguous(), q_norm, B, H, S, D,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            q_norm.stride(0), q_norm.stride(1), q_norm.stride(2), q_norm.stride(3),
+            self.rms_norm_eps,
+        )
+
+        k_norm = torch.empty_like(k, device=device, dtype=dtype)
+        rmsnorm_kernel[(B, H, S, D)](
+            k.contiguous(), k_norm_weight.contiguous(), k_norm, B, H, S, D,
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            k_norm.stride(0), k_norm.stride(1), k_norm.stride(2), k_norm.stride(3),
+            self.rms_norm_eps,
+        )
+
+        # 3) Rotate Q using sin/cos (cos/sin are [S, 64], matching head_dim/2)
+        # Repeat: original code only rotates Q; we will rotate Q and not K to match.
+        q_rot = torch.empty_like(q_norm, device=device, dtype=dtype)
+        rotate_half_kernel[(B, H, S, D)](
+            q_norm.contiguous(), cos.contiguous(), sin.contiguous(), q_rot, B, H, S, D,
+            q_norm.stride(0), q_norm.stride(1), q_norm.stride(2), q_norm.stride(3),
+            q_rot.stride(0), q_rot.stride(1), q_rot.stride(2), q_rot.stride(3),
+            cos.stride(0), cos.stride(1),  # cos/sin are [S, 64], so stride(1)=64
+            sin.stride(0), sin.stride(1),
+        )
+
+        # K remains as k_norm (original code does not rotate K)
+
+        # 4) Compute attention scores S[b, h, i, j] = q_rot[b,h,i,:] @ k_norm[b,h,j,:] * scaling
+        # S: [B, H, S, S]
+        S = torch.empty((B, H, S, S), device=device, dtype=dtype)
+        attn_scores_kernel[(B, H, S, S)](
+            q_rot.contiguous(), k_norm.contiguous(), S,
+            B, H, S, D,
+            q_rot.stride(0), q_rot.stride(1), q_rot.stride(2), q_rot.stride(3),
+            k_norm.stride(0), k_norm.stride(1), k_norm.stride(2), k_norm.stride(3),
+            S.stride(0), S.stride(1), S.stride(2), S.stride(3),
+            1.0 / (self.head_dim ** 0.5),  # scaling
+        )
+
+        # 5) Apply causal mask and softmax over columns (per (b, h))
+        # Soft = softmax(S, dim=-1)
+        Soft = torch.empty_like(S, device=device, dtype=dtype)
+        softmax_cols_kernel[(B, H, S)](
+            S, Soft,
+            B, H, S,
+            S.stride(0), S.stride(1), S.stride(2), S.stride(3),
+            Soft.stride(0), Soft.stride(1), Soft.stride(2), Soft.stride(3),
+        )
+
+        # 6) Compute attention output Y = Soft @ V
+        # V: [B, H, S, D], Y: [B, H, S, D]
+        Y = torch.empty((B, H, S, D), device=device, dtype=dtype)
+        attn_output_kernel[(B, H, S, D)](
+            Soft, v, Y,
+            B, H, S, D,
+            Soft.stride(0), Soft.stride(1), Soft.stride(2), Soft.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            Y.stride(0), Y.stride(1), Y.stride(2), Y.stride(3),
+        )
+
+        # 7) Final output projection: linear(Y_flat, o_proj_weight, o_proj_bias)
+        BS_out = B * S * H
+        attn_output_flat = Y.view(BS_out, D)
+        output = torch.empty((BS_out, o_proj_weight.shape[0]), device=device, dtype=dtype)
+        final_linear_kernel[(BS_out, o_proj_weight.shape[0])](
+            attn_output_flat, o_proj_weight.contiguous(), o_proj_bias.contiguous(), output,
+            BS_out, D, o_proj_weight.shape[0],
+            attn_output_flat.stride(0), D,  # stride_xm = BS_out row length, stride_xk = D
+            o_proj_weight.stride(0), o_proj_weight.stride(1),
+            output.stride(0), o_proj_weight.shape[0],  # output has D_out rows
+        )
+
+        # Reshape back to [B, S, H*D]
+        output = output.view(B, S, o_proj_weight.shape[0])
+        return output
+
+
+def run(*args):
+    return ModelNew()(*args)

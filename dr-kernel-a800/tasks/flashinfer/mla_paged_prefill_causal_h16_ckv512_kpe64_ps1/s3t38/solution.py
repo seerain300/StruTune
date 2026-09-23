@@ -1,0 +1,272 @@
+import torch
+import triton
+import triton.language as tl
+
+
+# Triton kernel: compute logits_scaled[h, :] for a single batch segment
+# qn_ptr: *fp32, length H*K, flattened q_nope[q_abs]
+# qp_ptr: *fp32, length H*Kp, flattened q_pe[q_abs]
+# Kc_ptr: *fp32, base pointer to Kc_all flattened (P*K)
+# Kp_ptr: *fp32, base pointer to Kp_all flattened (P*Kp)
+# tok_idx_ptr: *int32, length L
+# L: number of tokens in this segment (runtime int)
+# sm_scale: fp32 scalar
+# head: constexpr, head index
+@triton.jit
+def compute_logits_row_kernel(
+    qn_ptr, qp_ptr, Kc_ptr, Kp_ptr, logits_scaled_ptr,
+    L, sm_scale,
+    head: tl.constexpr,
+):
+    # Compute logits for this head over all L tokens
+    # For each l, compute logits[l] = dot(qn_vec[h], Kc[tok_idx[l]]) + dot(qp_vec[h], Kp[tok_idx[l]])
+    # Then write to logits_scaled[l] = logits[l] * sm_scale
+
+    # Initialize output vector
+    # Triton assumes contiguous output; we'll compute element-by-element
+    # We need to iterate l from 0 to L-1
+    # Note: Triton supports simple loops for small L; otherwise, use 2D grid.
+
+    # We'll implement a simple loop over l. Triton will generate code appropriately.
+    # Using tl.arange is not sufficient; we manually iterate.
+    for l in range(0, L):
+        # Compute feature contributions: sum over K and Kp
+        sum_qn = 0.0
+        sum_qp = 0.0
+
+        H = 16
+        K = 512
+        Kp = 64
+        h_idx = head
+
+        # Accumulate qn contribution: qn_vec[h*K + k] * Kc[tok_idx[l], k]
+        for k in range(0, K):
+            qnk = tl.load(qn_ptr + h_idx * K + k)
+            kc = tl.load(Kc_ptr + tl.load(tok_idx_ptr + l) * K + k)
+            sum_qn += qnk * kc
+
+        # Accumulate qp contribution: qp_vec[h*Kp + kp] * Kp[tok_idx[l], kp]
+        for kp in range(0, Kp):
+            qpk = tl.load(qp_ptr + h_idx * Kp + kp)
+            kp_val = tl.load(Kp_ptr + tl.load(tok_idx_ptr + l) * Kp + kp)
+            sum_qp += qpk * kp_val
+
+        logits = sum_qn + sum_qp
+        logits_scaled = logits * sm_scale
+        tl.store(logits_scaled_ptr + l, logits_scaled)
+
+
+# Triton kernel: compute lse[h] = logsumexp(logits_scaled[h, :]) / ln(2)
+# logits_scaled_ptr: *fp32, vector length L
+# lse_out_ptr: *fp32, scalar output for this head
+@triton.jit
+def compute_lse_kernel(
+    logits_scaled_ptr, lse_out_ptr, L,
+):
+    # Compute max over valid entries; since we zero invalid entries, max over all is fine.
+    m = -float("inf")
+    for l in range(0, L):
+        val = tl.load(logits_scaled_ptr + l)
+        if val > m:
+            m = val
+
+    sum_exp = 0.0
+    ln2 = 1.4426950408889634  # log(2)
+    for l in range(0, L):
+        val = tl.load(logits_scaled_ptr + l)
+        sum_exp += tl.exp(val)
+
+    lse = tl.log(sum_exp) / ln2 + m
+    tl.store(lse_out_ptr, lse)
+
+
+# Triton kernel: compute attn[h, :] = softmax(logits_scaled[h, :]) where invalid positions are zero in logits_scaled
+# Then write output vector of length K (head_dim_ckv) computed as attn @ Kc_all[:, :] but since Kc is indexed by tok_idx,
+# we can implement GEMV here. However, to keep kernels simple, we'll implement GEMV in host, but the requirement is Triton-only forward,
+# so instead we implement a kernel that computes out[h, :] = sum_l attn[h, l] * Kc[tok_idx[l], :].
+# We'll do this by first computing attn in a separate kernel (softmax), then GEMV in host? No: we must keep Triton-only.
+
+# To satisfy Triton-only constraint, we can implement a fused kernel that computes out[h, :] directly:
+# out[h, k] = sum_l attn[h, l] * Kc[tok_idx[l], k]
+# where attn[h, l] = exp(logits_scaled[h, l] - lse) if l valid, else 0.
+
+# Triton kernel: compute out[h, :] from attn and Kc
+# attn_ptr: *fp32, length L
+# Kc_ptr: *fp32, base pointer to Kc_all flattened (P*K)
+# out_ptr: *fp32, length K (head_dim_ckv), we will write head-specific row using h as constexpr.
+@triton.jit
+def compute_out_kernel(
+    attn_ptr, Kc_ptr, out_ptr, L, K,
+    head: tl.constexpr,
+):
+    # We need to produce out[h, :] of length K. We can compute it as a vector.
+    # For each k in [0..K-1], out[h, k] = sum_l attn[h, l] * Kc[tok_idx[l], k]
+    # We'll iterate over L and accumulate.
+
+    for k in range(0, K):
+        acc = 0.0
+        for l in range(0, L):
+            attn_l = tl.load(attn_ptr + l)
+            # Kc[tok_idx[l], k] = Kc_ptr[tok_idx[l]*K + k]
+            tok = tl.load(tok_idx_ptr + l)  # int32
+            kc = tl.load(Kc_ptr + tok * K + k)
+            acc += attn_l * kc
+        tl.store(out_ptr + h * K + k, acc)
+
+
+# Triton kernel: compute attn[h, :] = softmax(logits_scaled[h, :]) with invalid positions zeroed
+# attn_ptr: *fp32, length L
+@triton.jit
+def compute_softmax_kernel(
+    logits_scaled_ptr, attn_ptr, L, prefix_len, i,
+):
+    # Compute softmax(logits_scaled[h, :]) with causal masking: j > prefix_len + i -> attn=0
+    m = -float("inf")
+    for l in range(0, L):
+        val = tl.load(logits_scaled_ptr + l)
+        # No masking needed here; we already zeroed invalid positions in logits_scaled
+        if val > m:
+            m = val
+
+    sum_exp = 0.0
+    for l in range(0, L):
+        val = tl.load(logits_scaled_ptr + l)
+        sum_exp += tl.exp(val)
+
+    # Now write attn = exp(val - m) for all l
+    for l in range(0, L):
+        val = tl.load(logits_scaled_ptr + l)
+        attn_l = tl.exp(val - m)  # since invalid positions were zeroed in logits_scaled, no extra masking needed
+        tl.store(attn_ptr + l, attn_l)
+
+
+# Helper forward function: Triton-only. No torch math in forward.
+def model_forward_triton_only(
+    q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale
+):
+    device = q_nope.device
+    dtype = q_nope.dtype
+
+    # Ensure dtypes: kernels expect fp32 for qn/qp and fp32 for Kc/Kp (bf16 can be cast)
+    H = q_nope.shape[1]  # 16
+    K = q_nope.shape[2]  # 512
+    Kp = q_pe.shape[2]    # 64
+    P = ckv_cache.shape[0]  # 989669
+
+    # Squeeze caches to [P, K] and [P, Kp], keep float32 for math
+    Kc_all = ckv_cache.squeeze(1).to(torch.float32).contiguous()  # [P, 512]
+    Kp_all = kpe_cache.squeeze(1).to(torch.float32).contiguous()  # [P, 64]
+
+    total_q = q_nope.shape[0]
+    num_heads = H
+    head_dim_ckv = K
+
+    # Allocate outputs
+    output = torch.empty((total_q, num_heads, head_dim_ckv), dtype=torch.bfloat16, device=device)
+    lse = torch.empty((total_q, num_heads), dtype=torch.float32, device=device)
+
+    # Process each batch element
+    len_qo = qo_indptr.numel()
+    len_kv = kv_indptr.numel()
+
+    # We need to handle general len_indptr. The provided inputs have len_indptr=2 normally.
+    # But to be robust, we loop over b from 0 to len_qo-1 and 0 to len_kv-1. Typically, len_qo == len_kv == batch size.
+    # However, in the given generator, len_indptr=2, so b=0,1. We still write loops for generality.
+
+    for b in range(1 if len_qo <= 1 else len_qo - 1):  # qo_indptr[0..]
+        q_start = int(qo_indptr[b].item())
+        q_end = int(qo_indptr[b + 1].item())
+        q_len = q_end - q_start
+        if q_len <= 0:
+            continue
+
+        # Build tok_idx for this batch segment
+        # Note: We do not know if kv_indptr has multiple elements; but in provided inputs, len_indptr=2.
+        # For generality, we assume kv_indptr is consistent with number of segments. Since inputs are small,
+        # we just take kv_indptr[b+1] and compute tok_idx accordingly.
+        # Compute tok_idx = kv_indices[kv_indptr[b]: kv_indptr[b+1]]
+        # Create a local view in Python; Triton will consume this tensor.
+        tok_idx = kv_indices[kv_indptr[b]: kv_indptr[b + 1]].to(torch.int32).to(device)  # int32 indices on device
+        L = tok_idx.numel()
+
+        # We will process each query i within this batch segment
+        for i in range(q_len):
+            q_abs = q_start + i
+
+            # Prepare qn_vec and qp_vec as fp32 contiguous tensors
+            qn = q_nope[q_abs].to(torch.float32).contiguous()  # [H, K]
+            qn_vec = qn.view(-1).contiguous()  # [H*K]
+            qp = q_pe[q_abs].to(torch.float32).contiguous()   # [H, Kp]
+            qp_vec = qp.view(-1).contiguous()                 # [H*Kp]
+
+            # Allocate intermediates
+            logits_scaled = torch.empty((L,), dtype=torch.float32, device=device)
+            attn = torch.empty((L,), dtype=torch.float32, device=device)
+            # out row for this head, we will fill via compute_out_kernel
+
+            # Compute logits_scaled[h, :] for each head h
+            for h in range(H):
+                # Launch Triton kernel to compute logits_scaled for this head
+                compute_logits_row_kernel[(1,)](
+                    qn_vec, qp_vec, Kc_all, Kp_all, logits_scaled,
+                    L, float(sm_scale),
+                    head=h,
+                )
+
+                # Compute lse for this head
+                lse_b_h = torch.empty((1,), dtype=torch.float32, device=device)
+                compute_lse_kernel[(1,)](
+                    logits_scaled, lse_b_h, L,
+                )
+                lse[q_abs, h] = lse_b_h[0]
+
+                # Compute attn for this head
+                compute_softmax_kernel[(1,)](
+                    logits_scaled, attn, L, L - q_len, i,  # prefix_len and i
+                )
+
+                # Compute output for this head: out[h, :] = attn @ Kc_all[tok_idx, :]
+                # Implement GEMV-like via compute_out_kernel: out[h, k] = sum_l attn[l] * Kc[tok_idx[l], k]
+                out_row = torch.empty((head_dim_ckv,), dtype=torch.float32, device=device)
+                compute_out_kernel[(1,)](
+                    attn, Kc_all, out_row, L, head_dim_ckv,
+                    head=h,
+                )
+                output[q_abs, h, :] = out_row.to(torch.bfloat16)
+
+    return output, lse
+
+
+# Entry point ModelNew
+class ModelNew(torch.nn.Module):
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale):
+        return model_forward_triton_only(q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale)
+
+
+# Optional: mirror original interface helpers
+def get_inputs():
+    # Use CPU tensors; the evaluator may move them to GPU. Kernels will run on device tensors.
+    q_nope = torch.randn([1, 16, 512], dtype=torch.bfloat16)
+    q_pe = torch.randn([1, 16, 64], dtype=torch.bfloat16)
+    ckv_cache = torch.randn([989669, 1, 512], dtype=torch.bfloat16)
+    kpe_cache = torch.randn([989669, 1, 64], dtype=torch.bfloat16)
+    _n = 1; _t = 1
+    _lens = torch.full((_n,), _t // _n, dtype=torch.int32)
+    _lens[: _t % _n] += 1
+    qo_indptr = torch.cat([torch.zeros(1, dtype=torch.int32), torch.cumsum(_lens, 0)]).to(torch.int32)
+    _n = 1; _t = 34
+    _lens = torch.full((_n,), _t // _n, dtype=torch.int32)
+    _lens[: _t % _n] += 1
+    kv_indptr = torch.cat([torch.zeros(1, dtype=torch.int32), torch.cumsum(_lens, 0)]).to(torch.int32)
+    kv_indices = torch.randint(0, 989669, [34], dtype=torch.int32)
+    sm_scale = 1.0  # float32 scalar
+    return [q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale]
+
+
+def fused_operator(tensor_0, tensor_1, tensor_2, tensor_3, tensor_4, tensor_5, tensor_6, tensor_7):
+    _out = ModelNew().forward(tensor_0, tensor_1, tensor_2, tensor_3, tensor_4, tensor_5, tensor_6, tensor_7)
+    return list(_out) if isinstance(_out, (tuple, list)) else [_out]
+
+
+def run(*args):
+    return ModelNew()(*args)

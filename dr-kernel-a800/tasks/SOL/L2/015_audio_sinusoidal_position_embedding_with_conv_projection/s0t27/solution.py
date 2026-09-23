@@ -1,0 +1,249 @@
+import math
+import torch
+import torch.nn as nn
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+# Triton kernel: Conv2d 3x3, stride=2, padding=1, generic IC -> OC
+# X: [B, IC, F_in, T_in], W: [OC, IC, 3, 3], bias: [OC], Y: [B, OC, F_out, T_out]
+@triton.jit
+def conv3x3_s2_p1_gelu(
+    X_ptr, W_ptr, BIAS_ptr, Y_ptr,
+    B, IC, F_in, T_in, OC, F_out, T_out,
+    x_sN, x_sC, x_sF, x_sT,
+    w_sOC, w_sIC, w_sKH, w_sKW,
+    y_sN, y_sOC, y_sF, y_sT,
+):
+    # 1D launch per (b, oc) output element; grid will be B*OC * F_out * T_out
+    pid = tl.program_id(0)
+    b = pid // (OC * F_out * T_out)
+    rem = pid % (OC * F_out * T_out)
+    oc = rem // (F_out * T_out)
+    f_out = rem // T_out
+    t_out = rem % T_out
+
+    # Accumulator
+    acc = tl.zeros((), dtype=tl.float32)  # scalar accumulation per output
+
+    # Loop over input channels and 3x3 kernel
+    for ic in range(0, IC):
+        for kh in range(0, 3):
+            for kw in range(0, 3):
+                # in index for padding and stride=2
+                f_in = f_out * 2 - 1 + kh
+                t_in = t_out * 2 - 1 + kw
+                # bounds check
+                in_bounds = (f_in >= 0) & (f_in < F_in) & (t_in >= 0) & (t_in < T_in)
+                # compute input pointer for X[b, ic, f_in, t_in]
+                x_offset = b * x_sN + ic * x_sC + f_in * x_sF + t_in * x_sT
+                x_val = tl.load(X_ptr + x_offset, mask=in_bounds, other=0.0)
+                # compute weight pointer for W[oc, ic, kh, kw]
+                w_offset = oc * w_sOC + ic * w_sIC + kh * w_sKH + kw * w_sKW
+                w_val = tl.load(W_ptr + w_offset)
+                # accumulate
+                acc += x_val * w_val
+
+    # add bias
+    b_val = tl.load(BIAS_ptr + oc)
+    acc += b_val
+
+    # GELU activation (tanh approximation)
+    # gelu(x) ~ 0.5 * x * (1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+    c = 0.7978845608028654  # sqrt(2/pi)
+    x3 = acc * acc * acc
+    inner = c * (acc + 0.044715 * x3)
+    gelu = 0.5 * acc * (1.0 + tl.tanh(inner))
+
+    # store output at Y[b, oc, f_out, t_out]
+    y_offset = b * y_sN + oc * y_sOC + f_out * y_sF + t_out * y_sT
+    tl.store(Y_ptr + y_offset, gelu)
+
+
+# Triton matmul kernel for [M, K] x [K, N] -> [M, N] (specialized to M=384, K=384, N=1024, but we keep generic)
+@triton.jit
+def matmul_1024x3840x3840(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    a_sM, a_sK,
+    b_sK, b_sN,
+    c_sM, c_sN,
+):
+    # Each program computes one output element C[m, n]
+    m = tl.program_id(0)
+    n = tl.program_id(1)
+    acc = tl.zeros((), dtype=tl.float32)
+    # Loop over K
+    for k in range(0, K):
+        a_val = tl.load(A_ptr + m * a_sM + k * a_sK)
+        b_val = tl.load(B_ptr + k * b_sK + n * b_sN)
+        acc += a_val * b_val
+    # store result
+    tl.store(C_ptr + m * c_sM + n * c_sN, acc)
+
+
+# Triton elementwise: add scale and positional embedding
+# Z: [B, T3, 1024], scale: float, pos_emb: [T3, 1024]
+@triton.jit
+def add_scale_and_pos_embed(
+    Z_ptr, SCALE, pos_ptr, B, T3, N,
+    z_sB, z_sT, z_sN,
+):
+    pid = tl.program_id(0)
+    # flat indexing over B * T3 * N
+    # we'll iterate with grid size B*T3*N
+    # So decode (b, t, n)
+    t = pid // (N)
+    n = pid % N
+    b = pid // (T3 * N)
+    rem = pid % (T3 * N)
+    b = rem // (T3 * N)
+    t = rem // N
+    n = rem % N
+
+    # compute offsets
+    z_offset = b * z_sB + t * z_sT + n * z_sN
+    z_val = tl.load(Z_ptr + z_offset)
+    # load pos_emb[t, n]
+    pos_offset = t * N + n
+    pos_val = tl.load(pos_ptr + pos_offset)
+    out = z_val * SCALE + pos_val
+    tl.store(Z_ptr + z_offset, out)
+
+
+def triton_conv3x3_s2_p1_gelu(x, w, b, device):
+    """
+    x: [B, IC, F_in, T_in], float32 contiguous
+    w: [OC, IC, 3, 3], float32 contiguous
+    b: [OC], float32 contiguous
+    returns y: [B, OC, F_out, T_out], float32
+    """
+    assert TRITON_AVAILABLE, "Triton is not available"
+    B, IC, F_in, T_in = x.shape
+    OC = w.shape[0]
+    F_out = (F_in + 2 * 1 - 3) // 2 + 1
+    T_out = (T_in + 2 * 1 - 3) // 2 + 1
+    y = torch.empty((B, OC, F_out, T_out), device=device, dtype=torch.float32)
+    grid = (B * OC * F_out * T_out,)
+    conv3x3_s2_p1_gelu[grid](
+        x, w, b, y,
+        B, IC, F_in, T_in, OC, F_out, T_out,
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        w.stride(0), w.stride(1), w.stride(2), w.stride(3),
+        y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+    )
+    return y
+
+
+def triton_matmul_1024x3840x3840(A, B, device):
+    """
+    A: [M, K] float32 contiguous, expected M=384, K=384
+    B: [K, N] float32 contiguous, expected N=1024
+    returns C: [M, N] float32
+    """
+    assert TRITON_AVAILABLE, "Triton is not available"
+    M, K = A.shape
+    Kb, N = B.shape
+    assert K == Kb, f"Shape mismatch: A is {M}x{K}, B is {Kb}x{N}"
+    C = torch.empty((M, N), device=device, dtype=torch.float32)
+    grid = (M, N)
+    matmul_1024x3840x3840[grid](
+        A, B, C,
+        M, N, K,
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        C.stride(0), C.stride(1),
+    )
+    return C
+
+
+def triton_add_scale_and_pos_embed(Z, scale, pos_emb, device):
+    """
+    Z: [B, T3, N] float32 contiguous, here N=1024
+    scale: python float
+    pos_emb: [T3, N] float32 contiguous
+    modifies Z in-place
+    """
+    assert TRITON_AVAILABLE, "Triton is not available"
+    B, T3, N = Z.shape
+    grid = (B * T3 * N,)
+    add_scale_and_pos_embed[grid](
+        Z, scale, pos_emb,
+        B, T3, N,
+        Z.stride(0), Z.stride(1), Z.stride(2),
+    )
+
+
+class ModelNew(nn.Module):
+    def forward(self, *args):
+        # args order: input_features, conv2d1_weight, conv2d1_bias, conv2d2_weight, conv2d2_bias, conv2d3_weight, conv2d3_bias, conv_out_weight, positional_embedding, embed_scale
+        assert TRITON_AVAILABLE, "Triton is not available"
+
+        input_features = args[0]
+        conv2d1_weight = args[1]
+        conv2d1_bias = args[2]
+        conv2d2_weight = args[3]
+        conv2d2_bias = args[4]
+        conv2d3_weight = args[5]
+        conv2d3_bias = args[6]
+        conv_out_weight = args[7]  # expected shape [K, N] = [384, 1024]
+        positional_embedding = args[8]  # [max_source_positions, d_model], d_model=1024
+        embed_scale = float(args[9])
+
+        # Ensure device and dtype: Triton expects float32
+        device = input_features.device
+        x1 = input_features.contiguous().float()  # [B, 1, 80, time_dim]
+
+        # Stage 1: Conv2d (1 -> 384 channels) + GELU
+        w1 = conv2d1_weight.contiguous().float()  # [OC1=384, IC=1, 3, 3]
+        b1 = conv2d1_bias.contiguous().float()    # [OC1]
+        y1 = triton_conv3x3_s2_p1_gelu(x1, w1, b1, device)  # [B, 384, 40, t_out1]
+
+        # Stage 2: Conv2d (384 -> 384 channels) + GELU
+        x2 = y1
+        w2 = conv2d2_weight.contiguous().float()  # [OC2=384, IC=384, 3, 3]
+        b2 = conv2d2_bias.contiguous().float()    # [OC2]
+        y2 = triton_conv3x3_s2_p1_gelu(x2, w2, b2, device)  # [B, 384, 20, t_out2]
+
+        # Stage 3: Conv2d (384 -> 384 channels) + GELU
+        x3 = y2
+        w3 = conv2d3_weight.contiguous().float()  # [OC3=384, IC=384, 3, 3]
+        b3 = conv2d3_bias.contiguous().float()    # [OC3]
+        y3 = triton_conv3x3_s2_p1_gelu(x3, w3, b3, device)  # [B, 384, 10, t_out3]
+
+        # Reshape: (batch, channels, F, T) -> (batch, T, channels*F)
+        B, C, F, T = y3.shape  # y3: [B, 384, 10, T3]
+        Z = y3.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)  # [B, T3, 3840]
+        Z = Z.float()
+
+        # Linear projection to d_model=1024: [B*T3, 3840] x [3840, 1024] -> [B*T3, 1024]
+        A = Z.reshape(-1, 384).float()  # M=384, K=384
+        B_t = conv_out_weight.float()   # [384, 1024]
+        C_lin = triton_matmul_1024x3840x3840(A, B_t, device)  # [M=384, N=1024]
+        C_lin = C_lin.view(B, 384, 1024)  # [B, 384, 1024] but we need [B, T3, 1024]
+        # Note: We don't have B*T3=384 here. Instead, we can treat C_lin as [B, T3, 1024] by slicing B dimension or broadcasting.
+        # Since M=A.shape[0]=B*T3=384 and we reshaped A from Z of shape [B, T3, 3840], we can index as:
+        # However, triton_matmul_1024x3840x3840 computes only MxN with K=384. To get [B, T3, 1024], we need to loop over B if needed.
+        # Here, we assume only one batch and T3=384/3=128 for our test. If not, we need to adjust. For correctness, we avoid overwriting Z with matmul result.
+        # Instead, we compute matmul for [B*T3, 384] x [384, 1024]. Let's recompute with proper A.
+
+        # Recompute with A = Z.float() as [M, K]
+        M = Z.numel() // 3840  # batches*times
+        A_flat = Z.float().reshape(M, 3840)  # [M, K]
+        B_t = conv_out_weight.float()        # [3840, 1024]
+        C_flat = triton_matmul_1024x3840x3840(A_flat, B_t, device)  # [M, 1024]
+        Z = C_flat.view(B, Z.shape[1], 1024)  # [B, T3, 1024]
+
+        # Scale embeddings
+        triton_add_scale_and_pos_embed(Z, embed_scale, positional_embedding[:Z.shape[1], :].float(), device)
+
+        return Z
+
+
+def run(*args):
+    return ModelNew()(*args)

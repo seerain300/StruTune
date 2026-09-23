@@ -1,0 +1,293 @@
+import torch
+import triton
+import triton.language as tl
+
+
+# 1) Build L (causal mask) per (b, c, h): L[i, j] = exp(sum_{k=0..L-1} A[b, c, k, h]) if j <= i else 0
+@triton.jit
+def build_lower_tri_causal_kernel(
+    A_ptr,          # *float32, shape [B, C, L, H]
+    L_ptr,          # *float32, shape [B, C, 128, 128, H]
+    B: tl.constexpr, C: tl.constexpr, L: tl.constexpr, H: tl.constexpr,
+    stride_A_b, stride_A_c, stride_A_l, stride_A_h,
+    stride_L_b, stride_L_c, stride_L_i, stride_L_j, stride_L_h,
+):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    h = tl.program_id(2)
+
+    # row i over 128
+    i = tl.program_id(3)
+    # col j over 128
+    j = tl.program_id(4)
+
+    # Compute total cumsum along L dimension for this (b, c, h)
+    total = 0.0
+    for k in range(L):
+        a_off = b * stride_A_b + c * stride_A_c + k * stride_A_l + h * stride_A_h
+        a_val = tl.load(A_ptr + a_off)
+        total += a_val
+
+    exp_total = tl.exp(total)
+
+    # Lower-triangular mask with diagonal=-1 (i >= j)
+    mask_lower = (j <= i)
+
+    out_off = b * stride_L_b + c * stride_L_c + i * stride_L_i + j * stride_L_j + h * stride_L_h
+    if mask_lower:
+        tl.store(L_ptr + out_off, exp_total)
+    else:
+        tl.store(L_ptr + out_off, 0.0)
+
+
+# 2) Expand B and C from groups (G) to heads (H): B_exp[B, C, L, H, S], C_exp[B, C, L, H, S]
+@triton.jit
+def expand_groups_repeat_interleave(
+    B_in_ptr,       # *float32, shape [B, C, L, G, S]
+    C_in_ptr,       # *float32, shape [B, C, L, G, S]
+    B_out_ptr,      # *float32, shape [B, C, L, H, S]
+    C_out_ptr,      # *float32, shape [B, C, L, H, S]
+    B: tl.constexpr, C: tl.constexpr, L: tl.constexpr, G: tl.constexpr, H: tl.constexpr, S: tl.constexpr,
+    stride_BIN_b, stride_BIN_c, stride_BIN_l, stride_BIN_g, stride_BIN_s,
+    stride_CIN_b, stride_CIN_c, stride_CIN_l, stride_CIN_g, stride_CIN_s,
+    stride_BOUT_b, stride_BOUT_c, stride_BOUT_l, stride_BOUT_h, stride_BOUT_s,
+    stride_COUT_b, stride_COUT_c, stride_COUT_l, stride_COUT_h, stride_COUT_s,
+):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    l = tl.program_id(2)
+    g = tl.program_id(3)   # group index in 0..G-1
+    s = tl.program_id(4)   # state index in 0..S-1
+
+    # Map to head h = g * (H // G)
+    h = g * (H // G)
+
+    bin_off = b * stride_BIN_b + c * stride_BIN_c + l * stride_BIN_l + g * stride_BIN_g + s * stride_BIN_s
+    bin_val = tl.load(B_in_ptr + bin_off)
+
+    bout_off = b * stride_BOUT_b + c * stride_BOUT_c + l * stride_BOUT_l + h * stride_BOUT_h + s * stride_BOUT_s
+    tl.store(B_out_ptr + bout_off, bin_val)
+
+    cin_off = b * stride_CIN_b + c * stride_CIN_c + l * stride_CIN_l + g * stride_CIN_g + s * stride_CIN_s
+    cin_val = tl.load(C_in_ptr + cin_off)
+
+    cout_off = b * stride_COUT_b + c * stride_COUT_c + l * stride_COUT_l + h * stride_COUT_h + s * stride_COUT_s
+    tl.store(C_out_ptr + cout_off, cin_val)
+
+
+# 3) Compute G[b, c, i, j, h] = sum_s C_exp[b, c, i, h, s] * B_exp[b, c, j, h, s]
+@triton.jit
+def contract_G_kernel(
+    B_exp_ptr,      # *float32, shape [B, C, L, H, S]
+    C_exp_ptr,      # *float32, shape [B, C, L, H, S]
+    G_ptr,          # *float32, shape [B, C, L, L, H]
+    B: tl.constexpr, C: tl.constexpr, L: tl.constexpr, H: tl.constexpr, S: tl.constexpr,
+    stride_B_b, stride_B_c, stride_B_l, stride_B_h, stride_B_s,
+    stride_C_b, stride_C_c, stride_C_l, stride_C_h, stride_C_s,
+    stride_G_b, stride_G_c, stride_G_i, stride_G_j, stride_G_h,
+):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    i = tl.program_id(2)
+    j = tl.program_id(3)
+    h = tl.program_id(4)
+
+    # Accumulate over state dimension
+    acc = 0.0
+    for s in range(S):
+        b_off = b * stride_B_b + c * stride_B_c + j * stride_B_l + h * stride_B_h + s * stride_B_s
+        c_off = b * stride_C_b + c * stride_C_c + i * stride_C_l + h * stride_C_h + s * stride_C_s
+        b_val = tl.load(B_exp_ptr + b_off)
+        c_val = tl.load(C_exp_ptr + c_off)
+        acc += b_val * c_val
+
+    g_off = b * stride_G_b + c * stride_G_c + i * stride_G_i + j * stride_G_j + h * stride_G_h
+    tl.store(G_ptr + g_off, acc)
+
+
+# 4) Compute Y_diag[b, c, i, h, d] = sum_j M[b, c, i, j, h] * hidden_states[b, c, j, h, d]
+# M = G * L (element-wise). We assume L and G are already computed and passed as inputs.
+@triton.jit
+def reduce_j_kernel(
+    M_ptr,          # *float32, shape [B, C, L, L, H]
+    hidden_ptr,     # *float32, shape [B, C, L, H, D]
+    Y_ptr,          # *float32, shape [B, C, L, H, D]
+    B: tl.constexpr, C: tl.constexpr, L: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
+    stride_M_b, stride_M_c, stride_M_i, stride_M_j, stride_M_h,
+    stride_H_b, stride_H_c, stride_H_j, stride_H_h, stride_H_d,
+    stride_Y_b, stride_Y_c, stride_Y_i, stride_Y_h, stride_Y_d,
+):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    i = tl.program_id(2)
+    h = tl.program_id(3)
+    d = tl.program_id(4)
+
+    # Accumulator for this (b, c, i, h, d)
+    acc = 0.0
+
+    # Loop over j from 0 to L-1
+    for j in range(L):
+        m_off = b * stride_M_b + c * stride_M_c + i * stride_M_i + j * stride_M_j + h * stride_M_h
+        h_off = b * stride_H_b + c * stride_H_c + j * stride_H_j + h * stride_H_h + d * stride_H_d
+        m_val = tl.load(M_ptr + m_off)
+        h_val = tl.load(hidden_ptr + h_off)
+        acc += m_val * h_val
+
+    y_off = b * stride_Y_b + c * stride_Y_c + i * stride_Y_i + h * stride_Y_h + d * stride_Y_d
+    tl.store(Y_ptr + y_off, acc)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor, A_cumsum: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
+        """
+        Compute Y_diag = sum_j (G * L)[:, j, :] * hidden[:, j, :] with Triton kernels.
+        Shapes:
+          hidden_states: [B, C, L, H, D]
+          A_cumsum:      [B, C, L, H]
+          B:             [B, C, L, G, S]
+          C:             [B, C, L, G, S]
+        Constants:
+          H = 32, G = 8, GROUP_EXPAND = 4, CHUNK_SIZE = 128
+        Output:
+          Y_diag:        [B, C, L, H, D]
+        """
+        batch_size, num_chunks, chunk_size, num_heads, head_dim = hidden_states.shape
+
+        # Constants
+        NUM_HEADS = 32
+        N_GROUPS = 8
+        GROUP_EXPAND = 4
+        L_mat_size = 128  # mask size as in original code
+
+        # Cast inputs to float32 for computation
+        hidden_f32 = hidden_states.to(torch.float32)  # [B, C, L, H, D]
+        A_f32 = A_cumsum.to(torch.float32)            # [B, C, L, H]
+        B_f32 = B.to(torch.float32)                   # [B, C, L, G, S]
+        C_f32 = C.to(torch.float32)                   # [B, C, L, G, S]
+
+        # 1) Build L matrix [B, C, 128, 128, H] in Triton
+        L_ptr = torch.empty((batch_size, num_chunks, L_mat_size, L_mat_size, num_heads), dtype=torch.float32, device=hidden_f32.device)
+
+        # Strides for A and L
+        stride_A_b, stride_A_c, stride_A_l, stride_A_h = A_f32.stride()
+        stride_L_b, stride_L_c, stride_L_i, stride_L_j, stride_L_h = L_ptr.stride()
+
+        grid_L = (batch_size, num_chunks, num_heads, L_mat_size, L_mat_size)
+        build_lower_tri_causal_kernel[grid_L](
+            A_f32, L_ptr,
+            batch_size, num_chunks, chunk_size, num_heads,
+            stride_A_b, stride_A_c, stride_A_l, stride_A_h,
+            stride_L_b, stride_L_c, stride_L_i, stride_L_j, stride_L_h,
+        )
+
+        # 2) Expand B and C from groups to heads in Triton
+        S_size = B_f32.shape[-1]  # state_size, assumed same for B and C
+        B_exp = torch.empty((batch_size, num_chunks, chunk_size, num_heads, S_size), dtype=torch.float32, device=hidden_f32.device)
+        C_exp = torch.empty((batch_size, num_chunks, chunk_size, num_heads, S_size), dtype=torch.float32, device=hidden_f32.device)
+
+        # Strides
+        stride_BIN_b, stride_BIN_c, stride_BIN_l, stride_BIN_g, stride_BIN_s = B_f32.stride()
+        stride_CIN_b, stride_CIN_c, stride_CIN_l, stride_CIN_g, stride_CIN_s = C_f32.stride()
+        stride_BOUT_b, stride_BOUT_c, stride_BOUT_l, stride_BOUT_h, stride_BOUT_s = B_exp.stride()
+        stride_COUT_b, stride_COUT_c, stride_COUT_l, stride_COUT_h, stride_COUT_s = C_exp.stride()
+
+        grid_expand = (batch_size, num_chunks, chunk_size, N_GROUPS, S_size)
+        expand_groups_repeat_interleave[grid_expand](
+            B_f32, C_f32, B_exp, C_exp,
+            batch_size, num_chunks, chunk_size, N_GROUPS, num_heads, S_size,
+            stride_BIN_b, stride_BIN_c, stride_BIN_l, stride_BIN_g, stride_BIN_s,
+            stride_CIN_b, stride_CIN_c, stride_CIN_l, stride_CIN_g, stride_CIN_s,
+            stride_BOUT_b, stride_BOUT_c, stride_BOUT_l, stride_BOUT_h, stride_BOUT_s,
+            stride_COUT_b, stride_COUT_c, stride_COUT_l, stride_COUT_h, stride_COUT_s,
+        )
+
+        # 3) Compute G = contract(B_exp, C_exp) in Triton
+        G = torch.empty((batch_size, num_chunks, chunk_size, chunk_size, num_heads), dtype=torch.float32, device=hidden_f32.device)
+
+        stride_B_exp_b, stride_B_exp_c, stride_B_exp_l, stride_B_exp_h, stride_B_exp_s = B_exp.stride()
+        stride_C_exp_b, stride_C_exp_c, stride_C_exp_l, stride_C_exp_h, stride_C_exp_s = C_exp.stride()
+        stride_G_b, stride_G_c, stride_G_i, stride_G_j, stride_G_h = G.stride()
+
+        grid_contract = (batch_size, num_chunks, chunk_size, chunk_size, num_heads)
+        contract_G_kernel[grid_contract](
+            B_exp, C_exp, G,
+            batch_size, num_chunks, chunk_size, num_heads, S_size,
+            stride_B_exp_b, stride_B_exp_c, stride_B_exp_l, stride_B_exp_h, stride_B_exp_s,
+            stride_C_exp_b, stride_C_exp_c, stride_C_exp_l, stride_C_exp_h, stride_C_exp_s,
+            stride_G_b, stride_G_c, stride_G_i, stride_G_j, stride_G_h,
+        )
+
+        # 4) Apply element-wise mask L to G to get M in Triton
+        # Note: M = G * L. We can compute this by loading L from L_ptr and multiplying.
+        # We'll create M as a separate tensor and multiply in Triton to ensure correctness.
+        M = torch.empty((batch_size, num_chunks, chunk_size, chunk_size, num_heads), dtype=torch.float32, device=hidden_f32.device)
+
+        stride_M_b, stride_M_c, stride_M_i, stride_M_j, stride_M_h = M.stride()
+        stride_G_bM, stride_G_cM, stride_G_iM, stride_G_jM, stride_G_hM = G.stride()
+        stride_L_b, stride_L_c, stride_L_i, stride_L_j, stride_L_h = L_ptr.stride()
+
+        grid_M = (batch_size, num_chunks, chunk_size, chunk_size, num_heads)
+        # We need to multiply G and L element-wise; Triton kernel will load corresponding elements and store result.
+        # For positions where j > i, L[i, j] = 0, so M will be zero there. This matches the original intent of the mask.
+        # However, the original code uses a full L of size 128x128 and applies mask via a more involved path. To match behavior,
+        # we set M = G * L for lower-triangular entries and zero otherwise. In our case, L upper triangle is zero, so M is just G * L.
+        # We'll launch a kernel that multiplies G and L and writes to M. For this, we pass L_ptr (already computed). The kernel will
+        # load G and L at the same indices and store their product.
+
+        # Launch multiply kernel: element-wise M = G * L
+        # We'll implement it as a simple kernel that reads G and L and writes M. Triton supports this.
+
+        @triton.jit
+        def multiply_G_L_kernel(
+            G_ptr, L_ptr, M_ptr,
+            B: tl.constexpr, C: tl.constexpr, L_sz: tl.constexpr, H: tl.constexpr,
+            stride_G_b, stride_G_c, stride_G_i, stride_G_j, stride_G_h,
+            stride_L_b, stride_L_c, stride_L_i, stride_L_j, stride_L_h,
+            stride_M_b, stride_M_c, stride_M_i, stride_M_j, stride_M_h,
+        ):
+            b = tl.program_id(0)
+            c = tl.program_id(1)
+            i = tl.program_id(2)
+            j = tl.program_id(3)
+            h = tl.program_id(4)
+
+            g_off = b * stride_G_b + c * stride_G_c + i * stride_G_i + j * stride_G_j + h * stride_G_h
+            l_off = b * stride_L_b + c * stride_L_c + i * stride_L_i + j * stride_L_j + h * stride_L_h
+            m_off = b * stride_M_b + c * stride_M_c + i * stride_M_i + j * stride_M_j + h * stride_M_h
+
+            g_val = tl.load(G_ptr + g_off)
+            l_val = tl.load(L_ptr + l_off)
+            tl.store(M_ptr + m_off, g_val * l_val)
+
+        grid_M_kernel = (batch_size, num_chunks, chunk_size, chunk_size, num_heads)
+        multiply_G_L_kernel[grid_M_kernel](
+            G, L_ptr, M,
+            batch_size, num_chunks, chunk_size, num_heads,
+            stride_G_b, stride_G_c, stride_G_i, stride_G_j, stride_G_h,
+            stride_L_b, stride_L_c, stride_L_i, stride_L_j, stride_L_h,
+            stride_M_b, stride_M_c, stride_M_i, stride_M_j, stride_M_h,
+        )
+
+        # 5) Compute Y_diag by reduction over j using Triton
+        Y = torch.empty((batch_size, num_chunks, chunk_size, num_heads, head_dim), dtype=torch.float32, device=hidden_f32.device)
+
+        stride_M_bR, stride_M_cR, stride_M_iR, stride_M_jR, stride_M_hR = M.stride()
+        stride_H_bR, stride_H_cR, stride_H_jR, stride_H_hR, stride_H_dR = hidden_f32.stride()
+        stride_Y_bR, stride_Y_cR, stride_Y_iR, stride_Y_hR, stride_Y_dR = Y.stride()
+
+        grid_reduce = (batch_size, num_chunks, chunk_size, num_heads, head_dim)
+        reduce_j_kernel[grid_reduce](
+            M, hidden_f32, Y,
+            batch_size, num_chunks, chunk_size, num_heads, head_dim,
+            stride_M_bR, stride_M_cR, stride_M_iR, stride_M_jR, stride_M_hR,
+            stride_H_bR, stride_H_cR, stride_H_jR, stride_H_hR, stride_H_dR,
+            stride_Y_bR, stride_Y_cR, stride_Y_iR, stride_Y_hR, stride_Y_dR,
+        )
+
+        # Return in bfloat16 as in original example's signature
+        return Y.to(torch.bfloat16)
+
+
+def run(*args):
+    return ModelNew()(*args)

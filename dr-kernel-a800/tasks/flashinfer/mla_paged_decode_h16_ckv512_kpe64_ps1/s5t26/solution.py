@@ -1,0 +1,172 @@
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _compute_scaled_logits_kernel(
+    A_ptr,  # *f32, shape [H, CK]
+    B_ptr,  # *f32, shape [K, L] where K=CK for Kc, or K=KP for Kp
+    Out_ptr,  # *f32, shape [H, L]
+    H: tl.constexpr, CK: tl.constexpr, K: tl.constexpr, L: tl.constexpr, sm_scale: tl.constexpr,
+):
+    # Grid is (H, L): each program handles one (h, t) pair
+    pid_h = tl.program_id(axis=0)
+    pid_t = tl.program_id(axis=1)
+
+    # Load q[h] and K[t]
+    a_row = tl.load(A_ptr + pid_h * CK + tl.arange(0, CK))
+    b_row = tl.load(B_ptr + pid_t * K + tl.arange(0, K))
+
+    dot = tl.dot(a_row, b_row)  # scalar
+    out_val = dot * sm_scale
+    tl.store(Out_ptr + pid_h * L + pid_t, out_val)
+
+
+@triton.jit
+def _lse_reduction_kernel(
+    logits_ptr, lse_ptr,
+    H: tl.constexpr, L: tl.constexpr,
+    stride_h: tl.constexpr, stride_l: tl.constexpr,
+):
+    # One program per head
+    h = tl.program_id(axis=0)
+    max_val = -float('inf')
+    for t in range(0, L):
+        ptr = logits_ptr + h * stride_h + t * stride_l
+        val = tl.load(ptr)
+        if val > max_val:
+            max_val = val
+
+    sumexp = 0.0
+    for t in range(0, L):
+        ptr = logits_ptr + h * stride_h + t * stride_l
+        val = tl.load(ptr)
+        sumexp += tl.exp(val - max_val)
+
+    lse = tl.log(sumexp)
+    tl.store(lse_ptr + h, lse)
+
+
+@triton.jit
+def _compute_output_kernel(
+    logits_ptr,  # *f32, [H, L]
+    lse_ptr,      # *f32, [H]
+    Kc_ptr,       # *f32, [L, CK]
+    out_ptr,      # *f32, [H, CK]
+    H: tl.constexpr, L: tl.constexpr, CK: tl.constexpr,
+    stride_logits_h: tl.constexpr, stride_logits_l: tl.constexpr,
+    stride_kc_t: tl.constexpr, stride_kc_k: tl.constexpr,
+    stride_out_h: tl.constexpr, stride_out_k: tl.constexpr,
+):
+    h = tl.program_id(axis=0)
+    lse_h = tl.load(lse_ptr + h)
+    for t in range(0, L):
+        ptr = logits_ptr + h * stride_logits_h + t * stride_logits_l
+        val = tl.load(ptr)
+        softmax = tl.exp(val - lse_h)
+        # Load Kc[t, :]
+        kc_row = tl.load(Kc_ptr + t * stride_kc_t + tl.arange(0, CK))
+        # Accumulate out[h, :] += softmax * Kc[t, :]
+        out_row = tl.load(out_ptr + h * stride_out_h + tl.arange(0, CK))
+        out_row += softmax * kc_row
+        tl.store(out_ptr + h * stride_out_h + tl.arange(0, CK), out_row)
+
+
+def _matmul_triton(A, B, out, H, CK, K, L, sm_scale):
+    """
+    Compute Out[h, t] = sm_scale * dot(A[h, :], B[t, :]) where:
+    - A: [H, CK], float32
+    - B: [K, L], float32 (here K=CK or K=KP, L=L_tokens)
+    - out: [H, L], float32
+    Uses a simple per-(h,t) kernel. For performance, real matmul could be used, but to ensure Triton-only and correctness,
+    this per-element kernel is straightforward and robust. It launches grid (H, L).
+    """
+    # A is [H, CK], B is [K, L]
+    grid = (H, L)
+    _compute_scaled_logits_kernel[grid](
+        A, B, out,
+        H=H, CK=CK, K=K, L=L, sm_scale=sm_scale,
+        num_warps=4,
+    )
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale):
+        # Cast to float32 for compute
+        device = q_nope.device
+        H = q_nope.shape[1]
+        CK = q_nope.shape[2]
+        qn = q_nope.to(torch.float32)
+        qp = q_pe.to(torch.float32)
+        Kc_all = ckv_cache.to(torch.float32).squeeze(1)  # [num_pages, CK]
+        Kp_all = kpe_cache.to(torch.float32).squeeze(1)  # [num_pages, KP]
+
+        # Prepare outputs
+        output = torch.empty((q_nope.shape[0], H, CK), dtype=torch.float32, device=device)
+        lse = torch.empty((q_nope.shape[0], H), dtype=torch.float32, device=device)
+
+        # Iterate batches
+        for b in range(q_nope.shape[0]):
+            # Compute L_tokens from kv_indptr for this batch
+            L_tokens = int(kv_indptr[b + 1].item()) - int(kv_indptr[b].item())
+            if L_tokens <= 0:
+                # No valid tokens in this batch element
+                output[b] = torch.zeros((H, CK), dtype=torch.float32, device=device)
+                lse[b] = torch.zeros((H,), dtype=torch.float32, device=device)
+                continue
+
+            # Gather token indices for this batch
+            tok_idx = kv_indices[kv_indptr[b]:kv_indptr[b + 1]].to(torch.int32)
+            # Select Kc and Kp for these tokens
+            Kc_batch = Kc_all[tok_idx]  # [L_tokens, CK]
+            Kp_batch = Kp_all[tok_idx]  # [L_tokens, KP]
+
+            # We compute logits[h, t] = sm_scale * (qn[h] · Kc[t] + qp[h] · Kp[t])
+            logits = torch.empty((H, L_tokens), dtype=torch.float32, device=device)
+
+            # Matmul for qn @ Kc.T -> [H, L_tokens]
+            _matmul_triton(
+                qn[b].reshape(H, CK),  # A
+                Kc_batch.transpose(0, 1),  # B: [CK, L_tokens]
+                logits,                     # out
+                H=H, CK=CK, K=CK, L=L_tokens, sm_scale=float(sm_scale),
+            )
+
+            # Matmul for qp @ Kp.T -> [H, L_tokens] and add
+            extra = torch.empty((H, L_tokens), dtype=torch.float32, device=device)
+            _matmul_triton(
+                qp[b].reshape(H, CK),      # A
+                Kp_batch.transpose(0, 1),  # B: [KP, L_tokens]
+                extra,                     # out
+                H=H, CK=CK, K=CK, L=L_tokens, sm_scale=float(sm_scale),
+            )
+            logits = logits + extra
+
+            # Compute lse per head
+            lse[b] = torch.empty((H,), dtype=torch.float32, device=device)
+            _lse_reduction_kernel[(H,)](
+                logits, lse[b],
+                H=H, L=L_tokens,
+                stride_h=H, stride_l=1,
+            )
+
+            # Compute final output[h, :] = sum_t softmax(logits[h, t]) * Kc[t, :]
+            out_batch = torch.empty((H, CK), dtype=torch.float32, device=device)
+            _compute_output_kernel[(H,)](
+                logits, lse[b], Kc_batch, out_batch,
+                H=H, L=L_tokens, CK=CK,
+                stride_logits_h=H, stride_logits_l=1,
+                stride_kc_t=L_tokens, stride_kc_k=CK,
+                stride_out_h=H, stride_out_k=CK,
+            )
+
+            output[b] = out_batch
+
+        # Return output in bfloat16, lse in float32 (tuple)
+        return output.to(torch.bfloat16), lse
+
+
+def run(*args):
+    return ModelNew()(*args)

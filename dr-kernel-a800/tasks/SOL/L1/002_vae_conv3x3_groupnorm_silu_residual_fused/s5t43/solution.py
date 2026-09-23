@@ -1,0 +1,194 @@
+import torch
+import triton
+import triton.language as tl
+
+
+# GroupNorm reduction: per (n, group, channel_in_group) compute mean and rstd over HW
+@triton.jit
+def group_norm_reduce_kernel(
+    x_ptr,            # *f32, input after conv, shape [B, C, H, W]
+    mean_ptr,         # *f32, output mean per channel, length C
+    rstd_ptr,         # *f32, output rstd per channel, length C
+    B: tl.constexpr,  # int
+    C: tl.constexpr,  # int, total channels
+    H: tl.constexpr,  # int
+    W: tl.constexpr,  # int
+    num_groups: tl.constexpr,  # int
+):
+    n = tl.program_id(0)
+    group = tl.program_id(1)
+    c_in_group = tl.program_id(2)  # which channel within the group
+    # each program handles one channel c in a group
+    # compute c
+    channels_per_group = C // num_groups
+    c = group * channels_per_group + c_in_group
+
+    # accumulate sum and sum of squares over HW
+    sum_val = 0.0
+    sum_sq = 0.0
+
+    HW = H * W
+    BLOCK_HW = 1024
+    N_TILES = tl.cdiv(HW, BLOCK_HW)
+
+    for t in range(N_TILES):
+        start = t * BLOCK_HW
+        offs = start + tl.arange(0, BLOCK_HW)
+        mask = offs < HW
+
+        # map offs to (h, w)
+        h = offs // W
+        w = offs % W
+
+        # linear index in x: (((n * C) + c) * H + h) * W + w
+        base = ((n * C) + c) * H * W
+        idx = base + h * W + w
+
+        x_vec = tl.load(x_ptr + idx, mask=mask, other=0.0)
+        # accumulate
+        sum_val += tl.sum(x_vec, axis=0)
+        sum_sq += tl.sum(x_vec * x_vec, axis=0)
+
+    mean = sum_val / (H * W)
+    var = sum_sq / (H * W) - mean * mean
+    rstd = 1.0 / tl.sqrt(var + 1e-5)
+
+    # store per-channel mean and rstd
+    tl.store(mean_ptr + c, mean)
+    tl.store(rstd_ptr + c, rstd)
+
+
+# GroupNorm apply + affine + SiLU: y = silu(((x - mean) * rstd) * gamma + beta)
+@triton.jit
+def group_norm_apply_affine_silu_kernel(
+    x_ptr,            # *f32, input tensor [B, C, H, W]
+    y_ptr,            # *f32, output tensor [B, C, H, W]
+    gamma_ptr,        # *f32, per-channel scale [C]
+    beta_ptr,         # *f32, per-channel bias [C]
+    mean_ptr,         # *f32, per-channel mean [C]
+    rstd_ptr,         # *f32, per-channel rstd [C]
+    B: tl.constexpr,  # int
+    C: tl.constexpr,  # int
+    H: tl.constexpr,  # int
+    W: tl.constexpr,  # int
+):
+    n = tl.program_id(0)
+    group = tl.program_id(1)
+    c_in_group = tl.program_id(2)
+    tile_id = tl.program_id(3)
+
+    channels_per_group = C // tl.num_groups  # num_groups is not needed here since we pass tiles explicitly
+    c = group * channels_per_group + c_in_group
+
+    HW = H * W
+    BLOCK_HW = 1024
+    start = tile_id * BLOCK_HW
+    offs = start + tl.arange(0, BLOCK_HW)
+    mask = offs < HW
+
+    h = offs // W
+    w = offs % W
+
+    base = ((n * C) + c) * H * W
+    idx = base + h * W + w
+
+    x_vec = tl.load(x_ptr + idx, mask=mask, other=0.0)
+
+    mean = tl.load(mean_ptr + c)
+    rstd = tl.load(rstd_ptr + c)
+    gamma = tl.load(gamma_ptr + c)
+    beta = tl.load(beta_ptr + c)
+
+    # normalize + affine
+    norm = (x_vec - mean) * rstd
+    norm = norm * gamma + beta
+
+    # SiLU: x * sigmoid(x) = x / (1 + exp(-x))
+    sig = 1.0 / (1.0 + tl.exp(-norm))
+    y_vec = norm * sig
+
+    tl.store(y_ptr + idx, y_vec, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, num_groups: int = 32, eps: float = 1e-5):
+        super().__init__()
+        self.num_groups = num_groups
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor,
+                conv1_weight: torch.Tensor, norm1_weight: torch.Tensor, norm1_bias: torch.Tensor,
+                conv2_weight: torch.Tensor, norm2_weight: torch.Tensor, norm2_bias: torch.Tensor):
+        """
+        x: (B, C, H, W), conv weights: (C_out, C_in, 3, 3), norm scales/bias: (C,)
+        Returns: (B, C_out2, H, W)
+        """
+        assert x.is_cuda, "Inputs must be on CUDA for Triton kernels"
+        assert x.dim() == 4, "x must be (B, C, H, W)"
+        B, C_in, H, W = x.shape
+
+        # Conv1: PyTorch conv2d, stride=1, padding=1, no bias
+        conv1_w_f32 = conv1_weight.contiguous().to(torch.float32)  # (C_out1, C_in, 3, 3)
+        out1 = torch.nn.functional.conv2d(
+            x.contiguous().to(torch.float32), conv1_w_f32, bias=None, stride=1, padding=1
+        )  # (B, C_out1, H, W)
+
+        # GroupNorm 1 + SiLU
+        C_out1 = conv1_w_f32.shape[0]
+        assert (C_out1 % self.num_groups) == 0, "C_out1 must be divisible by num_groups for GroupNorm"
+        mean1 = torch.empty(C_out1, device=x.device, dtype=torch.float32)
+        rstd1 = torch.empty(C_out1, device=x.device, dtype=torch.float32)
+
+        grid_reduce1 = (B, self.num_groups, C_out1 // self.num_groups)
+        group_norm_reduce_kernel[grid_reduce1](
+            out1, mean1, rstd1,
+            B=B, C=C_out1, H=H, W=W, num_groups=self.num_groups,
+            num_warps=4, num_stages=2
+        )
+
+        # Prepare y1 for apply + affine + SiLU
+        y1 = torch.empty_like(out1)
+        grid_apply1 = (B, self.num_groups, C_out1 // self.num_groups, triton.cdiv(H * W, 1024))
+        group_norm_apply_affine_silu_kernel[grid_apply1](
+            out1, y1, norm1_weight.contiguous().to(torch.float32), norm1_bias.contiguous().to(torch.float32),
+            mean1, rstd1,
+            B=B, C=C_out1, H=H, W=W,
+            num_warps=4, num_stages=2
+        )
+
+        # Conv2: PyTorch conv2d, stride=1, padding=1, no bias
+        conv2_w_f32 = conv2_weight.contiguous().to(torch.float32)  # (C_out2, C_out1, 3, 3)
+        out2 = torch.nn.functional.conv2d(
+            y1, conv2_w_f32, bias=None, stride=1, padding=1
+        )  # (B, C_out2, H, W)
+
+        # GroupNorm 2 + SiLU
+        C_out2 = conv2_w_f32.shape[0]
+        assert (C_out2 % self.num_groups) == 0, "C_out2 must be divisible by num_groups for GroupNorm"
+        mean2 = torch.empty(C_out2, device=x.device, dtype=torch.float32)
+        rstd2 = torch.empty(C_out2, device=x.device, dtype=torch.float32)
+
+        grid_reduce2 = (B, self.num_groups, C_out2 // self.num_groups)
+        group_norm_reduce_kernel[grid_reduce2](
+            out2, mean2, rstd2,
+            B=B, C=C_out2, H=H, W=W, num_groups=self.num_groups,
+            num_warps=4, num_stages=2
+        )
+
+        y2 = torch.empty_like(out2)
+        grid_apply2 = (B, self.num_groups, C_out2 // self.num_groups, triton.cdiv(H * W, 1024))
+        group_norm_apply_affine_silu_kernel[grid_apply2](
+            out2, y2, norm2_weight.contiguous().to(torch.float32), norm2_bias.contiguous().to(torch.float32),
+            mean2, rstd2,
+            B=B, C=C_out2, H=H, W=W,
+            num_warps=4, num_stages=2
+        )
+
+        # Residual add: y2 + x
+        out = y2 + x.contiguous().to(torch.float32)
+
+        return out
+
+
+def run(*args):
+    return ModelNew()(*args)

@@ -1,0 +1,274 @@
+import math
+import torch
+import torch.nn as nn
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+# Triton kernel: Conv2d 3x3, stride=2, padding=1, generic IC -> OC
+# X: [B, IC, F_in, T_in], W: [OC, IC, 3, 3], bias: [OC], Y: [B, OC, F_out, T_out]
+@triton.jit
+def conv3x3_s2_p1_gelu(
+    X_ptr, W_ptr, BIAS_ptr, Y_ptr,
+    B, IC, F_in, T_in, OC, F_out, T_out,
+    x_sN, x_sC, x_sF, x_sT,
+    w_sOC, w_sIC, w_sKH, w_sKW,
+    y_sN, y_sOC, y_sF, y_sT,
+    BLOCK_F: tl.constexpr, BLOCK_T: tl.constexpr,
+):
+    # Launch grid: 1D over (b, oc, f_block, t_block)
+    total_blocks = B * OC * ((F_out + BLOCK_F - 1) // BLOCK_F) * ((T_out + BLOCK_T - 1) // BLOCK_T)
+    pid = tl.program_id(0)
+
+    # Decode pid into (b, oc, f_block, t_block)
+    grid_f_blocks = (F_out + BLOCK_F - 1) // BLOCK_F
+    grid_t_blocks = (T_out + BLOCK_T - 1) // BLOCK_T
+
+    b = pid // (OC * grid_f_blocks * grid_t_blocks)
+    rem = pid % (OC * grid_f_blocks * grid_t_blocks)
+    oc = rem // (grid_f_blocks * grid_t_blocks)
+    f_block = rem % (grid_f_blocks * grid_t_blocks) // grid_t_blocks
+    t_block = rem % grid_t_blocks
+
+    # Output tile indices
+    f_out_start = f_block * BLOCK_F
+    t_out_start = t_block * BLOCK_T
+    f_out_idx = f_out_start + tl.arange(0, BLOCK_F)[:, None]  # [BF, 1]
+    t_out_idx = t_out_start + tl.arange(0, BLOCK_T)[None, :]  # [1, BT]
+    out_mask = (f_out_idx < F_out) & (t_out_idx < T_out)
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_F, BLOCK_T), dtype=tl.float32)
+
+    # Loop over input channels and 3x3 kernel
+    for ic in range(0, IC):
+        for kh in range(0, 3):
+            for kw in range(0, 3):
+                f_in_idx = 2 * f_out_idx + 1 - kh  # stride=2, padding=1
+                t_in_idx = 2 * t_out_idx + 1 - kw
+
+                f_in_mask = (f_in_idx >= 0) & (f_in_idx < F_in)
+                t_in_mask = (t_in_idx >= 0) & (t_in_idx < T_in)
+                load_mask = out_mask & f_in_mask & t_in_mask
+
+                # Compute X[b, ic, f_in_idx, t_in_idx] for the tile
+                x_ptrs = X_ptr + b * x_sN + ic * x_sC + f_in_idx * x_sF + t_in_idx * x_sT
+                x_vals = tl.load(x_ptrs, mask=load_mask, other=0.0)
+
+                # Load W[oc, ic, kh, kw]
+                w_ptrs = W_ptr + oc * w_sOC + ic * w_sIC + kh * w_sKH + kw * w_sKW
+                w_vals = tl.load(w_ptrs)  # scalar
+
+                # Outer product accumulate: [BLOCK_F, 1] * [1, BLOCK_T]
+                acc += x_vals[:, None] * w_vals
+
+
+    # Add bias
+    b_ptrs = BIAS_ptr + oc
+    b_val = tl.load(b_ptrs)
+    acc += b_val
+
+    # GELU: approx = 0.5 * x * (1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+    c = 0.7978845608028654  # sqrt(2/pi)
+    x3 = acc * acc * acc
+    gelu = 0.5 * acc * (1.0 + tl.tanh(c * (acc + 0.044715 * x3)))
+
+
+    # Store result
+    y_ptrs = Y_ptr + b * y_sN + oc * y_sOC + f_out_idx * y_sF + t_out_idx * y_sT
+    tl.store(y_ptrs, gelu, mask=out_mask)
+
+
+# Triton matmul kernel: A[M, K] @ B[K, N] -> Y[M, N]
+@triton.jit
+def matmul_vecvec(
+    A_ptr, B_ptr, Y_ptr,
+    M, K, N,
+    a_sM, a_sK,
+    b_sK, b_sN,
+    y_sM, y_sN,
+    BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)  # [BK]
+
+        a_ptrs = A_ptr + offs_m[:, None] * a_sM + offs_k[None, :] * a_sK
+        b_ptrs = B_ptr + offs_k[:, None] * b_sK + offs_n[None, :] * b_sN
+
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        acc += tl.dot(a, b)
+
+    y_ptrs = Y_ptr + offs_m[:, None] * y_sM + offs_n[None, :] * y_sN
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(y_ptrs, acc, mask=mask)
+
+
+# Triton elementwise kernel: Y[:] = X[:] * scale
+@triton.jit
+def scale_vec(
+    X_ptr, Y_ptr, N,
+    scale,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    x = tl.load(X_ptr + offs, mask=mask, other=0.0)
+    y = x * scale
+    tl.store(Y_ptr + offs, y, mask=mask)
+
+
+# Triton elementwise kernel: Y[m, n] = X[m, n] + P[n]
+@triton.jit
+def add_pos_emb_vec(
+    X_ptr, P_ptr, Y_ptr,
+    M, N,
+    x_sM, x_sN,
+    y_sM, y_sN,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    total = M * N
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+    n_idx = offs % N
+    m_idx = offs // N
+    x_ptrs = X_ptr + m_idx * x_sM + n_idx * x_sN
+    p_ptrs = P_ptr + n_idx
+    x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
+    p_vals = tl.load(p_ptrs, mask=mask, other=0.0)
+    y_vals = x_vals + p_vals
+    y_ptrs = Y_ptr + m_idx * y_sM + n_idx * y_sN
+    tl.store(y_ptrs, y_vals, mask=mask)
+
+
+class ModelNew(nn.Module):
+    def forward(self, *args):
+        # args: (input_features, conv2d1_weight, conv2d1_bias, conv2d2_weight, conv2d2_bias, conv2d3_weight, conv2d3_bias, conv_out_weight, positional_embedding, embed_scale)
+        input_features = args[0]
+        conv2d1_weight = args[1]  # [OC, IC, 3, 3] with IC=1
+        conv2d1_bias = args[2]
+        conv2d2_weight = args[3]  # [OC, OC, 3, 3] with OC=384
+        conv2d2_bias = args[4]
+        conv2d3_weight = args[5]  # [OC, OC, 3, 3]
+        conv2d3_bias = args[6]
+        conv_out_weight = args[7]  # [d_model, conv_out_dim] = [1024, 3840]
+        positional_embedding = args[8]  # [max_source_positions, d_model]
+        embed_scale = float(args[9])
+
+        # Ensure device and dtype: Triton expects float32
+        device = input_features.device
+        B, IC_in, F_in, T_in = input_features.shape
+        x1 = input_features.contiguous().float()  # [B, 1, 80, T_in]
+
+        # Stage 1: Conv2d (1 -> 384 channels) + GELU
+        OC1 = conv2d1_weight.shape[0]
+        w1 = conv2d1_weight.contiguous().float()     # [OC1, 1, 3, 3]
+        b1 = conv2d1_bias.contiguous().float()       # [OC1]
+        F_out1 = (F_in + 2 * 1 - 3) // 2 + 1
+        T_out1 = (T_in + 2 * 1 - 3) // 2 + 1
+        y1 = torch.empty((B, OC1, F_out1, T_out1), device=device, dtype=torch.float32)
+        grid1 = (B * OC1 * triton.cdiv(F_out1, 32) * triton.cdiv(T_out1, 32),)
+        conv3x3_s2_p1_gelu[grid1](
+            x1, w1, b1, y1,
+            B, 1, F_in, T_in, OC1, F_out1, T_out1,
+            x1.stride(0), x1.stride(1), x1.stride(2), x1.stride(3),
+            w1.stride(0), w1.stride(1), w1.stride(2), w1.stride(3),
+            y1.stride(0), y1.stride(1), y1.stride(2), y1.stride(3),
+            BLOCK_F=32, BLOCK_T=32
+        )
+
+        # Stage 2: Conv2d (384 -> 384 channels) + GELU
+        x2 = y1
+        OC2 = conv2d2_weight.shape[0]
+        w2 = conv2d2_weight.contiguous().float()     # [OC2, OC1, 3, 3]
+        b2 = conv2d2_bias.contiguous().float()       # [OC2]
+        F_in2 = F_out1
+        T_in2 = T_out1
+        F_out2 = (F_in2 + 2 * 1 - 3) // 2 + 1
+        T_out2 = (T_in2 + 2 * 1 - 3) // 2 + 1
+        y2 = torch.empty((B, OC2, F_out2, T_out2), device=device, dtype=torch.float32)
+        grid2 = (B * OC2 * triton.cdiv(F_out2, 32) * triton.cdiv(T_out2, 32),)
+        conv3x3_s2_p1_gelu[grid2](
+            x2, w2, b2, y2,
+            B, OC1, F_in2, T_in2, OC2, F_out2, T_out2,
+            x2.stride(0), x2.stride(1), x2.stride(2), x2.stride(3),
+            w2.stride(0), w2.stride(1), w2.stride(2), w2.stride(3),
+            y2.stride(0), y2.stride(1), y2.stride(2), y2.stride(3),
+            BLOCK_F=32, BLOCK_T=32
+        )
+
+        # Stage 3: Conv2d (384 -> 384 channels) + GELU
+        x3 = y2
+        OC3 = OC2  # remains 384
+        w3 = conv2d3_weight.contiguous().float()     # [OC3, OC2, 3, 3]
+        b3 = conv2d3_bias.contiguous().float()       # [OC3]
+        F_in3 = F_out2
+        T_in3 = T_out2
+        F_out3 = (F_in3 + 2 * 1 - 3) // 2 + 1
+        T_out3 = (T_in3 + 2 * 1 - 3) // 2 + 1
+        y3 = torch.empty((B, OC3, F_out3, T_out3), device=device, dtype=torch.float32)
+        grid3 = (B * OC3 * triton.cdiv(F_out3, 32) * triton.cdiv(T_out3, 32),)
+        conv3x3_s2_p1_gelu[grid3](
+            x3, w3, b3, y3,
+            B, OC2, F_in3, T_in3, OC3, F_out3, T_out3,
+            x3.stride(0), x3.stride(1), x3.stride(2), x3.stride(3),
+            w3.stride(0), w3.stride(1), w3.stride(2), w3.stride(3),
+            y3.stride(0), y3.stride(1), y3.stride(2), y3.stride(3),
+            BLOCK_F=32, BLOCK_T=32
+        )
+
+        # Reshape: (B, OC, F_out3, T_out3) -> (B, T_out3, OC*F_out3)
+        B_out, OC_out, F_out, T_out = y3.shape
+        seq_len = T_out
+        features = OC_out * F_out  # 384 * (F_in // 8) = 384 * 10 = 3840 for typical
+        x4 = y3.permute(0, 3, 1, 2).contiguous().view(B_out, seq_len, features)  # [B, T_out, 3840]
+
+        # Linear projection to d_model (1024): x4[M= B*T_out, 3840] @ conv_out_weight[3840, 1024] -> [B*T_out, 1024]
+        M = B_out * seq_len
+        conv_out_weight_t = conv_out_weight.contiguous().float().t()  # [1024, 3840]
+        y_proj = torch.empty((M, 1024), device=device, dtype=torch.float32)
+        grid_mm = (triton.cdiv(M, 128), triton.cdiv(1024, 128))
+        matmul_vecvec[grid_mm](
+            x4.contiguous().float(), conv_out_weight_t, y_proj,
+            M, 3840, 1024,
+            x4.stride(0), x4.stride(2),
+            conv_out_weight_t.stride(0), conv_out_weight_t.stride(1),
+            y_proj.stride(0), y_proj.stride(1),
+            BLOCK_M=128, BLOCK_K=128, BLOCK_N=128
+        )
+        y_flat = y_proj.view(B_out, seq_len, 1024)  # [B, T_out, 1024]
+
+        # Scale by embed_scale = sqrt(d_model) = 32.0
+        y_scaled = torch.empty_like(y_flat)
+        scale_vec[(y_flat.numel() + 1023) // 1024,](y_flat, y_scaled, y_flat.numel(), embed_scale, BLOCK=1024)
+
+        # Add positional embedding: y[b, t, :] += positional_embedding[t, :]
+        pos_emb = positional_embedding[:seq_len].contiguous().float()  # [seq_len, 1024]
+        y_out = torch.empty_like(y_scaled)
+        add_pos_emb_vec[(y_scaled.numel() + 1023) // 1024,](y_scaled, pos_emb.view(-1), y_out,
+                                                            B_out, seq_len, 1024,
+                                                            y_scaled.stride(0), y_scaled.stride(2),
+                                                            y_out.stride(0), y_out.stride(2),
+                                                            BLOCK=1024)
+
+        return y_out
+
+
+def run(*args):
+    return ModelNew()(*args)

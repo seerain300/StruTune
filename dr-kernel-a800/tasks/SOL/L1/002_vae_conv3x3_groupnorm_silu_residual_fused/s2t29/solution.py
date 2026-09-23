@@ -1,0 +1,229 @@
+import torch
+import triton
+import triton.language as tl
+
+
+# Triton kernel: Conv3x3 NCHW, stride=1, padding=1, no bias
+# Computes out[n, co, h, w] = sum_{ci=0..C-1} sum_{dh=-1..1} sum_{dw=-1..1} x[n, ci, h+dh, w+dw] * w[co, ci, 1+dh, 1+dw]
+@triton.jit
+def conv3x3_nchw_kernel(
+    x_ptr, w_ptr, out_ptr,
+    B, C, H, W, C_OUT,
+    BLOCK_W: tl.constexpr,  # we can set 1 here; one output element per program
+):
+    # Grid: (B, C_OUT, H, W)
+    pid_n = tl.program_id(0)
+    pid_co = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    pid_w = tl.program_id(3)
+
+    h = pid_h
+    w = pid_w
+
+    # Accumulator for single output element
+    acc = tl.float32(0.0)
+
+    # Loop over input channels and 3x3 neighborhood with padding=1 (mask for valid)
+    for ci in range(0, C):
+        for dh in range(-1, 2):
+            rh = h + dh
+            valid_h = (rh >= 0) & (rh < H)
+            for dw in range(-1, 2):
+                rw = w + dw
+                valid_w = (rw >= 0) & (rw < W)
+                valid = valid_h & valid_w
+                # Compute input linear index: ((n*C + ci)*H + rh)*W + rw
+                in_idx = ((pid_n * C + ci) * H + rh) * W + rw
+                # Load input with mask; masked loads return 0.0
+                x_val = tl.load(x_ptr + in_idx, mask=valid, other=0.0)
+                # Load weight scalar: ((co*C + ci)*3 + (1+dh))*3 + (1+dw)
+                # Note: w shape is (C_OUT, C, 3, 3)
+                w_idx = (pid_co * C + ci) * 9 + (1 + dh) * 3 + (1 + dw)
+                w_val = tl.load(w_ptr + w_idx)
+                acc += x_val * w_val
+
+    # Store output: ((n*C_OUT + co)*H + h)*W + w
+    out_idx = ((pid_n * C_OUT + pid_co) * H + h) * W + w
+    tl.store(out_ptr + out_idx, acc)
+
+
+# Triton kernel: compute per-(n, group) sum and sumsq over channels in group and all H*W elements
+@triton.jit
+def groupnorm_sums_kernel(
+    x_ptr, sums_ptr, sumsq_ptr,
+    B, C, H, W, num_groups,
+    C_PER_GROUP: tl.constexpr,
+):
+    pid = tl.program_id(0)  # 0 .. (B * num_groups - 1)
+    n = pid // num_groups
+    g = pid % num_groups
+    start_ci = g * C_PER_GROUP
+    s = tl.float32(0.0)
+    s2 = tl.float32(0.0)
+    # Loop over channels in the group
+    for ci in range(0, C_PER_GROUP):
+        ci_abs = start_ci + ci
+        for h in range(0, H):
+            for w in range(0, W):
+                idx = ((n * C + ci_abs) * H + h) * W + w
+                x_val = tl.load(x_ptr + idx)
+                s += x_val
+                s2 += x_val * x_val
+    tl.store(sums_ptr + pid, s)
+    tl.store(sumsq_ptr + pid, s2)
+
+
+# Triton kernel: compute mean and invstd per (n, group) using sums and sumsq
+@triton.jit
+def groupnorm_compute_invstd_kernel(
+    sums_ptr, sumsq_ptr, mean_ptr, invstd_ptr,
+    B, C, H, W, num_groups,
+    C_PER_GROUP: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    pid = tl.program_id(0)  # 0 .. (B * num_groups - 1)
+    n = pid // num_groups
+    g = pid % num_groups
+    s = tl.load(sums_ptr + pid)
+    s2 = tl.load(sumsq_ptr + pid)
+    group_size = C_PER_GROUP * H * W
+    mean = s / group_size
+    var = s2 / group_size - mean * mean
+    invstd = 1.0 / tl.sqrt(var + EPS)
+    tl.store(mean_ptr + pid, mean)
+    tl.store(invstd_ptr + pid, invstd)
+
+
+# Triton kernel: apply normalization with affine and SiLU per (n, group)
+@triton.jit
+def groupnorm_apply_silu_kernel(
+    x_ptr, norm_w_ptr, norm_b_ptr, out_ptr, mean_ptr, invstd_ptr,
+    B, C, H, W, num_groups,
+    C_PER_GROUP: tl.constexpr,
+):
+    pid = tl.program_id(0)  # 0 .. (B * num_groups - 1)
+    n = pid // num_groups
+    g = pid % num_groups
+    mean = tl.load(mean_ptr + pid)
+    invstd = tl.load(invstd_ptr + pid)
+    start_ci = g * C_PER_GROUP
+    for ci in range(0, C_PER_GROUP):
+        ci_abs = start_ci + ci
+        w = tl.load(norm_w_ptr + ci_abs)
+        b = tl.load(norm_b_ptr + ci_abs)
+        for h in range(0, H):
+            for w in range(0, W):
+                idx = ((n * C + ci_abs) * H + h) * W + w
+                x_val = tl.load(x_ptr + idx)
+                norm = ((x_val - mean) * invstd) * w + b
+                # SiLU: y * sigmoid(y) = y / (1 + exp(-y))
+                y = norm
+                silu = y / (1.0 + tl.exp(-y))
+                out_idx = ((n * C + ci_abs) * H + h) * W + w
+                tl.store(out_ptr + out_idx, silu)
+
+
+def _assert_divisible(dividend: int, divisor: int):
+    if dividend % divisor != 0:
+        raise ValueError(f"{dividend} is not divisible by {divisor}")
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, conv1_weight, conv2_weight, norm1_weight, norm1_bias, norm2_weight, norm2_bias, eps):
+        super().__init__()
+        self.conv1_weight = conv1_weight
+        self.conv2_weight = conv2_weight
+        self.norm1_weight = norm1_weight
+        self.norm1_bias = norm1_bias
+        self.norm2_weight = norm2_weight
+        self.norm2_bias = norm2_bias
+        self.eps = eps
+        num_groups = 32
+        _assert_divisible(conv1_weight.shape[1], num_groups)
+        _assert_divisible(conv2_weight.shape[1], num_groups)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure float32 and contiguous for Triton kernels
+        if x.dtype != torch.float32:
+            x = x.float()
+        x = x.contiguous()
+
+        # Conv1: Triton kernel
+        B, C, H, W = x.shape
+        C_OUT1 = self.conv1_weight.shape[0]
+        out1 = torch.empty((B, C_OUT1, H, W), device=x.device, dtype=torch.float32)
+        grid_conv1 = (B, C_OUT1, H, W)
+        conv3x3_nchw_kernel[grid_conv1](x, self.conv1_weight, out1, B, C, H, W, C_OUT1, BLOCK_W=1)
+
+        # GroupNorm + SiLU for out1
+        num_groups = 32
+        C_PER_GROUP = C // num_groups
+        # Ensure weights/bias are float32 and contiguous
+        norm1_w = self.norm1_weight.contiguous().float()
+        norm1_b = self.norm1_bias.contiguous().float()
+
+        B_stage1 = B * num_groups
+        grid_sums1 = (B_stage1,)
+        sums1 = torch.empty(B_stage1, device=x.device, dtype=torch.float32)
+        sumsq1 = torch.empty(B_stage1, device=x.device, dtype=torch.float32)
+        groupnorm_sums_kernel[grid_sums1](out1, sums1, sumsq1, B, C, H, W, num_groups, C_PER_GROUP)
+
+        mean1 = torch.empty(B_stage1, device=x.device, dtype=torch.float32)
+        invstd1 = torch.empty(B_stage1, device=x.device, dtype=torch.float32)
+        groupnorm_compute_invstd_kernel[grid_sums1](sums1, sumsq1, mean1, invstd1, B, C, H, W, num_groups, C_PER_GROUP, self.eps)
+
+        out1_norm = torch.empty((B, C, H, W), device=x.device, dtype=torch.float32)
+        grid_apply1 = (B_stage1,)
+        groupnorm_apply_silu_kernel[grid_apply1](
+            out1, norm1_w, norm1_b, out1_norm, mean1, invstd1, B, C, H, W, num_groups, C_PER_GROUP
+        )
+
+        # Conv2: Triton kernel
+        C_OUT2 = self.conv2_weight.shape[0]
+        out2 = torch.empty((B, C_OUT2, H, W), device=x.device, dtype=torch.float32)
+        grid_conv2 = (B, C_OUT2, H, W)
+        conv3x3_nchw_kernel[grid_conv2](out1_norm, self.conv2_weight, out2, B, C, H, W, C_OUT2, BLOCK_W=1)
+
+        # GroupNorm + SiLU for out2
+        num_groups2 = 32
+        C_PER_GROUP2 = C // num_groups2
+        norm2_w = self.norm2_weight.contiguous().float()
+        norm2_b = self.norm2_bias.contiguous().float()
+
+        B_stage2 = B * num_groups2
+        grid_sums2 = (B_stage2,)
+        sums2 = torch.empty(B_stage2, device=x.device, dtype=torch.float32)
+        sumsq2 = torch.empty(B_stage2, device=x.device, dtype=torch.float32)
+        groupnorm_sums_kernel[grid_sums2](out2, sums2, sumsq2, B, C, H, W, num_groups2, C_PER_GROUP2)
+
+        mean2 = torch.empty(B_stage2, device=x.device, dtype=torch.float32)
+        invstd2 = torch.empty(B_stage2, device=x.device, dtype=torch.float32)
+        groupnorm_compute_invstd_kernel[grid_sums2](sums2, sumsq2, mean2, invstd2, B, C, H, W, num_groups2, C_PER_GROUP2, self.eps)
+
+        out2_norm = torch.empty((B, C, H, W), device=x.device, dtype=torch.float32)
+        grid_apply2 = (B_stage2,)
+        groupnorm_apply_silu_kernel[grid_apply2](
+            out2, norm2_w, norm2_b, out2_norm, mean2, invstd2, B, C, H, W, num_groups2, C_PER_GROUP2
+        )
+
+        # Residual add: out = out2_norm + x
+        out = out2_norm + x
+        return out
+
+
+# Example helper functions for testing (not required by the environment):
+def get_inputs():
+    B = 16; H = 64; W = 64
+    x = torch.randn(B, 64, H, W, device='cuda', dtype=torch.float32)
+    conv1_weight = torch.randn(64, 64, 3, 3, device='cuda', dtype=torch.float32)
+    norm1_weight = torch.randn(64, device='cuda', dtype=torch.float32)
+    norm1_bias = torch.randn(64, device='cuda', dtype=torch.float32)
+    conv2_weight = torch.randn(64, 64, 3, 3, device='cuda', dtype=torch.float32)
+    norm2_weight = torch.randn(64, device='cuda', dtype=torch.float32)
+    norm2_bias = torch.randn(64, device='cuda', dtype=torch.float32)
+    eps = 1e-5
+    return [x, conv1_weight, norm1_weight, norm1_bias, conv2_weight, norm2_weight, norm2_bias, eps]
+
+
+def run(*args):
+    return ModelNew()(*args)

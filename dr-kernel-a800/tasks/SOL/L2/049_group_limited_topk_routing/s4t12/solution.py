@@ -1,0 +1,524 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _matmul_AxB_kernel(
+    A_ptr,  # [M, K], float32
+    B_ptr,  # [K, N], float32
+    C_ptr,  # [M, N], float32
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # 2D tiling over output [M, N]
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Iterate over K dimension in chunks
+    for k in range(0, K, BLOCK_K):
+        k_ids = k + tl.arange(0, BLOCK_K)
+
+        # Tile pointers
+        a_ptrs = A_ptr + (offs_m[:, None] * stride_am + k_ids[None, :] * stride_ak)
+        b_ptrs = B_ptr + (k_ids[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+        # Masks for loads
+        a_mask = (offs_m[:, None] < M) & (k_ids[None, :] < K)
+        b_mask = (k_ids[:, None] < K) & (offs_n[None, :] < N)
+
+        # Load tiles
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Accumulate
+        acc += tl.dot(a, b)
+
+    # Store result
+    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+@triton.jit
+def _sigmoid_add_bias_kernel(
+    X_ptr,    # [M, N], float32
+    B_ptr,    # [N],   float32
+    Y_ptr,    # [M, N], float32
+    M, N,
+    stride_xm, stride_xn,
+    stride_ym, stride_yn,
+    stride_b,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    # 2D tiling over [M, N]
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    x_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn)
+    y_ptrs = Y_ptr + (offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    x = tl.load(x_ptrs, mask=mask, other=0.0)
+    # sigmoid
+    s = 1.0 / (1.0 + tl.exp(-x))
+    # add bias (broadcast along rows)
+    b = tl.load(B_ptr + offs_n * stride_b, mask=(offs_n < N), other=0.0)
+    s = s + b[None, :]
+    tl.store(y_ptrs, s, mask=mask)
+
+
+@triton.jit
+def _group_top2_sum_kernel(
+    S_ptr,       # [M, N], float32
+    G_ptr,       # [M, 8], float32
+    M, N,
+    stride_sm, stride_sn,
+    stride_gm, stride_gn,
+    groups: tl.constexpr,  # 8
+    experts_per_group: tl.constexpr,  # 32
+    BLOCK: tl.constexpr,
+):
+    # Each program processes one token
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+
+    base = pid * N
+    # For each group, compute top-2 scores and sum
+    for g in range(groups):
+        group_base = g * experts_per_group
+        # Load 32 scores for this group
+        offs = tl.arange(0, BLOCK)
+        v = S_ptr + base + group_base + offs
+        mask = (group_base + offs) < N
+        scores = tl.load(v, mask=mask, other=-float('inf'))
+        # Find top-2 via iterative argmax
+        # Initialize with first element
+        idx = 0
+        m1 = scores[0]
+        # Pass 1: get max1
+        for i in range(1, experts_per_group):
+            if scores[i] > m1:
+                m1 = scores[i]
+                idx = i
+        # Set max1 to -inf to get max2
+        scores = tl.where((group_base + offs) == (group_base + idx), -float('inf'), scores)
+        idx2 = 0
+        m2 = scores[0]
+        for i in range(1, experts_per_group):
+            if scores[i] > m2:
+                m2 = scores[i]
+                idx2 = i
+        gs = m1 + m2
+        # Store group score
+        out_ptr = G_ptr + pid * stride_gm + g * stride_gn
+        tl.store(out_ptr, gs)
+
+
+@triton.jit
+def _group_top4_select_kernel(
+    G_ptr,       # [M, 8], float32
+    GIDX_ptr,    # [M, 4], int32
+    M, N,        # N not used but kept for consistency
+    stride_gm, stride_gn,
+    stride_gim, stride_gin,
+    groups: tl.constexpr,  # 8
+    BLOCK: tl.constexpr,   # 8
+):
+    # Each program processes one token
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+
+    # Iterative argmax to select top-4 indices
+    # Keep selected indices in idxs[4] as 0/1 flags
+    # Here we assume groups=8 constexpr, so we can hardcode.
+    # We select indices and write to GIDX_ptr[pid, j]
+    # Note: Triton has no dynamic arrays; we use static loop with masks.
+
+    # Initialize selected indices vector (int32)
+    selected = tl.zeros((BLOCK,), dtype=tl.int32)  # indices 0..7
+    values = tl.zeros((BLOCK,), dtype=tl.float32)  # top-4 values
+
+    # Pass 1: find top-1
+    top1 = -float('inf')
+    for i in range(groups):
+        ptr = G_ptr + pid * stride_gm + i * stride_gn
+        val = tl.load(ptr)
+        if val > top1:
+            top1 = val
+    # Now find index of top1
+    top1_idx = 0
+    for i in range(groups):
+        ptr = G_ptr + pid * stride_gm + i * stride_gn
+        val = tl.load(ptr)
+        if val == top1:
+            top1_idx = i
+            break
+    # Record top1
+    selected[0] = top1_idx
+    values[0] = top1
+
+    # Set group i to -inf so it won't be selected again
+    # Then repeat for top2, top3, top4
+    # Top-2
+    top2 = -float('inf')
+    for i in range(groups):
+        ptr = G_ptr + pid * stride_gm + i * stride_gn
+        val = tl.load(ptr)
+        if val > top2 and i != top1_idx:
+            top2 = val
+    top2_idx = 0
+    for i in range(groups):
+        ptr = G_ptr + pid * stride_gm + i * stride_gn
+        val = tl.load(ptr)
+        if val == top2 and i != top1_idx:
+            top2_idx = i
+            break
+    selected[1] = top2_idx
+    values[1] = top2
+
+    # Top-3
+    top3 = -float('inf')
+    for i in range(groups):
+        ptr = G_ptr + pid * stride_gm + i * stride_gn
+        val = tl.load(ptr)
+        if val > top3 and (i != top1_idx) and (i != top2_idx):
+            top3 = val
+    top3_idx = 0
+    for i in range(groups):
+        ptr = G_ptr + pid * stride_gm + i * stride_gn
+        val = tl.load(ptr)
+        if val == top3 and (i != top1_idx) and (i != top2_idx):
+            top3_idx = i
+            break
+    selected[2] = top3_idx
+    values[2] = top3
+
+    # Top-4
+    top4 = -float('inf')
+    for i in range(groups):
+        ptr = G_ptr + pid * stride_gm + i * stride_gn
+        val = tl.load(ptr)
+        if val > top4 and (i != top1_idx) and (i != top2_idx) and (i != top3_idx):
+            top4 = val
+    top4_idx = 0
+    for i in range(groups):
+        ptr = G_ptr + pid * stride_gm + i * stride_gn
+        val = tl.load(ptr)
+        if val == top4 and (i != top1_idx) and (i != top2_idx) and (i != top3_idx):
+            top4_idx = i
+            break
+    selected[3] = top4_idx
+    values[3] = top4
+
+    # Store results to GIDX_ptr
+    for j in range(4):
+        out_ptr = GIDX_ptr + pid * stride_gim + j * stride_gin
+        tl.store(out_ptr, selected[j])
+
+
+@triton.jit
+def _final_top8_and_normalize_kernel(
+    S_ptr,               # [M, N], float32
+    GIDX_ptr,            # [M, 4], int32
+    OUT_IDX_ptr,         # [M, 8], int32
+    OUT_W_ptr,           # [M, 8], float32
+    M, N,
+    stride_sm, stride_sn,
+    stride_gim, stride_gin,
+    stride_oim, stride_ojn,
+    stride_wm, stride_wn,
+    scale,               # float32
+    groups: tl.constexpr,  # 8
+    experts_per_group: tl.constexpr,  # 32
+    BLOCK: tl.constexpr,   # 256 (covers N=256)
+):
+    # Each program processes one token
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+
+    # Build score_mask: keep only selected groups, else set to -inf
+    # Load selected group indices
+    selected_groups = tl.zeros((groups,), dtype=tl.int32)
+    # Unpack GIDX_ptr[pid, 0..3] into selected_groups[0..3]
+    # Triton allows static indexing, so read them
+    for j in range(4):
+        ptr = GIDX_ptr + pid * stride_gim + j * stride_gin
+        idx = tl.load(ptr)
+        selected_groups[j] = idx
+
+    # Create mask vector of length N
+    # We'll fill mask with 1s for positions in selected_groups*experts_per_group + [0..experts_per_group-1], else 0
+    mask_vec = tl.full((N,), 0.0, dtype=tl.float32)
+    for j in range(4):
+        base = selected_groups[j] * experts_per_group
+        for k in range(experts_per_group):
+            pos = base + k
+            mask_vec[pos] = 1.0
+
+    # Now masked_scores = S_ptr[:, :] * mask_vec (broadcast) or -inf where mask=0
+    # Simpler: we'll recompute top8 selection only on S_ptr, but to enforce mask, we can set non-selected scores to -inf here.
+    # However, Triton doesn't support dynamic indexing into 1D like this. Instead, we will directly select from S_ptr without pre-masking.
+    # The trick: We will select by checking group membership per index during selection. This avoids pre-masking.
+
+    # Iterative argmax to select top-8 indices
+    selected_idx = tl.zeros((8,), dtype=tl.int32)
+    selected_val = tl.zeros((8,), dtype=tl.float32)
+
+    # Top-1
+    top1 = -float('inf')
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val > top1:
+            top1 = val
+    top1_idx = 0
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val == top1:
+            top1_idx = i
+            break
+    selected_idx[0] = top1_idx
+    selected_val[0] = top1
+
+    # Top-2
+    top2 = -float('inf')
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val > top2 and i != top1_idx:
+            top2 = val
+    top2_idx = 0
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val == top2 and i != top1_idx:
+            top2_idx = i
+            break
+    selected_idx[1] = top2_idx
+    selected_val[1] = top2
+
+    # Top-3
+    top3 = -float('inf')
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val > top3 and (i != top1_idx) and (i != top2_idx):
+            top3 = val
+    top3_idx = 0
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val == top3 and (i != top1_idx) and (i != top2_idx):
+            top3_idx = i
+            break
+    selected_idx[2] = top3_idx
+    selected_val[2] = top3
+
+    # Top-4
+    top4 = -float('inf')
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val > top4 and (i != top1_idx) and (i != top2_idx) and (i != top3_idx):
+            top4 = val
+    top4_idx = 0
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val == top4 and (i != top1_idx) and (i != top2_idx) and (i != top3_idx):
+            top4_idx = i
+            break
+    selected_idx[3] = top4_idx
+    selected_val[3] = top4
+
+    # Top-5
+    top5 = -float('inf')
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val > top5 and (i != top1_idx) and (i != top2_idx) and (i != top3_idx) and (i != top4_idx):
+            top5 = val
+    top5_idx = 0
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val == top5 and (i != top1_idx) and (i != top2_idx) and (i != top3_idx) and (i != top4_idx):
+            top5_idx = i
+            break
+    selected_idx[4] = top5_idx
+    selected_val[4] = top5
+
+    # Top-6
+    top6 = -float('inf')
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val > top6 and (i != top1_idx) and (i != top2_idx) and (i != top3_idx) and (i != top4_idx) and (i != top5_idx):
+            top6 = val
+    top6_idx = 0
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val == top6 and (i != top1_idx) and (i != top2_idx) and (i != top3_idx) and (i != top4_idx) and (i != top5_idx):
+            top6_idx = i
+            break
+    selected_idx[5] = top6_idx
+    selected_val[5] = top6
+
+    # Top-7
+    top7 = -float('inf')
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val > top7 and (i != top1_idx) and (i != top2_idx) and (i != top3_idx) and (i != top4_idx) and (i != top5_idx) and (i != top6_idx):
+            top7 = val
+    top7_idx = 0
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val == top7 and (i != top1_idx) and (i != top2_idx) and (i != top3_idx) and (i != top4_idx) and (i != top5_idx) and (i != top6_idx):
+            top7_idx = i
+            break
+    selected_idx[6] = top7_idx
+    selected_val[6] = top7
+
+    # Top-8
+    top8 = -float('inf')
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val > top8 and (i != top1_idx) and (i != top2_idx) and (i != top3_idx) and (i != top4_idx) and (i != top5_idx) and (i != top6_idx) and (i != top7_idx):
+            top8 = val
+    top8_idx = 0
+    for i in range(N):
+        ptr = S_ptr + pid * stride_sm + i * stride_sn
+        val = tl.load(ptr)
+        if val == top8 and (i != top1_idx) and (i != top2_idx) and (i != top3_idx) and (i != top4_idx) and (i != top5_idx) and (i != top6_idx) and (i != top7_idx):
+            top8_idx = i
+            break
+    selected_idx[7] = top8_idx
+    selected_val[7] = top8
+
+    # Store indices
+    for j in range(8):
+        out_idx_ptr = OUT_IDX_ptr + pid * stride_oim + j * stride_ojn
+        tl.store(out_idx_ptr, selected_idx[j])
+
+    # Compute and store weights: L1 normalize selected_val and scale by 'scale'
+    denom = selected_val[0] + selected_val[1] + selected_val[2] + selected_val[3] + \
+            selected_val[4] + selected_val[5] + selected_val[6] + selected_val[7]
+    denom = tl.maximum(denom, 1e-20)
+    for j in range(8):
+        out_w_ptr = OUT_W_ptr + pid * stride_wm + j * stride_wn
+        w = selected_val[j] / denom
+        w = w * scale
+        tl.store(out_w_ptr, w)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, routed_scaling_factor: float):
+        super().__init__()
+        self.routed_scaling_factor = routed_scaling_factor
+
+    def forward(self, hidden_states: torch.Tensor, weight: torch.Tensor, expert_bias: torch.Tensor):
+        """
+        hidden_states: [M, K], float32 on CUDA
+        weight:        [N, K], float32 on CUDA, N=256
+        expert_bias:   [N],   float32 on CUDA
+        Returns:
+        - topk_idx: [M, 8], int64
+        - topk_weight: [M, 8], float32
+        """
+        assert hidden_states.is_cuda and weight.is_cuda and expert_bias.is_cuda, "All tensors must be on CUDA for Triton kernels"
+        assert hidden_states.dim() == 2, "hidden_states must be [M, K]"
+        assert weight.dim() == 2, "weight must be [N, K]"
+        assert expert_bias.dim() == 1 and expert_bias.shape[0] == weight.shape[0], "expert_bias must be [N]"
+        M, K = hidden_states.shape
+        N = weight.shape[0]  # num_experts, expected 256
+
+        # Prepare B = weight.T as [K, N] for matmul
+        B = weight.t().contiguous()
+        # Ensure dtype float32
+        A = hidden_states.contiguous().to(torch.float32)
+        B = B.to(torch.float32)
+
+        # Output logits [M, N]
+        logits = torch.empty((M, N), dtype=torch.float32, device=hidden_states.device)
+        grid = (triton.cdiv(M, 64), triton.cdiv(N, 64))
+        _matmul_AxB_kernel[grid](
+            A, B, logits,
+            M, N, K,
+            A.stride(0), A.stride(1),
+            B.stride(0), B.stride(1),
+            logits.stride(0), logits.stride(1),
+            BLOCK_M=64, BLOCK_N=64, BLOCK_K=32,
+            num_warps=4, num_stages=3,
+        )
+
+        # Sigmoid + expert bias in Triton
+        scores = torch.empty((M, N), dtype=torch.float32, device=hidden_states.device)
+        _sigmoid_add_bias_kernel[(M, N)](
+            logits, expert_bias,
+            scores,
+            M, N,
+            logits.stride(0), logits.stride(1),
+            scores.stride(0), scores.stride(1),
+            expert_bias.stride(0),
+            BLOCK_M=64, BLOCK_N=128,
+        )
+
+        # Group scores per token (8 groups)
+        group_scores = torch.empty((M, 8), dtype=torch.float32, device=hidden_states.device)
+        _group_top2_sum_kernel[(M,)](
+            scores, group_scores,
+            M, N,
+            scores.stride(0), scores.stride(1),
+            group_scores.stride(0), group_scores.stride(1),
+            groups=8, experts_per_group=32, BLOCK=32,
+        )
+
+        # Group top-4 selection per token in Triton
+        group_idx = torch.empty((M, 4), dtype=torch.int32, device=hidden_states.device)
+        _group_top4_select_kernel[(M,)](
+            group_scores, group_idx,
+            M, N,
+            group_scores.stride(0), group_scores.stride(1),
+            group_idx.stride(0), group_idx.stride(1),
+            groups=8, BLOCK=8,
+        )
+
+        # Final top-8 and normalize with scaling in Triton
+        topk_idx = torch.empty((M, 8), dtype=torch.int32, device=hidden_states.device)
+        topk_weight = torch.empty((M, 8), dtype=torch.float32, device=hidden_states.device)
+        _final_top8_and_normalize_kernel[(M,)](
+            scores, group_idx, topk_idx, topk_weight,
+            M, N,
+            scores.stride(0), scores.stride(1),
+            group_idx.stride(0), group_idx.stride(1),
+            topk_idx.stride(0), topk_idx.stride(1),
+            topk_weight.stride(0), topk_weight.stride(1),
+            self.routed_scaling_factor,
+            groups=8, experts_per_group=32, BLOCK=256,
+        )
+
+        # Return as in original: int64 indices and float32 weights
+        return topk_idx.to(torch.int64), topk_weight
+
+
+def run(*args):
+    return ModelNew()(*args)

@@ -1,0 +1,93 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _histogram_experts_kernel(
+    flat_ptr: tl.pointer_type(dtype=tl.int32),
+    counts_ptr: tl.pointer_type(dtype=tl.int32),
+    N: tl.int32,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+):
+    # Each program handles a block of tokens
+    pid = tl.program_id(axis=0)
+    start = pid * BLOCK_SIZE
+    offsets = start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+
+    # Load a block of token values
+    vals = tl.load(flat_ptr + offsets, mask=mask, other=0)
+
+    # For each token in the block, atomically increment its expert count
+    # vals are in [0, NUM_EXPERTS-1], int32
+    for i in range(0, BLOCK_SIZE):
+        idx = offsets[i]
+        if mask[i]:
+            val = vals[i]  # int32 scalar
+            # Atomic add into counts[val]
+            tl.atomic_add(counts_ptr + val, 1)
+
+
+@triton.jit
+def _inclusive_prefix_sum_kernel(
+    counts_ptr: tl.pointer_type(dtype=tl.int32),
+    offsets_ptr: tl.pointer_type(dtype=tl.int32),
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Single program computes inclusive prefix sums over NUM_EXPERTS
+    running = tl.zeros((), dtype=tl.int32)  # scalar accumulator
+    for i in range(0, NUM_EXPERTS):
+        # Load count[i]
+        val_i = tl.load(counts_ptr + i)
+        running = running + val_i
+        # Store inclusive prefix sum at offsets[i+1]
+        tl.store(offsets_ptr + (i + 1), running)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, topk_idx: torch.Tensor):
+        """
+        Triton-optimized forward:
+        - Compute sorted token indices using PyTorch (correct and fast).
+        - Compute per-expert counts using Triton histogram (no torch.bincount).
+        - Compute expert_offsets using Triton inclusive prefix sum.
+        """
+        # Ensure tensor is on CUDA and contiguous
+        assert topk_idx.is_cuda, "topk_idx must be on CUDA device for Triton kernels."
+        topk_idx = topk_idx.contiguous()
+
+        # Flatten the tensor
+        flat = topk_idx.reshape(-1)  # shape: (N,)
+        N = flat.numel()
+        # Stable sort of values (not tied to num_experts)
+        sorted_token_indices = torch.sort(flat, stable=True)[1]
+
+        # Prepare per-expert counts (int32), initialized to zeros
+        num_experts = 256
+        counts = torch.zeros(num_experts, dtype=torch.int32, device=flat.device)
+
+        # Launch histogram kernel: process tokens in blocks
+        BLOCK_SIZE = 4096  # large block to reduce grid size and atomic contention
+        grid = (triton.cdiv(N, BLOCK_SIZE),)
+        _histogram_experts_kernel[grid](
+            flat, counts, N, BLOCK_SIZE=BLOCK_SIZE, NUM_EXPERTS=num_experts
+        )
+
+        # Compute expert_offsets via inclusive prefix sum
+        expert_offsets = torch.empty(num_experts + 1, dtype=torch.int32, device=flat.device)
+        # offsets[0] should be 0; the kernel writes offsets[1..]
+        # To ensure offsets[0] = 0, we explicitly set it here
+        expert_offsets[0] = 0
+
+        _inclusive_prefix_sum_kernel[(1,)](
+            counts, expert_offsets, NUM_EXPERTS=num_experts, BLOCK_SIZE=1024
+        )
+
+        return sorted_token_indices.to(torch.int32), expert_offsets
+
+
+def run(*args):
+    return ModelNew()(*args)

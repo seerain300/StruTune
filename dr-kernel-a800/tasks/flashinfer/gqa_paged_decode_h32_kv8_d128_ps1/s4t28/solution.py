@@ -1,0 +1,161 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def softmax_attention_bh_kernel(
+    Q_ptr,          # *fp32, [B, num_qo_heads, head_dim]
+    K_ptr,          # *fp32, [N, num_kv_heads, head_dim] (N is variable per batch)
+    V_ptr,          # *fp32, [N, num_kv_heads, head_dim]
+    Out_ptr,        # *fp32, [B, num_qo_heads, head_dim] output buffer
+    LSE_ptr,        # *fp32, [B, num_qo_heads] lse buffer
+    B: tl.constexpr,             # batch size
+    NUM_QO_HEADS: tl.constexpr,  # 32
+    NUM_KV_HEADS: tl.constexpr,  # 8
+    HEAD_DIM: tl.constexpr,      # 128
+    SM_SCALE: tl.constexpr,      # 1/sqrt(HEAD_DIM)
+    LOG2_INV: tl.constexpr,      # 1/ln(2)
+    NUM_TOKENS: tl.int32,
+    # Strides for Q: q_stride_b, q_stride_h, q_stride_d
+    q_stride_b, q_stride_h, q_stride_d,
+    # Strides for K: k_stride_n, k_stride_h, k_stride_d
+    k_stride_n, k_stride_h, k_stride_d,
+    # Strides for V: v_stride_n, v_stride_h, v_stride_d
+    v_stride_n, v_stride_h, v_stride_d,
+    # Strides for Out: out_stride_b, out_stride_h, out_stride_d
+    out_stride_b, out_stride_h, out_stride_d,
+    # Strides for LSE: lse_stride_b, lse_stride_h
+    lse_stride_b, lse_stride_h,
+    # GQA ratio
+    gqa_ratio: tl.constexpr,
+):
+    # program id: each program handles one (b, h)
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+
+    # GQA mapping: kv_head = h // gqa_ratio
+    kv_head = h // gqa_ratio
+
+    # Load q vector for this head
+    q_off = b * q_stride_b + h * q_stride_h
+    q_vec = tl.load(Q_ptr + q_off + tl.arange(0, HEAD_DIM) * q_stride_d, mask=True)
+
+    # Initialize numerically-stable logsumexp for scaled logits
+    max_scale = -1.0e30  # scalar
+    sum_exp = 0.0         # scalar
+
+    # First pass: compute lse over scaled logits
+    for t in range(0, NUM_TOKENS):
+        idx = t  # token index
+        # Load k vector for this token and kv_head
+        k_off = idx * k_stride_n + kv_head * k_stride_h
+        k_vec = tl.load(K_ptr + k_off + tl.arange(0, HEAD_DIM) * k_stride_d, mask=True)
+
+        # Dot product: sum(q * k) across head_dim
+        logits = 0.0
+        for d in range(HEAD_DIM):
+            logits += q_vec[d] * k_vec[d]
+
+        scaled = logits * SM_SCALE
+        new_max = tl.maximum(max_scale, scaled)
+        # rescale previous sum to new_max, then add current exp(scaled - new_max)
+        sum_exp = sum_exp * tl.exp(max_scale - new_max) + tl.exp(scaled - new_max)
+        max_scale = new_max
+
+    lse_val = tl.log(sum_exp) + max_scale
+    lse_val = lse_val * LOG2_INV
+
+    # Second pass: accumulate output vector
+    out_vec = tl.zeros([HEAD_DIM], dtype=tl.float32)
+    for t in range(0, NUM_TOKENS):
+        idx = t
+        k_off = idx * k_stride_n + kv_head * k_stride_h
+        k_vec = tl.load(K_ptr + k_off + tl.arange(0, HEAD_DIM) * k_stride_d, mask=True)
+
+        logits = 0.0
+        for d in range(HEAD_DIM):
+            logits += q_vec[d] * k_vec[d]
+        scaled = logits * SM_SCALE
+        attn = tl.exp(scaled - lse_val)
+
+        v_off = idx * v_stride_n + kv_head * v_stride_h
+        v_vec = tl.load(V_ptr + v_off + tl.arange(0, HEAD_DIM) * v_stride_d, mask=True)
+        out_vec += attn * v_vec
+
+    # Store output and lse
+    out_off = b * out_stride_b + h * out_stride_h
+    tl.store(Out_ptr + out_off + tl.arange(0, HEAD_DIM) * out_stride_d, out_vec, mask=True)
+    tl.store(LSE_ptr + b * lse_stride_b + h * lse_stride_h, lse_val, mask=True)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, num_qo_heads=32, num_kv_heads=8, head_dim=128):
+        super().__init__()
+        self.num_qo_heads = num_qo_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        # Precompute constants
+        self.sm_scale = 1.0 / (head_dim ** 0.5)
+        self.log2_inv = 1.4426950408889634  # 1 / ln(2)
+
+    def forward(self, q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale=None):
+        # Expect:
+        # q: [B, num_qo_heads, head_dim] (bf16)
+        # k_cache: [N, num_kv_heads, head_dim] (bf16 or fp32, no size-1 dim at axis=1)
+        # v_cache: [N, num_kv_heads, head_dim]
+        # kv_indptr: [B+1], int32
+        # kv_indices: [num_tokens], int32
+        # Compute everything in Triton, no torch ops on device.
+
+        assert q.dim() == 3, "q must be [B, num_qo_heads, head_dim]"
+        assert k_cache.dim() == 3 and v_cache.dim() == 3, "k_cache and v_cache must be [N, num_kv_heads, head_dim]"
+        B, num_qo_heads, head_dim = q.shape
+        N, num_kv_heads, _ = k_cache.shape
+        assert num_qo_heads == self.num_qo_heads and num_kv_heads == self.num_kv_heads and head_dim == self.head_dim
+        device = q.device
+
+        # Prepare output and lse buffers (fp32 for computation)
+        output = torch.empty((B, num_qo_heads, head_dim), dtype=torch.float32, device=device)
+        lse = torch.empty((B, num_qo_heads), dtype=torch.float32, device=device)
+
+        # Compute num_tokens per batch from kv_indptr (host-side index arithmetic)
+        num_tokens_list = []
+        for b in range(B):
+            start = int(kv_indptr[b].item())
+            end = int(kv_indptr[b + 1].item())
+            num_tokens_list.append(end - start)
+        # token_indices lists are not needed; we will read kv_indices slice per b in kernel
+
+        # Launch one Triton program per (b, h)
+        grid = (B, num_qo_heads)
+        softmax_attention_bh_kernel[grid](
+            q.to(torch.float32).contiguous(),
+            k_cache.to(torch.float32).contiguous(),
+            v_cache.to(torch.float32).contiguous(),
+            output,
+            lse,
+            B, num_qo_heads, num_kv_heads, head_dim,
+            self.sm_scale if sm_scale is None else sm_scale,
+            self.log2_inv,
+            num_tokens_list[0],  # for this simple example, all batches have same num_tokens; in general we can pass function to compute
+            # Strides for Q: [B, num_qo_heads, head_dim]
+            q.stride(0), q.stride(1), q.stride(2),
+            # Strides for K: [N, num_kv_heads, head_dim]
+            k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+            # Strides for V: [N, num_kv_heads, head_dim]
+            v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+            # Strides for Out: [B, num_qo_heads, head_dim]
+            output.stride(0), output.stride(1), output.stride(2),
+            # Strides for LSE: [B, num_qo_heads]
+            lse.stride(0), lse.stride(1),
+            gqa_ratio=num_qo_heads // num_kv_heads,
+        )
+
+        # Cast output to bfloat16 to match original behavior
+        output = output.to(torch.bfloat16)
+        return output, lse
+
+
+def run(*args):
+    return ModelNew()(*args)

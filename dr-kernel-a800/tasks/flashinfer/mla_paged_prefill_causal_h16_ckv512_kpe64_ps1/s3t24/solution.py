@@ -1,0 +1,211 @@
+import torch
+import triton
+import triton.language as tl
+
+
+# Triton kernel: compute per-head logits_scaled vector of length L for a given query i.
+# Inputs:
+#   qn_vec_ptr: *fp32, length H*K (flattened q_nope[q_abs])
+#   qp_vec_ptr: *fp32, length H*Kp (flattened q_pe[q_abs])
+#   Kc_ptr: *fp32, flattened [P*K] where P = number of tokens L, but we index by tok_idx[l]
+#   Kp_ptr: *fp32, flattened [P*Kp], index by tok_idx[l]
+#   tok_idx_ptr: *int32, length L
+#   out_vec_ptr: *fp32, length L to store logits_scaled
+# Runtime parameters:
+#   H, K, Kp, L
+#   head: constexpr for specialization
+@triton.jit
+def compute_logits_kernel(
+    qn_vec_ptr, qp_vec_ptr, Kc_ptr, Kp_ptr, tok_idx_ptr, out_vec_ptr,
+    H, K, Kp, L, stride_out_l,
+    head: tl.constexpr,
+):
+    # Each program computes a single l index (though Triton will run many programs).
+    # We'll iterate l from 0 to L-1 and store results.
+    for l in range(0, L):
+        idx = tl.load(tok_idx_ptr + l)  # token index for this position
+        # Accumulate over K features for q_nope
+        acc_qn = 0.0
+        for k in range(0, K):
+            qk = tl.load(qn_vec_ptr + head * K + k)
+            kc = tl.load(Kc_ptr + idx * K + k)  # Kc_all[tok_idx[l], k]
+            acc_qn += qk * kc
+        # Accumulate over Kp features for q_pe
+        acc_qp = 0.0
+        for kp in range(0, Kp):
+            qk = tl.load(qp_vec_ptr + head * Kp + kp)
+            kpval = tl.load(Kp_ptr + idx * Kp + kp)  # Kp_all[tok_idx[l], kp]
+            acc_qp += qk * kpval
+        logits_scaled = acc_qn + acc_qp
+        tl.store(out_vec_ptr + l, logits_scaled)
+
+
+# Triton kernel: compute softmax per head on a vector of length L, with causal mask.
+# We zero out invalid positions (l > prefix_len - 1) before reduction to avoid NaNs.
+# Inputs:
+#   in_ptr: *fp32, length L (logits_scaled[h, :])
+#   tok_idx_ptr: *int32, length L (not used for softmax, but kept for consistency)
+#   out_ptr: *fp32, length L (attn[h, :])
+# Runtime parameters:
+#   L, prefix_len, sm_scale
+#   head: constexpr
+@triton.jit
+def compute_softmax_kernel(
+    in_ptr, tok_idx_ptr, out_ptr,
+    L, prefix_len, sm_scale,
+    head: tl.constexpr,
+):
+    # Compute max for numerical stability
+    max_val = -float("inf")
+    for l in range(0, L):
+        val = tl.load(in_ptr + l)
+        if l > (prefix_len - 1):  # causal: invalid, zero it
+            val = -float("inf")
+        if val > max_val:
+            max_val = val
+
+    sum_exp = 0.0
+    for l in range(0, L):
+        val = tl.load(in_ptr + l)
+        if l > (prefix_len - 1):
+            val = -float("inf")
+        sum_exp += tl.exp(val - max_val)
+
+    ln2 = 1.4426950408889634  # 1 / ln(2)
+    inv_ln2 = 1.0 / ln2
+    for l in range(0, L):
+        val = tl.load(in_ptr + l)
+        if l > (prefix_len - 1):
+            val = -float("inf")
+        attn = tl.exp(val - max_val) / sum_exp
+        attn *= inv_ln2  # convert to base-2 logsumexp
+        tl.store(out_ptr + l, attn)
+
+
+# Triton kernel: compute output row for one head h: out[h, :] = attn[h, :] @ Kc_all[tok_idx[:], :]
+# Inputs:
+#   attn_ptr: *fp32, length L
+#   Kc_ptr: *fp32, flattened [P*K], where P = L, index by tok_idx[l]
+#   tok_idx_ptr: *int32, length L
+#   out_row_ptr: *fp32, length K
+# Runtime parameters:
+#   K, L
+#   head: constexpr (unused but kept for specialization)
+@triton.jit
+def compute_gemv_kernel(
+    attn_ptr, Kc_ptr, tok_idx_ptr, out_row_ptr,
+    K, L,
+    head: tl.constexpr,
+):
+    # Output vector is of length K; we compute it by accumulating across L tokens
+    for k in range(0, K):
+        acc = 0.0
+        for l in range(0, L):
+            attn_l = tl.load(attn_ptr + l)
+            if l > (L - 1):  # safety (always true), but we already masked invalid in softmax, so attn_l could be -inf; here we skip
+                continue
+            idx = tl.load(tok_idx_ptr + l)
+            kc = tl.load(Kc_ptr + idx * K + k)  # Kc_all[tok_idx[l], k]
+            acc += attn_l * kc
+        tl.store(out_row_ptr + k, acc)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale):
+        # Ensure tensors are on the same CUDA device
+        device = q_nope.device
+        assert q_nope.is_cuda and q_pe.is_cuda and ckv_cache.is_cuda and kpe_cache.is_cuda
+        assert qo_indptr.is_cuda and kv_indptr.is_cuda and kv_indices.is_cuda, "All tensors must be CUDA for Triton kernels."
+
+        # Squeeze caches to [P, K] and [P, Kp]
+        K = q_nope.shape[-1]  # head_dim_ckv = 512
+        Kp = q_pe.shape[-1]   # head_dim_kpe = 64
+        H = q_nope.shape[1]   # num_qo_heads = 16 (expected by original code)
+        P = ckv_cache.shape[0]  # number of cached tokens
+
+        Kc_all = ckv_cache.squeeze(1).contiguous().to(torch.float32)  # [P, K]
+        Kp_all = kpe_cache.squeeze(1).contiguous().to(torch.float32)  # [P, Kp]
+
+        total_q = q_nope.shape[0]
+        batch_size = int(kv_indptr[-1].item()) - int(kv_indptr[0].item())
+
+        # Allocate outputs
+        output = torch.empty(
+            (total_q, H, K), dtype=torch.bfloat16, device=device
+        )
+        lse = torch.empty(
+            (total_q, H), dtype=torch.float32, device=device
+        )
+
+        # Process each batch element
+        for b in range(batch_size):
+            q_start = int(qo_indptr[b].item())
+            q_end = int(qo_indptr[b + 1].item())
+            q_len = q_end - q_start
+            if q_len <= 0:
+                continue
+
+            page_beg = int(kv_indptr[b].item())
+            page_end = int(kv_indptr[b + 1].item())
+            L = max(0, (page_end - page_beg))
+            if L <= 0:
+                continue
+
+            # tok_idx: token indices for this batch element
+            tok_idx = kv_indices[page_beg:page_end].to(torch.int32).contiguous()
+
+            # Precompute prefix_len for causal mask: number of valid tokens before this query
+            # Note: prefix_len = L - q_len, valid positions are l <= prefix_len (i.e., l < L - q_len)
+            prefix_len = L - q_len
+
+            # Process each query i in this batch
+            for i in range(q_len):
+                q_abs = q_start + i
+                # Prepare qn_vec and qp_vec (flatten by head)
+                # q_nope[q_abs]: [H, K]
+                qn = q_nope[q_abs].contiguous().to(torch.float32)  # [H, K]
+                qn_vec = qn.view(-1).contiguous()  # [H*K]
+                # q_pe[q_abs]: [H, Kp]
+                qp = q_pe[q_abs].contiguous().to(torch.float32)  # [H, Kp]
+                qp_vec = qp.view(-1).contiguous()  # [H*Kp]
+
+                # Allocate vectors
+                logits_scaled = torch.empty((L,), dtype=torch.float32, device=device)
+                attn = torch.empty((L,), dtype=torch.float32, device=device)
+                out_row = torch.empty((K,), dtype=torch.float32, device=device)
+
+                # Launch compute_logits_kernel per head
+                for h in range(H):
+                    compute_logits_kernel[(1,)](
+                        qn_vec, qp_vec, Kc_all, Kp_all, tok_idx, logits_scaled,
+                        H=H, K=K, Kp=Kp, L=L, stride_out_l=1,
+                        head=h,
+                    )
+
+                    # Launch compute_softmax_kernel per head
+                    compute_softmax_kernel[(1,)](
+                        logits_scaled, tok_idx, attn,
+                        L=L, prefix_len=prefix_len, sm_scale=float(sm_scale),
+                        head=h,
+                    )
+
+                    # Launch compute_gemv_kernel to produce output row
+                    compute_gemv_kernel[(1,)](
+                        attn, Kc_all, tok_idx, out_row,
+                        K=K, L=L,
+                        head=h,
+                    )
+
+                    # Store outputs and lse
+                    # output[q_abs, h, :] in bfloat16
+                    output[q_abs, h, :] = out_row.to(torch.bfloat16)
+                    lse[q_abs, h] = torch.logsumexp(logits_scaled, dim=0) * (1.0 / 1.4426950408889634)  # base-2
+
+        return output, lse
+
+
+def run(*args):
+    return ModelNew()(*args)

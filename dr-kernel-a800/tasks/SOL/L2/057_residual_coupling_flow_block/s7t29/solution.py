@@ -1,0 +1,389 @@
+import math
+import torch
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+# Triton kernels
+if TRITON_AVAILABLE:
+    @triton.jit
+    def conv1d_forward_kernel(
+        x_ptr,         # *float32, input [N, C_IN, T_IN]
+        w_ptr,         # *float32, weights [C_OUT, C_IN, K]
+        b_ptr,         # *float32, bias [C_OUT]
+        y_ptr,         # *float32, output [N, C_OUT, T_OUT]
+        N, T_IN, T_OUT, C_IN: tl.constexpr, C_OUT: tl.constexpr, K: tl.constexpr, PAD: tl.constexpr,
+        x_stride_n, x_stride_c, x_stride_t,
+        w_stride_co, w_stride_ci, w_stride_k,
+        y_stride_n, y_stride_c, y_stride_t,
+        t_block_start: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+    ):
+        # Grid: (N, C_OUT, ceil_div(T_OUT, BLOCK_T))
+        pid_n = tl.program_id(0)
+        pid_co = tl.program_id(1)
+        pid_tb = tl.program_id(2)
+
+        # Time offsets this program computes
+        t_offsets = t_block_start + tl.arange(0, BLOCK_T)
+        t_mask = t_offsets < T_OUT
+
+        # Accumulator for this (n, co, t_block)
+        acc = tl.zeros([BLOCK_T], dtype=tl.float32)
+
+        # Loop over input channels and kernel taps
+        for ci in range(0, C_IN):
+            for k in range(0, K):
+                t_in = t_offsets + k - PAD
+                valid = (t_in >= 0) & (t_in < T_IN) & t_mask
+                # Load x[n, ci, t_in]
+                x_ptrs = x_ptr + pid_n * x_stride_n + ci * x_stride_c + t_in * x_stride_t
+                x_vals = tl.load(x_ptrs, mask=valid, other=0.0)
+                # Load weight w[co, ci, k]
+                w_ptrs = w_ptr + pid_co * w_stride_co + ci * w_stride_ci + k * w_stride_k
+                w_val = tl.load(w_ptrs)
+                # Accumulate
+                acc += x_vals * w_val
+
+        # Add bias for this output channel
+        b_val = tl.load(b_ptr + pid_co)
+        acc += b_val
+
+        # Store y[n, co, t_offsets]
+        y_ptrs = y_ptr + pid_n * y_stride_n + pid_co * y_stride_c + t_offsets * y_stride_t
+        tl.store(y_ptrs, acc, mask=t_mask)
+
+    @triton.jit
+    def relu_forward_kernel(
+        inp_ptr,        # *float32, input [N, C, T]
+        out_ptr,        # *float32, output [N, C, T]
+        N, C, T,
+        in_stride_n, in_stride_c, in_stride_t,
+        out_stride_n, out_stride_c, out_stride_t,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        # Grid: (N, C, ceil_div(T, BLOCK_SIZE))
+        pid_n = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        pid_t = tl.program_id(2)
+
+        t_offsets = pid_t * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        t_mask = t_offsets < T
+
+        in_ptrs = inp_ptr + pid_n * in_stride_n + pid_c * in_stride_c + t_offsets * in_stride_t
+        out_ptrs = out_ptr + pid_n * out_stride_n + pid_c * out_stride_c + t_offsets * out_stride_t
+
+        vals = tl.load(in_ptrs, mask=t_mask, other=0.0)
+        vals = tl.maximum(vals, 0.0)
+        tl.store(out_ptrs, vals, mask=t_mask)
+
+    @triton.jit
+    def concat_half_channels_kernel(
+        x0_ptr,         # *float32, [N, C_half, T]
+        x1_ptr,         # *float32, [N, C_half, T]
+        out_ptr,        # *float32, [N, 2*C_half, T]
+        N, C_half, T,
+        x0_stride_n, x0_stride_c, x0_stride_t,
+        x1_stride_n, x1_stride_c, x1_stride_t,
+        out_stride_n, out_stride_c, out_stride_t,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        # Grid: (N, 2*C_half, ceil_div(T, BLOCK_SIZE))
+        pid_n = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        pid_t = tl.program_id(2)
+
+        t_offsets = pid_t * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        t_mask = t_offsets < T
+
+        # first half: c in [0, C_half)
+        in_c = pid_c
+        if in_c < C_half:
+            in_ptrs = x0_ptr + pid_n * x0_stride_n + in_c * x0_stride_c + t_offsets * x0_stride_t
+            out_ptrs = out_ptr + pid_n * out_stride_n + in_c * out_stride_c + t_offsets * out_stride_t
+            vals = tl.load(in_ptrs, mask=t_mask, other=0.0)
+            tl.store(out_ptrs, vals, mask=t_mask)
+        # second half: c in [C_half, 2*C_half)
+        in_c = pid_c - C_half
+        if in_c >= 0:
+            in_ptrs = x1_ptr + pid_n * x1_stride_n + in_c * x1_stride_c + t_offsets * x1_stride_t
+            out_ptrs = out_ptr + pid_n * out_stride_n + (C_half + in_c) * out_stride_c + t_offsets * out_stride_t
+            vals = tl.load(in_ptrs, mask=t_mask, other=0.0)
+            tl.store(out_ptrs, vals, mask=t_mask)
+
+    @triton.jit
+    def affine_add_kernel(
+        x1_ptr,     # *float32, input [N, C_half, T] (the "x1" to be updated)
+        h_ptr,      # *float32, [N, C_half, T] (transform output to add)
+        out_ptr,    # *float32, [N, C_half, T]
+        N, C_half, T,
+        x1_stride_n, x1_stride_c, x1_stride_t,
+        h_stride_n, h_stride_c, h_stride_t,
+        out_stride_n, out_stride_c, out_stride_t,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        # Grid: (N, C_half, ceil_div(T, BLOCK_SIZE))
+        pid_n = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        pid_t = tl.program_id(2)
+
+        t_offsets = pid_t * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        t_mask = t_offsets < T
+
+        x1_ptrs = x1_ptr + pid_n * x1_stride_n + pid_c * x1_stride_c + t_offsets * x1_stride_t
+        h_ptrs = h_ptr + pid_n * h_stride_n + pid_c * h_stride_c + t_offsets * h_stride_t
+        out_ptrs = out_ptr + pid_n * out_stride_n + pid_c * out_stride_c + t_offsets * out_stride_t
+
+        x1_vals = tl.load(x1_ptrs, mask=t_mask, other=0.0)
+        h_vals = tl.load(h_ptrs, mask=t_mask, other=0.0)
+        out_vals = x1_vals + h_vals
+        tl.store(out_ptrs, out_vals, mask=t_mask)
+
+    @triton.jit
+    def affine_sub_kernel(
+        x1_ptr,     # *float32, input [N, C_half, T]
+        h_ptr,      # *float32, [N, C_half, T]
+        out_ptr,    # *float32, [N, C_half, T]
+        N, C_half, T,
+        x1_stride_n, x1_stride_c, x1_stride_t,
+        h_stride_n, h_stride_c, h_stride_t,
+        out_stride_n, out_stride_c, out_stride_t,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        # Grid: (N, C_half, ceil_div(T, BLOCK_SIZE))
+        pid_n = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        pid_t = tl.program_id(2)
+
+        t_offsets = pid_t * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        t_mask = t_offsets < T
+
+        x1_ptrs = x1_ptr + pid_n * x1_stride_n + pid_c * x1_stride_c + t_offsets * x1_stride_t
+        h_ptrs = h_ptr + pid_n * h_stride_n + pid_c * h_stride_c + t_offsets * h_stride_t
+        out_ptrs = out_ptr + pid_n * out_stride_n + pid_c * out_stride_c + t_offsets * out_stride_t
+
+        x1_vals = tl.load(x1_ptrs, mask=t_mask, other=0.0)
+        h_vals = tl.load(h_ptrs, mask=t_mask, other=0.0)
+        out_vals = x1_vals - h_vals
+        tl.store(out_ptrs, out_vals, mask=t_mask)
+
+    @triton.jit
+    def mask_mul_kernel(
+        inp_ptr,     # *float32, [N, C, T]
+        mask_ptr,    # *float32, [N, 1, T] (broadcast along channel)
+        out_ptr,     # *float32, [N, C, T]
+        N, C, T,
+        inp_stride_n, inp_stride_c, inp_stride_t,
+        mask_stride_n, mask_stride_t,  # mask has no channel stride
+        out_stride_n, out_stride_c, out_stride_t,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        # Grid: (N, C, ceil_div(T, BLOCK_SIZE))
+        pid_n = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        pid_t = tl.program_id(2)
+
+        t_offsets = pid_t * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        t_mask = t_offsets < T
+
+        inp_ptrs = inp_ptr + pid_n * inp_stride_n + pid_c * inp_stride_c + t_offsets * inp_stride_t
+        mask_ptrs = mask_ptr + pid_n * mask_stride_n + t_offsets * mask_stride_t
+        out_ptrs = out_ptr + pid_n * out_stride_n + pid_c * out_stride_c + t_offsets * out_stride_t
+
+        vals = tl.load(inp_ptrs, mask=t_mask, other=0.0)
+        m = tl.load(mask_ptrs, mask=t_mask, other=1.0)
+        vals = vals * m
+        tl.store(out_ptrs, vals, mask=t_mask)
+
+
+def conv1d_triton(x, w, b, padding=0, block_t=128):
+    # x: [N, C_in, T_in], w: [C_out, C_in, K], b: [C_out]
+    assert x.is_cuda and TRITON_AVAILABLE, "Input must be CUDA tensor for Triton conv"
+    N, C_in, T_in = x.shape
+    C_out, C_in_w, K = w.shape
+    assert C_in == C_in_w, "Weight C_in must match input channels"
+    T_out = T_in + 2 * padding
+    y = torch.empty((N, C_out, T_out), device=x.device, dtype=x.dtype)
+
+    grid = (N, C_out, triton.cdiv(T_out, block_t))
+    conv1d_forward_kernel[grid](
+        x, w, b, y,
+        N, T_in, T_out, C_in, C_out, K, padding,
+        x.stride(0), x.stride(1), x.stride(2),
+        w.stride(0), w.stride(1), w.stride(2),
+        y.stride(0), y.stride(1), y.stride(2),
+        block_t,
+        block_t,
+    )
+    return y
+
+
+def relu_triton(inp):
+    # inp: [N, C, T]
+    assert inp.is_cuda and TRITON_AVAILABLE, "Input must be CUDA tensor for Triton ReLU"
+    N, C, T = inp.shape
+    out = torch.empty_like(inp)
+    grid = (N, C, triton.cdiv(T, 256))
+    relu_forward_kernel[grid](
+        inp, out,
+        N, C, T,
+        inp.stride(0), inp.stride(1), inp.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        256,
+    )
+    return out
+
+
+def concat_half_channels_triton(x0, x1):
+    # x0: [N, C_half, T], x1: [N, C_half, T]
+    assert x0.is_cuda and x1.is_cuda and TRITON_AVAILABLE, "Inputs must be CUDA tensors for Triton concat"
+    N = x0.shape[0]
+    C_half = x0.shape[1]
+    T = x0.shape[2]
+    out = torch.empty((N, 2 * C_half, T), device=x0.device, dtype=x0.dtype)
+    grid = (N, 2 * C_half, triton.cdiv(T, 256))
+    concat_half_channels_kernel[grid](
+        x0, x1, out,
+        N, C_half, T,
+        x0.stride(0), x0.stride(1), x0.stride(2),
+        x1.stride(0), x1.stride(1), x1.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        256,
+    )
+    return out
+
+
+def affine_add_triton(x1, h):
+    # x1, h: [N, C_half, T]
+    assert x1.is_cuda and h.is_cuda and TRITON_AVAILABLE, "Inputs must be CUDA tensors for Triton affine add"
+    N, C_half, T = x1.shape
+    out = torch.empty_like(x1)
+    grid = (N, C_half, triton.cdiv(T, 256))
+    affine_add_kernel[grid](
+        x1, h, out,
+        N, C_half, T,
+        x1.stride(0), x1.stride(1), x1.stride(2),
+        h.stride(0), h.stride(1), h.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        256,
+    )
+    return out
+
+
+def affine_sub_triton(x1, h):
+    # x1, h: [N, C_half, T]
+    assert x1.is_cuda and h.is_cuda and TRITON_AVAILABLE, "Inputs must be CUDA tensors for Triton affine sub"
+    N, C_half, T = x1.shape
+    out = torch.empty_like(x1)
+    grid = (N, C_half, triton.cdiv(T, 256))
+    affine_sub_kernel[grid](
+        x1, h, out,
+        N, C_half, T,
+        x1.stride(0), x1.stride(1), x1.stride(2),
+        h.stride(0), h.stride(1), h.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        256,
+    )
+    return out
+
+
+def mask_mul_triton(inp, mask):
+    # inp: [N, C, T], mask: [N, 1, T]
+    assert inp.is_cuda and mask.is_cuda and TRITON_AVAILABLE, "Inputs must be CUDA tensors for Triton mask mul"
+    N, C, T = inp.shape
+    out = torch.empty_like(inp)
+    grid = (N, C, triton.cdiv(T, 256))
+    mask_mul_kernel[grid](
+        inp, mask, out,
+        N, C, T,
+        inp.stride(0), inp.stride(1), inp.stride(2),
+        mask.stride(0), mask.stride(1),
+        out.stride(0), out.stride(1), out.stride(2),
+        256,
+    )
+    return out
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        x,                                      # [N, C=192, T]
+        x_mask,                                # [N, 1, T]
+        reverse: bool,                        # True for reverse path
+        transform_0_conv0_weight,             # [C_out=192, C_in=96, K=5]
+        transform_0_conv0_bias,               # [C_out=192]
+        transform_0_conv1_weight,             # [C_out=192, C_in=192, K=5]
+        transform_0_conv1_bias,               # [C_out=192]
+        transform_0_conv2_weight,             # [C_out=96, C_in=192, K=5]
+        transform_0_conv2_bias,               # [C_out=96]
+        transform_1_conv0_weight,             # [192, 96, 5]
+        transform_1_conv0_bias,               # [192]
+        transform_1_conv1_weight,             # [192, 192, 5]
+        transform_1_conv1_bias,               # [192]
+        transform_1_conv2_weight,             # [96, 192, 5]
+        transform_1_conv2_bias,               # [96]
+        transform_2_conv0_weight,             # [192, 96, 5]
+        transform_2_conv0_bias,               # [192]
+        transform_2_conv1_weight,             # [192, 192, 5]
+        transform_2_conv1_bias,               # [192]
+        transform_2_conv2_weight,             # [96, 192, 5]
+        transform_2_conv2_bias,               # [96]
+        transform_3_conv0_weight,             # [192, 96, 5]
+        transform_3_conv0_bias,               # [192]
+        transform_3_conv1_weight,             # [192, 192, 5]
+        transform_3_conv1_bias,               # [192]
+        transform_3_conv2_weight,             # [96, 192, 5]
+        transform_3_conv2_bias,               # [96]
+    ):
+        # Ensure Triton is available and tensors are on CUDA
+        assert TRITON_AVAILABLE and x.is_cuda, "ModelNew requires CUDA tensors and Triton"
+        N, C, T = x.shape
+        assert C == 192, "Expected 192 channels for x"
+        half_channels = 96
+
+        # Helper to compute a single transform using Triton ops
+        def compute_transform(x0):
+            # conv0 -> ReLU -> conv1 -> ReLU -> conv2
+            # conv0: in=96, out=192, K=5, padding=2
+            y0 = conv1d_triton(x0, transform_0_conv0_weight, transform_0_conv0_bias, padding=2)
+            y0 = relu_triton(y0)
+            # conv1: in=192, out=192, K=5, padding=2
+            y1 = conv1d_triton(y0, transform_0_conv1_weight, transform_0_conv1_bias, padding=2)
+            y1 = relu_triton(y1)
+            # conv2: in=192, out=96, K=5, padding=2
+            h = conv1d_triton(y1, transform_0_conv2_weight, transform_0_conv2_bias, padding=2)
+            return h
+
+        # Forward loop: apply transforms sequentially
+        x0 = x[:, :half_channels, :]
+        x1 = x[:, half_channels:, :]
+        for _ in range(4):
+            h = compute_transform(x0)
+            # elementwise coupling: update x1
+            if reverse:
+                x1 = affine_sub_triton(x1, h)
+            else:
+                x1 = affine_add_triton(x1, h)
+            # Concatenate halves along channel dimension (Triton)
+            x = concat_half_channels_triton(x0, x1)
+            # Apply mask (broadcast along channel)
+            x = mask_mul_triton(x, x_mask)
+            # Prepare next split: current x becomes new x for next iteration
+            # We keep the same structure: x0 = first half channels, x1 = second half
+            # Since we concatenated and masked, split again
+            x0 = x[:, :half_channels, :]
+            x1 = x[:, half_channels:, :]
+
+        return x
+
+
+def run(*args):
+    return ModelNew()(*args)

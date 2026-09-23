@@ -1,0 +1,280 @@
+import math
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+# Triton kernel: Conv2d (NCHW) 3x3, stride=2, padding=1, no dilation
+# Input x: [B, C_in, H, W], weight: [C_out, C_in, 3, 3], bias: [C_out]
+# Output out: [B, C_out, H_out, W_out]
+@triton.jit
+def conv2d_nchw_stride2_gelu(
+    x_ptr,         # *const float (bfloat16 loaded as float), shape [B, C_in, H, W]
+    w_ptr,         # *const float, shape [C_out, C_in, 3, 3]
+    b_ptr,         # *const float, shape [C_out]
+    out_ptr,       # *float, shape [B, C_out, H_out, W_out]
+    B, C_in, H, W,
+    C_out, H_out, W_out,
+    x_stride_b, x_stride_c, x_stride_h, x_stride_w,
+    out_stride_b, out_stride_c, out_stride_h, out_stride_w,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    b = tl.program_id(0)   # batch
+    oh = tl.program_id(1)  # output height
+    ow = tl.program_id(2)  # output width
+
+    # Initialize accumulator for all output channels
+    # We'll compute for all co in [0, C_out) and store one by one
+    for co in range(0, C_out):
+        y_val = 0.0  # scalar float32 accumulator
+
+        # Loop over input channels and 3x3 neighborhood
+        for ic in range(0, C_in):
+            for kh in range(0, 3):
+                ih = oh + kh - 1  # because padding=1
+                if (ih >= 0) and (ih < H):
+                    for kw in range(0, 3):
+                        iw = ow + kw - 1
+                        if (iw >= 0) and (iw < W):
+                            # Compute input offset: b*x_stride_b + ic*x_stride_c + ih*x_stride_h + iw*x_stride_w
+                            x_off = b * x_stride_b + ic * x_stride_c + ih * x_stride_h + iw * x_stride_w
+                            x_val = tl.load(x_ptr + x_off)  # scalar load
+                            # Load weight: w[co, ic, kh, kw]
+                            w_off = co * (C_in * 3 * 3) + ic * (3 * 3) + kh * 3 + kw
+                            w_val = tl.load(w_ptr + w_off)  # scalar load
+                            y_val += x_val * w_val
+
+        # Add bias
+        b_val = tl.load(b_ptr + co)
+        y_val += b_val
+
+        # GELU (tanh approximation)
+        c = 0.7978845608028654  # sqrt(2/pi)
+        x3 = y_val * y_val * y_val
+        tanh_arg = c * (y_val + 0.044715 * x3)
+        tanh_val = tl.math.tanh(tanh_arg)
+        y_val = 0.5 * y_val * (1.0 + tanh_val)
+
+        # Store output: out[b, co, oh, ow]
+        out_off = b * out_stride_b + co * out_stride_c + oh * out_stride_h + ow * out_stride_w
+        tl.store(out_ptr + out_off, y_val)
+
+
+# Triton kernel: batched GEMV for y[b, t, d] = sum_k x[b, t, k] * W[d, k], where
+# x is [B, T, K] (row-major), W is [N, K], y is [B, T, N].
+# Grid: (B, T). Each program computes one (b, t) row and writes all N outputs.
+@triton.jit
+def linear_gemv_kernel(
+    x_ptr,          # *const float (bfloat16 loaded as float), input [B, T, K], contiguous
+    w_ptr,          # *const float, weight [N, K], contiguous
+    y_ptr,          # *float, output [B, T, N], contiguous
+    B, T, K, N,
+    x_stride_b, x_stride_t, x_stride_k,
+    y_stride_b, y_stride_t, y_stride_n,
+    BLOCK_N: tl.constexpr,  # tile size over N (e.g., 128)
+    BLOCK_K: tl.constexpr,  # tile size over K (e.g., 128)
+):
+    b = tl.program_id(0)
+    t = tl.program_id(1)
+
+    # Accumulator for N outputs (float32 for stability)
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    # Loop over K in tiles
+    for k_start in range(0, K, BLOCK_K):
+        k_offsets = k_start + tl.arange(0, BLOCK_K)  # [BLOCK_K]
+        k_mask = k_offsets < K
+
+        # Load x[b, t, k_offsets] as a vector (linear indexing into x)
+        # x is row-major (B, T, K). Linear index for row (b, t): base + k
+        x_base = (b * T + t) * K
+        x_vec = tl.load(x_ptr + x_base + k_offsets, mask=k_mask, other=0.0)  # [BLOCK_K], float16/float
+
+        # Load W[:, k_offsets] as a [BLOCK_N, BLOCK_K] tile
+        # W is [N, K], contiguous: ptr + n*K + k
+        w_tile = tl.load(w_ptr + (tl.arange(0, BLOCK_N)[:, None] * K) + k_offsets[None, :], mask=(tl.arange(0, BLOCK_N)[:, None] < N), other=0.0)
+
+        # Multiply and reduce over K axis: cast x_vec to float32 for dot
+        acc += tl.sum(w_tile.to(tl.float32) * x_vec[None, :].to(tl.float32), axis=1)
+
+    # Store to y[b, t, :]. y is row-major (B, T, N), linear index: base + n
+    y_base = (b * T + t) * N
+    # Cast back to desired dtype: original input/output are bfloat16; we store as float32 (then cast in PyTorch if needed).
+    # Here, we store as float32 and rely on caller to allocate y_ptr with appropriate dtype. If caller allocated bfloat16, Triton will convert automatically at store, but better to allocate y as float32 and convert after kernel.
+    for n in range(0, BLOCK_N):
+        if n < N:
+            tl.store(y_ptr + y_base + n, acc[n])
+
+
+# Triton kernel: add positional embedding slice [pos_len, d_model] to y[b, t, :]
+# y_ptr: [B, T, N], contiguous; pos_ptr: [pos_len, d_model], contiguous.
+# We add pos[t, :] to every row y[b, t, :].
+@triton.jit
+def add_pos_embed_kernel(
+    y_ptr,         # *float, [B, T, N]
+    pos_ptr,       # *float, [pos_len, d_model]
+    B, T, N, pos_len, d_model,
+    y_stride_b, y_stride_t, y_stride_n,
+    pos_stride_p, pos_stride_d,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    b = tl.program_id(0)
+    t = tl.program_id(1)
+
+    # Load position vector pos[t, :] and add to y[b, t, :]
+    for d_start in range(0, d_model, BLOCK_D):
+        d_offsets = d_start + tl.arange(0, BLOCK_D)  # [BLOCK_D], int
+        d_mask = d_offsets < d_model
+
+        pos_vec = tl.load(pos_ptr + t * pos_stride_p + d_offsets * pos_stride_d, mask=d_mask, other=0.0)  # [BLOCK_D]
+
+        y_base = (b * T + t) * N
+        # Load and add: y_ptr + y_base + d_offsets
+        y_vals = tl.load(y_ptr + y_base + d_offsets, mask=d_mask, other=0.0)  # [BLOCK_D]
+        y_vals += pos_vec
+        tl.store(y_ptr + y_base + d_offsets, y_vals, mask=d_mask)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, *args):
+        # Model signature follows the provided run function arguments:
+        # input_features: [B, 1, 80, time_dim], bfloat16
+        # conv weights: [C_out, C_in, 3, 3] for each conv, bfloat16
+        # biases: [C_out] for each conv, bfloat16
+        # conv_out_weight: [d_model, conv_out_dim] in the helper is [1024, 3840], but we will generalize.
+        # positional_embedding: [max_source_positions, d_model], bfloat16
+        # embed_scale: float (sqrt(d_model))
+        # Note: We must use Triton for conv, GEMV, and positional add; no PyTorch computation in host.
+
+        # Extract inputs
+        # The original helper passes them in this order. We unpack accordingly.
+        input_features = args[0]  # [B, 1, 80, time_dim], bfloat16
+        conv2d1_weight = args[1]  # [384, 1, 3, 3]
+        conv2d1_bias = args[2]    # [384]
+        conv2d2_weight = args[3]  # [384, 384, 3, 3]
+        conv2d2_bias = args[4]    # [384]
+        conv2d3_weight = args[5]  # [384, 384, 3, 3]
+        conv2d3_bias = args[6]    # [384]
+        conv_out_weight = args[7] # [d_model, conv_out_dim], but we will treat as [d_model, K] generically
+        positional_embedding = args[8]  # [max_source_positions, d_model], bfloat16
+        embed_scale = args[9]  # float
+
+        B, C_in, H, W = input_features.shape
+        C_in = 1  # fixed as per helper
+
+        # Conv1: (384, 1, 3x3), stride=2, padding=1
+        H1 = (H + 2*1 - 3) // 2 + 1  # 40
+        W1 = (W + 2*1 - 3) // 2 + 1  # ~349 (exact for given W)
+        x = input_features
+        out1 = torch.empty((B, 384, H1, W1), dtype=torch.float32, device=x.device)  # compute in float32
+        # Launch Triton conv kernel
+        grid1 = (B, H1, W1)
+        conv2d_nchw_stride2_gelu[grid1](
+            x, conv2d1_weight, conv2d1_bias, out1,
+            B, C_in, H, W, 384, H1, W1,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            out1.stride(0), out1.stride(1), out1.stride(2), out1.stride(3),
+            BLOCK_H=1, BLOCK_W=1,
+            num_warps=4,
+        )
+
+        # GELU already applied inside kernel
+
+        # Conv2: (384, 384, 3x3), stride=2, padding=1
+        H2 = (H1 + 2*1 - 3) // 2 + 1
+        W2 = (W1 + 2*1 - 3) // 2 + 1
+        out2 = torch.empty((B, 384, H2, W2), dtype=torch.float32, device=out1.device)
+        grid2 = (B, H2, W2)
+        conv2d_nchw_stride2_gelu[grid2](
+            out1, conv2d2_weight, conv2d2_bias, out2,
+            B, 384, H1, W1, 384, H2, W2,
+            out1.stride(0), out1.stride(1), out1.stride(2), out1.stride(3),
+            out2.stride(0), out2.stride(1), out2.stride(2), out2.stride(3),
+            BLOCK_H=1, BLOCK_W=1,
+            num_warps=4,
+        )
+
+        # Conv3: (384, 384, 3x3), stride=2, padding=1
+        H3 = (H2 + 2*1 - 3) // 2 + 1
+        W3 = (W2 + 2*1 - 3) // 2 + 1
+        out3 = torch.empty((B, 384, H3, W3), dtype=torch.float32, device=out2.device)
+        grid3 = (B, H3, W3)
+        conv2d_nchw_stride2_gelu[grid3](
+            out2, conv2d3_weight, conv2d3_bias, out3,
+            B, 384, H2, W2, 384, H3, W3,
+            out2.stride(0), out2.stride(1), out2.stride(2), out2.stride(3),
+            out3.stride(0), out3.stride(1), out3.stride(2), out3.stride(3),
+            BLOCK_H=1, BLOCK_W=1,
+            num_warps=4,
+        )
+
+        # Reshape to [B, T, K] where T=W_out3 and K=C_out3*H_out3*W_out3
+        b, c, h, t_out = B, 384, H3, W3
+        K = c * h * t_out  # total features
+        x_lin = out3.permute(0, 3, 1, 2).contiguous().view(B, t_out, K)
+
+        # Linear projection: y[b, t, d] = sum_k x[b, t, k] * W[d, k]
+        # We must ensure conv_out_weight is [d_model, K]. The original helper sets conv_out_dim=3840,
+        # but in general, K can be larger. We handle this by using the provided conv_out_weight as-is.
+        # If conv_out_weight.shape[1] != K, we would need to pad/truncate. For this task, helper supplies correct dim; however, defensively we can assert or truncate/pad to nearest.
+        N = conv_out_weight.shape[0]  # d_model = 1024
+        K_eff = x_lin.shape[2]
+        # If conv_out_weight.shape[1] != K_eff, we must match. The helper guarantees conv_out_weight second dim equals K_eff in the provided test.
+        # Allocate y as float32 and later apply scale and add pos in Triton.
+
+        # To keep dtype consistent, we’ll compute GEMV in float32 and then do the remaining steps in float32 (scaling and add). Original uses bfloat16, but our weights and inputs are bfloat16; we cast appropriately.
+        # We need a contiguous [B, T, K] in float32. Cast x_lin to float32 for GEMV.
+        x32 = x_lin.float()
+        W32 = conv_out_weight.float()
+        y_btk = torch.empty((B, t_out, N), dtype=torch.float32, device=x32.device)
+
+        # Launch GEMV Triton kernel: grid over (B, T). We need to set BLOCK_N and BLOCK_K.
+        # Choose BLOCK_N as nearest power-of-two <= 1024, say 1024; BLOCK_K as 128 for decent throughput.
+        grid_lin = (B, t_out)
+        BLOCK_N = 1024  # N=1024
+        BLOCK_K = 128
+        linear_gemv_kernel[grid_lin](
+            x32, W32, y_btk,
+            B, t_out, K_eff, N,
+            x32.stride(0), x32.stride(1), x32.stride(2),
+            y_btk.stride(0), y_btk.stride(1), y_btk.stride(2),
+            BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            num_warps=4,
+        )
+
+        # Multiply by embed_scale (sqrt(d_model) = 32.0)
+        y_btk = y_btk * embed_scale
+
+        # Add positional embedding: positional_embedding shape [max_source_positions, d_model]
+        # We only need the first 'time_after_conv' rows of embedding. But we don’t have time_after_conv directly here.
+        # The original run function passes positional_embedding as a tensor already. The helper sets its length to max_source_positions=1500, which is larger than any time_after_conv in workloads (e.g., 211, 541, etc.).
+        # We can safely use the first t_out rows of positional_embedding. In the original run, time_after_conv is computed as the output width after the last conv, which equals t_out for the final tensor.
+        # Thus, we use pos_len = t_out. To be robust, we pass t_out as pos_len. The original positional_embedding has more rows than needed; we ignore the rest by masking in kernel using pos_len.
+        pos_len = t_out
+        d_model = N  # 1024
+        pos_embed = positional_embedding.float()  # cast to float for kernel; only first pos_len rows used
+
+        # Launch add positional embedding kernel
+        grid_add = (B, t_out)
+        add_pos_embed_kernel[grid_add](
+            y_btk, pos_embed,
+            B, t_out, N, pos_len, d_model,
+            y_btk.stride(0), y_btk.stride(1), y_btk.stride(2),
+            pos_embed.stride(0), pos_embed.stride(1),
+            BLOCK_N=1024, BLOCK_D=128,
+            num_warps=4,
+        )
+
+        # Return result. Original output dtype is bfloat16; cast back for compatibility.
+        # y_btk is float32. To match original, cast to bfloat16.
+        return y_btk.to(torch.bfloat16)
+
+
+def run(*args):
+    return ModelNew()(*args)

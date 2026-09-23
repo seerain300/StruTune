@@ -1,0 +1,237 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv3x3_nchw_4d(x_ptr, w_ptr, y_ptr,
+                    N, C_in, H, W,
+                    x_sN, x_sC, x_sH, x_sW,
+                    w_sCo, w_sCi, w_sKh, w_sKw,
+                    y_sN, y_sC, y_sH, y_sW,
+                    BLOCK_CIN: tl.constexpr):
+    # One program computes one output element y[n, co, h, w]
+    pid_n = tl.program_id(0)
+    pid_co = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    pid_w = tl.program_id(3)
+
+    acc = tl.zeros((), dtype=tl.float32)
+
+    # Loop over input channels and 3x3 neighborhood
+    for ci in range(0, C_in):
+        for kh in range(0, 3):
+            for kw in range(0, 3):
+                h_in = pid_h + kh
+                w_in = pid_w + kw
+                in_h = (h_in >= 0) & (h_in < H)
+                in_w = (w_in >= 0) & (w_in < W)
+                if in_h and in_w:
+                    x_offset = pid_n * x_sN + ci * x_sC + h_in * x_sH + w_in * x_sW
+                    x_val = tl.load(x_ptr + x_offset)
+                else:
+                    x_val = 0.0
+
+                w_offset = pid_co * w_sCo + ci * w_sCi + kh * w_sKh + kw * w_sKw
+                w_val = tl.load(w_ptr + w_offset)
+                acc += x_val * w_val
+
+    y_offset = pid_n * y_sN + pid_co * y_sC + pid_h * y_sH + pid_w * y_sW
+    tl.store(y_ptr + y_offset, acc)
+
+
+@triton.jit
+def conv3x3_nchw_3d(x_ptr, w_ptr, y_ptr,
+                    N, C_in, H, W,
+                    x_sN, x_sC, x_sH, x_sW,
+                    w_sCo, w_sCi, w_sKh, w_sKw,
+                    y_sN, y_sC, y_sH, y_sW,
+                    BLOCK_CIN: tl.constexpr):
+    # One program computes y[n, co, h, w] for a flattened (h, w) index
+    pid_n = tl.program_id(0)
+    pid_co = tl.program_id(1)
+    hw = tl.program_id(2)  # flattened spatial index
+    h = hw // W
+    w = hw % W
+
+    acc = tl.zeros((), dtype=tl.float32)
+
+    for ci in range(0, C_in):
+        for kh in range(0, 3):
+            for kw in range(0, 3):
+                h_in = h + kh
+                w_in = w + kw
+                in_h = (h_in >= 0) & (h_in < H)
+                in_w = (w_in >= 0) & (w_in < W)
+                if in_h and in_w:
+                    x_offset = pid_n * x_sN + ci * x_sC + h_in * x_sH + w_in * x_sW
+                    x_val = tl.load(x_ptr + x_offset)
+                else:
+                    x_val = 0.0
+
+                w_offset = pid_co * w_sCo + ci * w_sCi + kh * w_sKh + kw * w_sKw
+                w_val = tl.load(w_ptr + w_offset)
+                acc += x_val * w_val
+
+    y_offset = pid_n * y_sN + pid_co * y_sC + h * y_sH + w * y_sW
+    tl.store(y_ptr + y_offset, acc)
+
+
+@triton.jit
+def groupnorm_reduce_sums(y_ptr, sums_ptr,
+                           N, C, H, W, groups,
+                           y_sN, y_sC, y_sH, y_sW):
+    # Grid over (N, groups). Compute per-(n, group) sum and sumsq.
+    pid_n = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    group_size_c = C // groups
+    start_c = pid_g * group_size_c
+
+    sum_val = tl.zeros((), dtype=tl.float32)
+    sumsq_val = tl.zeros((), dtype=tl.float32)
+
+    for c in range(start_c, start_c + group_size_c):
+        for h in range(0, H):
+            for w in range(0, W):
+                y_offset = pid_n * y_sN + c * y_sC + h * y_sH + w * y_sW
+                val = tl.load(y_ptr + y_offset)
+                sum_val += val
+                sumsq_val += val * val
+
+    base = pid_n * groups + pid_g
+    tl.store(sums_ptr + base * 2 + 0, sum_val)
+    tl.store(sums_ptr + base * 2 + 1, sumsq_val)
+
+
+@triton.jit
+def groupnorm_apply_affine_silu(y_ptr, sums_ptr, gamma_ptr, beta_ptr, out_ptr,
+                                N, C, H, W, groups, eps,
+                                y_sN, y_sC, y_sH, y_sW,
+                                out_sN, out_sC, out_sH, out_sW):
+    # Grid over (N, C). For each (n, c), apply GroupNorm and SiLU.
+    pid_n = tl.program_id(0)
+    pid_c = tl.program_id(1)
+
+    group_size_c = C // groups
+    group = pid_c // group_size_c  # integer division
+
+    sum_ptr = sums_ptr + (pid_n * groups + group) * 2 + 0
+    sum_val = tl.load(sum_ptr)
+    sumsq_ptr = sums_ptr + (pid_n * groups + group) * 2 + 1
+    sumsq_val = tl.load(sums_ptr + (pid_n * groups + group) * 2 + 1)
+
+    M = H * W
+    mean = sum_val / M
+    var = sumsq_val / M - mean * mean
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    gamma = tl.load(gamma_ptr + pid_c)
+    beta = tl.load(beta_ptr + pid_c)
+
+    for h in range(0, H):
+        for w in range(0, W):
+            y_offset = pid_n * y_sN + pid_c * y_sC + h * y_sH + w * y_sW
+            y_val = tl.load(y_ptr + y_offset)
+            norm = (y_val - mean) * rstd
+            z = norm * gamma + beta
+            # SiLU: z * sigmoid(z)
+            s = 1.0 / (1.0 + tl.exp(-z))
+            out_val = z * s
+            out_offset = pid_n * out_sN + pid_c * out_sC + h * out_sH + w * out_sW
+            tl.store(out_ptr + out_offset, out_val)
+
+
+@triton.jit
+def add_residual_kernel(y_ptr, x_ptr, out_ptr, total_elems: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid < total_elems:
+        y_val = tl.load(y_ptr + pid)
+        x_val = tl.load(x_ptr + pid)
+        tl.store(out_ptr + pid, y_val + x_val)
+
+
+def _triton_conv3x3(x, weight, out):
+    # x: (N, C_in, H, W), weight: (C_out, C_in, 3, 3), out: (N, C_out, H, W)
+    assert x.is_cuda and weight.is_cuda, "Triton conv requires CUDA tensors"
+    x = x.contiguous().to(torch.float32)
+    w = weight.contiguous().to(torch.float32)
+    N, C_in, H, W = x.shape
+    C_out = w.shape[0]
+
+    y = out  # provided output tensor
+    grid = (N, C_out, H, W)
+    conv3x3_nchw_4d[grid](x, w, y, N, C_in, H, W,
+                          x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+                          w.stride(0), w.stride(1), w.stride(2), w.stride(3),
+                          y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+                          C_in, num_warps=1, num_stages=1)
+
+
+def _triton_groupnorm(y, sums, gamma, beta, out, groups, eps):
+    # y: (N, C, H, W), sums: (N, groups, 2), gamma: (C,), beta: (C,), out: (N, C, H, W)
+    assert y.is_cuda and gamma.is_cuda and beta.is_cuda, "Triton GroupNorm requires CUDA tensors"
+    y32 = y.contiguous().to(torch.float32)
+    N, C, H, W = y32.shape
+    # sums is (N, groups, 2): we compute base index per (n, group) and store/load pairs
+    grid_reduce = (N, groups)
+    groupnorm_reduce_sums[grid_reduce](y32, sums, N, C, H, W, groups,
+                                       y32.stride(0), y32.stride(1), y32.stride(2), y32.stride(3),
+                                       num_warps=1, num_stages=1)
+
+    # apply affine and SiLU
+    grid_apply = (N, C)
+    groupnorm_apply_affine_silu[grid_apply](y32, sums, gamma.contiguous(), beta.contiguous(), out,
+                                            N, C, H, W, groups, eps,
+                                            y32.stride(0), y32.stride(1), y32.stride(2), y32.stride(3),
+                                            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+                                            num_warps=1, num_stages=1)
+
+
+def _triton_add_residual(y, x, out):
+    # y: (N, C, H, W), x: (N, C, H, W) same shape, out: (N, C, H, W)
+    assert y.is_cuda and x.is_cuda, "Triton add requires CUDA tensors"
+    y32 = y.contiguous().to(torch.float32)
+    x32 = x.contiguous().to(torch.float32)
+    total_elems = y32.numel()
+    out = torch.empty_like(y32)
+    grid = (total_elems,)
+    add_residual_kernel[grid](y32, x32, out, total_elems, num_warps=1, num_stages=1)
+    return out
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, x: torch.Tensor,
+                conv1_weight: torch.Tensor,
+                norm1_weight: torch.Tensor,
+                norm1_bias: torch.Tensor,
+                conv2_weight: torch.Tensor,
+                norm2_weight: torch.Tensor,
+                norm2_bias: torch.Tensor,
+                eps: float):
+        # Ensure CUDA tensors
+        assert x.is_cuda, "Input must be on CUDA for Triton kernels"
+        # First path: Conv3x3 -> GroupNorm -> SiLU
+        y1 = torch.empty_like(x, dtype=torch.float32, device=x.device)
+        _triton_conv3x3(x, conv1_weight, y1)
+
+        sums1 = torch.empty((x.shape[0], 32, 2), dtype=torch.float32, device=x.device)
+        out1 = torch.empty_like(x, dtype=torch.float32, device=x.device)
+        _triton_groupnorm(y1, sums1, norm1_weight, norm1_bias, out1, 32, eps)
+
+        # Second path: Conv3x3 -> GroupNorm -> SiLU
+        y2 = torch.empty_like(x, dtype=torch.float32, device=x.device)
+        _triton_conv3x3(out1, conv2_weight, y2)
+
+        sums2 = torch.empty((x.shape[0], 32, 2), dtype=torch.float32, device=x.device)
+        out2 = torch.empty_like(x, dtype=torch.float32, device=x.device)
+        _triton_groupnorm(y2, sums2, norm2_weight, norm2_bias, out2, 32, eps)
+
+        # Residual connection
+        out = _triton_add_residual(out2, x, out2)
+
+        return out
+
+
+def run(*args):
+    return ModelNew()(*args)

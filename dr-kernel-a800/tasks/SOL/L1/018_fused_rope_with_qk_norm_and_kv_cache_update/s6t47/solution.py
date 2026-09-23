@@ -1,0 +1,290 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def rms_sum_kernel(x_ptr, sum_ptr,
+                    B: tl.constexpr, NUM_HEADS: tl.constexpr, S: tl.constexpr, H: tl.constexpr,
+                    stride_b, stride_h, stride_s,
+                    sum_stride,
+                    BLOCK_H: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid >= B * NUM_HEADS * S:
+        return
+    b = pid // (NUM_HEADS * S)
+    h = (pid % (NUM_HEADS * S)) // S
+    s = pid % S
+
+    acc = 0.0
+    for off in range(0, H, BLOCK_H):
+        idx = off + tl.arange(0, BLOCK_H)
+        mask = idx < H
+        x_offs = b * stride_b + h * stride_h + s * stride_s + idx
+        x_vals = tl.load(x_ptr + x_offs, mask=mask, other=0.0)
+        x_vals = x_vals.to(tl.float32)
+        acc += tl.sum(x_vals * x_vals, axis=0)
+    tl.store(sum_ptr + pid, acc)
+
+
+@triton.jit
+def rms_norm_kernel(x_ptr, w_ptr, out_ptr, sum_ptr,
+                     B: tl.constexpr, NUM_HEADS: tl.constexpr, S: tl.constexpr, H: tl.constexpr,
+                     stride_b_x, stride_h_x, stride_s_x,
+                     stride_b_out, stride_h_out, stride_s_out,
+                     stride_b_sum, eps: tl.float32,
+                     BLOCK_H: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid >= B * NUM_HEADS * S:
+        return
+    b = pid // (NUM_HEADS * S)
+    h = (pid % (NUM_HEADS * S)) // S
+    s = pid % S
+
+    sum_val = tl.load(sum_ptr + pid)  # already float32
+    inv_rms = 1.0 / tl.sqrt(sum_val / H + eps)
+
+    for off in range(0, H, BLOCK_H):
+        idx = off + tl.arange(0, BLOCK_H)
+        mask = idx < H
+        x_offs = b * stride_b_x + h * stride_h_x + s * stride_s_x + idx
+        x_vals = tl.load(x_ptr + x_offs, mask=mask, other=0.0).to(tl.float32)
+        w_vals = tl.load(w_ptr + idx, mask=mask, other=1.0).to(tl.float32)
+        y = x_vals * inv_rms * w_vals
+        # Cast to output dtype inferred from out_ptr element (bf16)
+        y = y.to(tl.bfloat16)
+        out_offs = b * stride_b_out + h * stride_h_out + s * stride_s_out + idx
+        tl.store(out_ptr + out_offs, y, mask=mask)
+
+
+@triton.jit
+def rotate_sin_cos_kernel_b_s(position_ids_ptr, inv_freq_ptr,
+                               cos_ptr, sin_ptr,
+                               B: tl.constexpr, S: tl.constexpr, H: tl.constexpr, HALF: tl.constexpr,
+                               stride_pos,
+                               cos_stride0, cos_stride1, cos_stride2,
+                               sin_stride0, sin_stride1, sin_stride2,
+                               BLOCK_H: tl.constexpr):
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+    if b >= B or s >= S:
+        return
+
+    pos = tl.load(position_ids_ptr + b * stride_pos).to(tl.float32)
+
+    # Build emb of length H: first half uses inv_freq[i//2], second half duplicates
+    for off in range(0, H, BLOCK_H):
+        idx = off + tl.arange(0, BLOCK_H)
+        mask = idx < H
+        first_mask = idx < HALF
+        second_mask = idx >= HALF
+
+        # First half
+        inv_freq_idx = idx // 2
+        inv_freq_vals = tl.load(inv_freq_ptr + inv_freq_idx, mask=first_mask, other=0.0).to(tl.float32)
+        emb_first = pos * inv_freq_vals
+
+        # Second half duplicates first_half
+        emb = tl.where(first_mask, emb_first, emb_first)
+
+        c = tl.cos(emb)
+        s_ = tl.sin(emb)
+
+        base = b * cos_stride0 + s * cos_stride1
+        tl.store(cos_ptr + base + idx * cos_stride2, c, mask=mask)
+        tl.store(sin_ptr + base + idx * sin_stride2, s_, mask=mask)
+
+
+@triton.jit
+def apply_rotation_kernel(x_ptr, cos_ptr, sin_ptr, out_ptr,
+                           B: tl.constexpr, NUM_HEADS: tl.constexpr, S: tl.constexpr, H: tl.constexpr, HALF: tl.constexpr,
+                           stride_b_x, stride_h_x, stride_s_x,
+                           stride_b_out, stride_h_out, stride_s_out,
+                           cos_stride0, cos_stride1, cos_stride2,
+                           sin_stride0, sin_stride1, sin_stride2,
+                           BLOCK_H: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid >= B * NUM_HEADS * S:
+        return
+    b = pid // (NUM_HEADS * S)
+    h = (pid % (NUM_HEADS * S)) // S
+    s = pid % S
+
+    base = b * cos_stride0 + s * cos_stride1
+
+    for off in range(0, H, BLOCK_H):
+        idx = off + tl.arange(0, BLOCK_H)
+        mask = idx < H
+
+        x_offs = b * stride_b_x + h * stride_h_x + s * stride_s_x + idx
+        x_vals = tl.load(x_ptr + x_offs, mask=mask, other=0.0).to(tl.float32)
+
+        cos_vals = tl.load(cos_ptr + base + idx * cos_stride2, mask=mask, other=0.0).to(tl.float32)
+        sin_vals = tl.load(sin_ptr + base + idx * sin_stride2, mask=mask, other=0.0).to(tl.float32)
+
+        # Build rotated
+        rotated_first = -tl.load(x_ptr + x_offs, mask=(idx < HALF), other=0.0).to(tl.float32)
+        rotated_second = tl.load(x_ptr + x_offs, mask=(idx >= HALF), other=0.0).to(tl.float32)
+
+        # rotated = [rotated_first, rotated_second]
+        rotated = tl.zeros_like(idx, dtype=tl.float32)
+        rotated = tl.where(idx < HALF, rotated_first, rotated)
+        rotated = tl.where(idx >= HALF, rotated_second, rotated)
+
+        y = x_vals * cos_vals + rotated * sin_vals
+        y = y.to(tl.bfloat16)
+
+        out_offs = b * stride_b_out + h * stride_h_out + s * stride_s_out + idx
+        tl.store(out_ptr + out_offs, y, mask=mask)
+
+
+@triton.jit
+def update_cache_kernel(key_ptr, value_ptr, key_cache_ptr, value_cache_ptr, cache_pos_ptr,
+                         B: tl.constexpr, NUM_HEADS: tl.constexpr, S: tl.constexpr, H: tl.constexpr,
+                         stride_b_key, stride_h_key, stride_s_key,
+                         stride_b_val, stride_h_val, stride_s_val,
+                         stride_b_key_cache, stride_h_key_cache, stride_pos_key_cache,
+                         stride_b_val_cache, stride_h_val_cache, stride_pos_val_cache,
+                         BLOCK_H: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid >= B * NUM_HEADS * S:
+        return
+    b = pid // (NUM_HEADS * S)
+    h = (pid % (NUM_HEADS * S)) // S
+    s = pid % S
+
+    dest = tl.load(cache_pos_ptr + s).to(tl.int32)
+
+    for off in range(0, H, BLOCK_H):
+        idx = off + tl.arange(0, BLOCK_H)
+        mask = idx < H
+
+        # key: load (b, h, s), write to (b, h, dest)
+        key_offs = b * stride_b_key + h * stride_h_key + s * stride_s_key + idx
+        k_vals = tl.load(key_ptr + key_offs, mask=mask, other=0.0).to(tl.bfloat16)
+
+        key_cache_offs = b * stride_b_key_cache + h * stride_h_key_cache + dest * stride_pos_key_cache + idx
+        tl.store(key_cache_ptr + key_cache_offs, k_vals, mask=mask)
+
+        # value: load (b, h, s), write to (b, h, dest)
+        val_offs = b * stride_b_val + h * stride_h_val + s * stride_s_val + idx
+        v_vals = tl.load(value_ptr + val_offs, mask=mask, other=0.0).to(tl.bfloat16)
+
+        val_cache_offs = b * stride_b_val_cache + h * stride_h_val_cache + dest * stride_pos_val_cache + idx
+        tl.store(value_cache_ptr + val_cache_offs, v_vals, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self,
+                query: torch.Tensor,
+                key: torch.Tensor,
+                value: torch.Tensor,
+                position_ids: torch.Tensor,
+                key_cache: torch.Tensor,
+                value_cache: torch.Tensor,
+                cache_position: torch.Tensor,
+                q_norm_weight: torch.Tensor,
+                k_norm_weight: torch.Tensor,
+                inv_freq: torch.Tensor,
+                rms_norm_eps: float):
+        """
+        Returns:
+          query_rotated: bfloat16 tensor [B, num_q_heads, S, H]
+          key_rotated: bfloat16 tensor [B, num_kv_heads, S, H]
+          key_cache: updated bfloat16 tensor [B, num_kv_heads, max_pos, H]
+          value_cache: updated bfloat16 tensor [B, num_kv_heads, max_pos, H]
+        """
+        B, num_q_heads, S, H = query.shape
+        num_kv_heads = key.shape[1]
+        HALF = H // 2
+
+        # 1) RMSNorm for query -> query_norm (float16)
+        query_norm = torch.empty_like(query, dtype=torch.float16)
+        sum_sums_q = torch.empty((B * num_q_heads * S,), dtype=torch.float32, device=query.device)
+        grid_sum_q = (B * num_q_heads * S,)
+        rms_sum_kernel[grid_sum_q](query, sum_sums_q,
+                                   B, num_q_heads, S, H,
+                                   query.stride(0), query.stride(1), query.stride(2),
+                                   sum_sums_q.stride(0),
+                                   BLOCK_H=128, num_warps=4)
+
+        rms_norm_kernel[grid_sum_q](query, q_norm_weight, query_norm, sum_sums_q,
+                                    B, num_q_heads, S, H,
+                                    query.stride(0), query.stride(1), query.stride(2),
+                                    query_norm.stride(0), query_norm.stride(1), query_norm.stride(2),
+                                    sum_sums_q.stride(0),
+                                    eps=rms_norm_eps,
+                                    BLOCK_H=128, num_warps=4)
+
+        # 2) Compute rotation cos/sin per (b, s) -> cos, sin float32 [B, S, H]
+        cos = torch.empty((B, S, H), dtype=torch.float32, device=query.device)
+        sin = torch.empty((B, S, H), dtype=torch.float32, device=query.device)
+        grid_rc = (B, S)
+        rotate_sin_cos_kernel_b_s[grid_rc](position_ids, inv_freq, cos, sin,
+                                           B, S, H, HALF,
+                                           position_ids.stride(0),
+                                           cos.stride(0), cos.stride(1), cos.stride(2),
+                                           sin.stride(0), sin.stride(1), sin.stride(2),
+                                           BLOCK_H=128, num_warps=4)
+
+        # 3) Apply rotation to query_norm -> query_rot (bfloat16)
+        query_rot = torch.empty_like(query_norm, dtype=torch.bfloat16)
+        grid_rot_q = (B * num_q_heads * S,)
+        apply_rotation_kernel[grid_rot_q](query_norm, cos, sin, query_rot,
+                                          B, num_q_heads, S, H, HALF,
+                                          query_norm.stride(0), query_norm.stride(1), query_norm.stride(2),
+                                          query_rot.stride(0), query_rot.stride(1), query_rot.stride(2),
+                                          cos.stride(0), cos.stride(1), cos.stride(2),
+                                          sin.stride(0), sin.stride(1), sin.stride(2),
+                                          BLOCK_H=128, num_warps=4)
+
+        # 4) RMSNorm for key -> key_norm (float16)
+        key_norm = torch.empty_like(key, dtype=torch.float16)
+        sum_sums_k = torch.empty((B * num_kv_heads * S,), dtype=torch.float32, device=key.device)
+        grid_sum_k = (B * num_kv_heads * S,)
+        rms_sum_kernel[grid_sum_k](key, sum_sums_k,
+                                   B, num_kv_heads, S, H,
+                                   key.stride(0), key.stride(1), key.stride(2),
+                                   sum_sums_k.stride(0),
+                                   BLOCK_H=128, num_warps=4)
+
+        rms_norm_kernel[grid_sum_k](key, k_norm_weight, key_norm, sum_sums_k,
+                                    B, num_kv_heads, S, H,
+                                    key.stride(0), key.stride(1), key.stride(2),
+                                    key_norm.stride(0), key_norm.stride(1), key_norm.stride(2),
+                                    sum_sums_k.stride(0),
+                                    eps=rms_norm_eps,
+                                    BLOCK_H=128, num_warps=4)
+
+        # 5) Apply rotation to key_norm -> key_rot (bfloat16)
+        key_rot = torch.empty_like(key_norm, dtype=torch.bfloat16)
+        grid_rot_k = (B * num_kv_heads * S,)
+        apply_rotation_kernel[grid_rot_k](key_norm, cos, sin, key_rot,
+                                          B, num_kv_heads, S, H, HALF,
+                                          key_norm.stride(0), key_norm.stride(1), key_norm.stride(2),
+                                          key_rot.stride(0), key_rot.stride(1), key_rot.stride(2),
+                                          cos.stride(0), cos.stride(1), cos.stride(2),
+                                          sin.stride(0), sin.stride(1), sin.stride(2),
+                                          BLOCK_H=128, num_warps=4)
+
+        # 6) Update caches: key_cache[:, :, cache_position] = key_rot, value_cache[:, :, cache_position] = value
+        # Ensure cache_position is int32 for Triton indexing
+        cache_position_i32 = cache_position.to(torch.int32)
+
+        update_cache_kernel[grid_rot_k](key_rot, value, key_cache, value_cache, cache_position_i32,
+                                        B, num_kv_heads, S, H,
+                                        key_rot.stride(0), key_rot.stride(1), key_rot.stride(2),
+                                        value.stride(0), value.stride(1), value.stride(2),
+                                        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                                        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                                        BLOCK_H=128, num_warps=4)
+
+        # Return as expected by original: (query_rotated, key_rotated, key_cache, value_cache)
+        return query_rot, key_rot, key_cache, value_cache
+
+
+def run(*args):
+    return ModelNew()(*args)

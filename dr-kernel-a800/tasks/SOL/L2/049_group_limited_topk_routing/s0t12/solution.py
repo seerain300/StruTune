@@ -1,0 +1,306 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def linear_proj_kernel(
+    hidden_ptr,  # [M, K]
+    weight_ptr,  # [N, K]
+    logits_ptr,  # [M, N]
+    M, K, N,
+    stride_hm, stride_hk,
+    stride_wn, stride_wk,
+    stride_lm, stride_ln,
+    TILE_M: tl.constexpr, TILE_N: tl.constexpr, TILE_K: tl.constexpr,
+):
+    # 2D grid over tokens and num_experts
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    m_idx = pid_m * TILE_M + tl.arange(0, TILE_M)
+    n_idx = pid_n * TILE_N + tl.arange(0, TILE_N)
+
+    # Accumulator
+    acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k0 in range(0, K, TILE_K):
+        k_idx = k0 + tl.arange(0, TILE_K)
+        # A_tile: [TILE_M, TILE_K] from hidden
+        a_ptrs = hidden_ptr + m_idx[:, None] * stride_hm + k_idx[None, :] * stride_hk
+        a = tl.load(a_ptrs, mask=(m_idx[:, None] < M) & (k_idx[None, :] < K), other=0.0)
+
+        # B_tile: [TILE_K, TILE_N] from weight (we want weight.T, so we index weight as [N, K] and read as [K, N])
+        b_ptrs = weight_ptr + n_idx[None, :] * stride_wn + k_idx[:, None] * stride_wk
+        b = tl.load(b_ptrs, mask=(n_idx[None, :] < N) & (k_idx[:, None] < K), other=0.0)
+
+        acc += tl.dot(a, b)
+
+    # Write back
+    out_ptrs = logits_ptr + m_idx[:, None] * stride_lm + n_idx[None, :] * stride_ln
+    tl.store(out_ptrs, acc, mask=(m_idx[:, None] < M) & (n_idx[None, :] < N))
+
+
+@triton.jit
+def sigmoid_add_bias_kernel(
+    logits_ptr,   # [M, N]
+    bias_ptr,     # [N]
+    scores_ptr,   # [M, N]
+    M, N,
+    stride_lm, stride_ln,
+    stride_bn,
+    stride_sm, stride_sn,
+):
+    pid = tl.program_id(0)
+    # 1D launch over M*N
+    m = pid // N
+    n = pid % N
+    if m >= M:
+        return
+    logit = tl.load(logits_ptr + m * stride_lm + n * stride_ln)
+    bias = tl.load(bias_ptr + n * stride_bn)
+    score = tl.sigmoid(logit) + bias
+    tl.store(scores_ptr + m * stride_sm + n * stride_sn, score)
+
+
+@triton.jit
+def group_top2_sum_kernel(
+    scores_ptr,     # [M, N]
+    group_scores_ptr,  # [M, 8]
+    M, N,
+    EXP_PER_GROUP: tl.constexpr,  # 32
+    stride_sm, stride_sn,
+    stride_gm, stride_gn,
+):
+    # One program per token
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+    for g in range(0, 8):
+        start = g * EXP_PER_GROUP
+        idx = start + tl.arange(0, EXP_PER_GROUP)
+        ptrs = scores_ptr + pid * stride_sm + idx * stride_sn
+        vals = tl.load(ptrs)
+        # Unsorted top-2
+        top1 = tl.max(vals, axis=0)
+        mask1 = vals == top1
+        # exclude the first max by setting it to -inf
+        vals2 = tl.where(mask1, tl.full_like(vals, -float('inf')), vals)
+        top2 = tl.max(vals2, axis=0)
+        group_scores_ptr[pid, g] = top1 + top2  # store as float32
+
+
+@triton.jit
+def select_top4_groups_kernel(
+    group_scores_ptr,  # [M, 8]
+    top4_groups_ptr,   # [M, 4], int32
+    M,
+    stride_gm, stride_gn,
+    stride_tm, stride_tn,
+):
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+    for t in range(0, 4):
+        max_val = -float('inf')
+        for g in range(0, 8):
+            val = group_scores_ptr[pid, g]
+            if val > max_val:
+                max_val = val
+        # Find index of max among 8
+        for g in range(0, 8):
+            val = group_scores_ptr[pid, g]
+            if val == max_val:
+                tl.store(top4_groups_ptr + pid * stride_tm + t * stride_tn, g)
+                group_scores_ptr[pid, g] = -float('inf')
+                break
+
+
+@triton.jit
+def mask_nonselected_groups_kernel(
+    scores_ptr,           # [M, N]
+    top4_groups_ptr,      # [M, 4], int32
+    masked_ptr,           # [M, N]
+    M, N,
+    EXP_PER_GROUP: tl.constexpr,  # 32
+    stride_sm, stride_sn,
+    stride_tm, stride_tn,       # strides for top4_groups
+    stride_mm, stride_mn,       # strides for masked
+):
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+    # Initialize masked to -inf
+    idxs = tl.arange(0, N)
+    ptrs = masked_ptr + pid * stride_mm + idxs * stride_mn
+    tl.store(ptrs, -float('inf'))
+    # Overwrite selected groups with scores
+    for t in range(0, 4):
+        g = tl.load(top4_groups_ptr + pid * stride_tm + t * stride_tn)
+        start = g * EXP_PER_GROUP
+        idxs2 = start + tl.arange(0, EXP_PER_GROUP)
+        ptrs_scores = scores_ptr + pid * stride_sm + idxs2 * stride_sn
+        ptrs_masked = masked_ptr + pid * stride_mm + idxs2 * stride_mn
+        vals = tl.load(ptrs_scores)
+        tl.store(ptrs_masked, vals)
+
+
+@triton.jit
+def select_top8_masked_kernel(
+    masked_ptr,            # [M, N]
+    top8_indices_ptr,      # [M, 8], int32
+    M, N,
+    stride_mm, stride_mn,
+    stride_tm, stride_tn,
+):
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+    for t in range(0, 8):
+        idxs = tl.arange(0, N)
+        ptrs = masked_ptr + pid * stride_mm + idxs * stride_mn
+        vals = tl.load(ptrs)
+        max_val = tl.max(vals, axis=0)
+        for k in range(0, N):
+            if vals[k] == max_val:
+                tl.store(top8_indices_ptr + pid * stride_tm + t * stride_tn, k)
+                break
+
+
+@triton.jit
+def normalize_and_scale_kernel(
+    masked_ptr,            # [M, N]
+    top8_indices_ptr,      # [M, 8], int32
+    topk_weight_ptr,       # [M, 8], float32
+    M,
+    routed_scale,          # float32
+    stride_mm, stride_mn,
+    stride_tm, stride_tn,
+    stride_wm, stride_wn,
+):
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+    sum_val = tl.zeros((), dtype=tl.float32)
+    for t in range(0, 8):
+        idx = tl.load(top8_indices_ptr + pid * stride_tm + t * stride_tn)
+        s = tl.load(masked_ptr + pid * stride_mm + idx * stride_mn)
+        sum_val += s
+    for t in range(0, 8):
+        idx = tl.load(top8_indices_ptr + pid * stride_tm + t * stride_tn)
+        s = tl.load(masked_ptr + pid * stride_mm + idx * stride_mn)
+        norm = s / (sum_val + 1e-20)
+        out = norm * routed_scale
+        tl.store(topk_weight_ptr + pid * stride_wm + t * stride_wn, out)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        # No parameters; all computation in Triton kernels
+
+    def forward(self, hidden_states: torch.Tensor, weight: torch.Tensor, expert_bias: torch.Tensor, routed_scaling_factor: float):
+        # Ensure on CUDA
+        assert hidden_states.is_cuda and weight.is_cuda and expert_bias.is_cuda, "All tensors must be on CUDA for Triton."
+
+        device = hidden_states.device
+        M, K = hidden_states.shape
+        N = weight.shape[0]  # num_experts, should be 256
+        EXP_PER_GROUP = 32
+        GROUPS = 8
+        TOPK_GROUP = 4
+        TOPK_FINAL = 8
+
+        # 1) GEMM logits = hidden @ weight.T
+        logits = torch.empty((M, N), dtype=torch.float32, device=device)
+        TILE_M = 64
+        TILE_N = 32
+        TILE_K = 64
+        grid = (triton.cdiv(M, TILE_M), triton.cdiv(N, TILE_N))
+        _linear_proj_kernel[grid](
+            hidden_states, weight, logits,
+            M, K, N,
+            hidden_states.stride(0), hidden_states.stride(1),
+            weight.stride(0), weight.stride(1),
+            logits.stride(0), logits.stride(1),
+            TILE_M=TILE_M, TILE_N=TILE_N, TILE_K=TILE_K,
+            num_warps=4, num_stages=2,
+        )
+
+        # 2) Sigmoid + expert bias
+        scores = torch.empty_like(logits)
+        bias_f32 = expert_bias.to(torch.float32).contiguous()
+        grid_elem = (M * N,)
+        _sigmoid_add_bias_kernel[grid_elem](
+            logits, bias_f32, scores,
+            M, N,
+            logits.stride(0), logits.stride(1),
+            bias_f32.stride(0),
+            scores.stride(0), scores.stride(1),
+            num_warps=1, num_stages=1,
+        )
+
+        # 3) Group top-2 sum per token
+        group_scores = torch.empty((M, GROUPS), dtype=torch.float32, device=device)
+        _group_top2_sum_kernel[(M,)](
+            scores, group_scores,
+            M, N,
+            EXP_PER_GROUP=EXP_PER_GROUP,
+            stride_sm=scores.stride(0), stride_sn=scores.stride(1),
+            stride_gm=group_scores.stride(0), stride_gn=group_scores.stride(1),
+            num_warps=1, num_stages=1,
+        )
+
+        # 4) Select top-4 groups per token
+        top4_groups = torch.empty((M, TOPK_GROUP), dtype=torch.int32, device=device)
+        _select_top4_groups_kernel[(M,)](
+            group_scores, top4_groups,
+            M,
+            stride_gm=group_scores.stride(0), stride_gn=group_scores.stride(1),
+            stride_tm=top4_groups.stride(0), stride_tn=top4_groups.stride(1),
+            num_warps=1, num_stages=1,
+        )
+
+        # 5) Mask non-selected groups: set masked_scores to -inf and write selected groups
+        masked_scores = torch.empty_like(scores)
+        _mask_nonselected_groups_kernel[(M,)](
+            scores, top4_groups, masked_scores,
+            M, N,
+            EXP_PER_GROUP=EXP_PER_GROUP,
+            stride_sm=scores.stride(0), stride_sn=scores.stride(1),
+            stride_tm=top4_groups.stride(0), stride_tn=top4_groups.stride(1),
+            stride_mm=masked_scores.stride(0), stride_mn=masked_scores.stride(1),
+            num_warps=1, num_stages=1,
+        )
+
+        # 6) Select top-8 from masked scores
+        top8_indices = torch.empty((M, TOPK_FINAL), dtype=torch.int32, device=device)
+        _select_top8_masked_kernel[(M,)](
+            masked_scores, top8_indices,
+            M, N,
+            stride_mm=masked_scores.stride(0), stride_mn=masked_scores.stride(1),
+            stride_tm=top8_indices.stride(0), stride_tn=top8_indices.stride(1),
+            num_warps=1, num_stages=1,
+        )
+
+        # 7) Normalize and scale
+        topk_weight = torch.empty((M, TOPK_FINAL), dtype=torch.float32, device=device)
+        _normalize_and_scale_kernel[(M,)](
+            masked_scores, top8_indices, topk_weight,
+            M,
+            routed_scaling_factor,
+            stride_mm=masked_scores.stride(0), stride_mn=masked_scores.stride(1),
+            stride_tm=top8_indices.stride(0), stride_tn=top8_indices.stride(1),
+            stride_wm=topk_weight.stride(0), stride_wn=topk_weight.stride(1),
+            num_warps=1, num_stages=1,
+        )
+
+        # Return indices and weights
+        # topk_idx corresponds to the indices of selected experts from masked_scores
+        # We need to return topk_idx as int64 tensor and topk_weight as float32
+        topk_idx = top8_indices.to(torch.int64)
+        return topk_idx, topk_weight
+
+
+def run(*args):
+    return ModelNew()(*args)

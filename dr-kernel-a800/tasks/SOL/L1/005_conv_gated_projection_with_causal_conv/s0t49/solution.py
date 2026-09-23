@@ -1,0 +1,288 @@
+import triton
+import triton.language as tl
+
+# 1) in_proj: compute BCx[b, s, m] = sum_h x[b, s, h] * in_proj_weight[m, h] + in_proj_bias[m]
+@triton.jit
+def in_proj_kernel(
+    x_ptr,                 # *f32, shape (B, S, H)
+    in_w_ptr,              # *f32, shape (M, H), M = 3*H
+    in_b_ptr,              # *f32, shape (M,)
+    bcx_ptr,               # *f32, output (B, S, M)
+    B: tl.constexpr,       # int
+    S: tl.constexpr,       # int
+    H: tl.constexpr,       # int
+    M: tl.constexpr,       # int = 3*H
+    BLOCK_M: tl.constexpr, # tile along M
+):
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+    m_tile = tl.program_id(2)
+    m_offsets = m_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = m_offsets < M
+
+    # Accumulator for BCx[b, s, m_offsets]
+    acc = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    # Loop over h statically
+    for h in range(0, H):
+        x_val = tl.load(x_ptr + b * S * H + s * H + h, mask=True, other=0.0)  # x[b, s, h]
+        # in_w[m, h] for current h, loop over m in tile
+        for j in range(0, BLOCK_M):
+            m = m_offsets[j]
+            # weight for this (m, h)
+            w_val = tl.load(in_w_ptr + m * H + h, mask=mask_m[j], other=0.0)
+            acc[j] += x_val * w_val
+
+    # Add bias
+    bias_vals = tl.load(in_b_ptr + m_offsets, mask=mask_m, other=0.0)
+    acc += bias_vals
+
+    # Store to bcx[b, s, m_offsets]
+    tl.store(bcx_ptr + b * S * M + s * M + m_offsets, acc, mask=mask_m)
+
+
+# 2) Elementwise gating: out[b, s, h] = B[b, s, h] * x_proj[b, s, h]
+@triton.jit
+def gating_kernel(
+    B_ptr,        # *f32, shape (B, S, H)
+    x_proj_ptr,   # *f32, shape (B, S, H)
+    out_ptr,      # *f32, shape (B, S, H)
+    B: tl.constexpr, S: tl.constexpr, H: tl.constexpr,
+    BLOCK_H: tl.constexpr = 128,
+):
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+    h_tile = tl.program_id(2)
+    h_offsets = h_tile * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = h_offsets < H
+
+    B_vals = tl.load(B_ptr + b * S * H + s * H + h_offsets, mask=mask_h, other=0.0)
+    xP_vals = tl.load(x_proj_ptr + b * S * H + s * H + h_offsets, mask=mask_h, other=0.0)
+    out_vals = B_vals * xP_vals
+    tl.store(out_ptr + b * S * H + s * H + h_offsets, out_vals, mask=mask_h)
+
+
+# 3) Left-pad along sequence dim: Bx_padded[b, t, h] = 0 if t < pad else Bx[b, t - pad, h]
+@triton.jit
+def left_pad_kernel(
+    Bx_ptr,           # *f32, shape (B, S, H)
+    Bxp_ptr,          # *f32, shape (B, S_padded, H)
+    B: tl.constexpr, S: tl.constexpr, H: tl.constexpr,
+    PAD: tl.constexpr,  # pad = K - 1
+    BLOCK_H: tl.constexpr = 128,
+):
+    b = tl.program_id(0)
+    t = tl.program_id(1)
+    h_tile = tl.program_id(2)
+    h_offsets = h_tile * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = h_offsets < H
+
+    # If t < PAD, write zeros; else copy Bx[b, t - PAD, h_offsets]
+    use_copy = t >= PAD
+    src_t = t - PAD
+    # Base pointers
+    src_base = Bx_ptr + b * S * H + src_t * H
+    dst_base = Bxp_ptr + b * (S + PAD) * H + t * H
+
+    # Load either zeros or original values
+    if use_copy:
+        vals = tl.load(src_base + h_offsets, mask=mask_h, other=0.0)
+    else:
+        vals = tl.zeros([BLOCK_H], dtype=tl.float32)
+
+    tl.store(dst_base + h_offsets, vals, mask=mask_h)
+
+
+# 4) Grouped causal 1D conv with groups=B, kernel_size=K, per-channel conv_weight (H, 1, K), bias (H,)
+#    conv_out[b, c, t] = sum_{k=0..K-1} Bx_padded[b, c, t + k] * conv_weight[c, 0, k] + conv_bias[c]
+@triton.jit
+def conv1d_groupsB_kernel(
+    Bxp_ptr,            # *f32, shape (B, S_padded, H)
+    conv_w_ptr,         # *f32, shape (H, K) where K=4
+    conv_b_ptr,         # *f32, shape (H,)
+    conv_out_ptr,       # *f32, shape (B, H, S)
+    B: tl.constexpr, S_padded: tl.constexpr, H: tl.constexpr, K: tl.constexpr,
+    BLOCK_H: tl.constexpr = 128,
+):
+    b = tl.program_id(0)
+    c = tl.program_id(1)   # c runs over H channels (groups=B and H, but here groups=B is conceptual; we process (b, c) independently)
+    t = tl.program_id(2)
+
+    # Accumulate conv for time t
+    acc = tl.zeros([1], dtype=tl.float32)  # scalar accumulator
+
+    # Sum over kernel taps k=0..K-1 with causal access in Bx_padded
+    for k in range(0, K):
+        pos = t + k
+        # pos is in [0, S_padded-1]
+        vals = tl.load(Bxp_ptr + b * (S_padded) * H + pos * H + tl.arange(0, H), mask=tl.arange(0, H) < H, other=0.0)
+        w_vals = tl.load(conv_w_ptr + c * K + k, mask=True, other=0.0)
+        acc += tl.sum(vals * w_vals)
+
+    # Add bias
+    b_val = tl.load(conv_b_ptr + c)
+    acc += b_val
+
+    # Store conv_out[b, c, t]
+    tl.store(conv_out_ptr + b * H * S + c * S + t, acc)
+
+
+# 5) Output gating: y = C * conv_out (elementwise)
+@triton.jit
+def out_gate_kernel(
+    C_ptr,              # *f32, shape (B, S, H)
+    conv_out_ptr,       # *f32, shape (B, H, S)
+    y_ptr,              # *f32, shape (B, H, S)
+    B: tl.constexpr, S: tl.constexpr, H: tl.constexpr,
+    BLOCK_H: tl.constexpr = 128,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    s = tl.program_id(2)
+    # Simple 1D grid; use small loop across S and H if needed. Here, we vectorize over H in tiles and loop over S.
+    h_tile = tl.program_id(2)  # reusing 3rd dim for H tiles
+    h_offsets = h_tile * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = h_offsets < H
+
+    # Loop over S (since grid only covers H, we'll launch grid=(B, H, S) for simplicity)
+    # Note: Triton grid is 3D, we assign s as program_id(2) by design; here we set s=program_id(2).
+    s_val = s
+    C_vals = tl.load(C_ptr + b * S * H + s_val * H + h_offsets, mask=mask_h, other=0.0)
+    co_vals = tl.load(conv_out_ptr + b * H * S + h_offsets * S + s_val, mask=mask_h, other=0.0)
+    y_vals = C_vals * co_vals
+    tl.store(y_ptr + b * H * S + h_offsets * S + s_val, y_vals, mask=mask_h)
+
+
+# 6) Final linear projection: output[b, s, h] = sum_h' y_T[b, s, h'] * out_proj_weight[h', h] + out_proj_bias[h]
+#    y_T = y.transpose(-1, -2) -> (B, S, H)
+@triton.jit
+def out_proj_kernel(
+    yT_ptr,              # *f32, shape (B, S, H) -> (B, S, H)
+    out_w_ptr,           # *f32, shape (H, H)
+    out_b_ptr,           # *f32, shape (H,)
+    out_ptr,             # *f32, shape (B, S, H)
+    B: tl.constexpr, S: tl.constexpr, H: tl.constexpr,
+    BLOCK_H: tl.constexpr = 128,
+):
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+    h_tile = tl.program_id(2)
+    h_offsets = h_tile * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = h_offsets < H
+
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+
+    # For each h in H, accumulate dot product over h' in H
+    for h_out in range(0, H):
+        y_vals = tl.load(yT_ptr + b * S * H + s * H + h_out, mask=True, other=0.0)
+        w_vals = tl.load(out_w_ptr + h_out * H + h_offsets, mask=mask_h, other=0.0)
+        acc += y_vals * w_vals
+
+    # Add bias
+    b_vals = tl.load(out_b_ptr + h_offsets, mask=mask_h, other=0.0)
+    acc += b_vals
+
+    tl.store(out_ptr + b * S * H + s * H + h_offsets, acc, mask=mask_h)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self,
+                x: torch.Tensor,
+                in_proj_weight: torch.Tensor,
+                in_proj_bias: torch.Tensor,
+                conv_weight: torch.Tensor,
+                conv_bias: torch.Tensor,
+                out_proj_weight: torch.Tensor,
+                out_proj_bias: torch.Tensor):
+        """
+        Full fused pipeline in Triton:
+        1) in_proj: BCx = x @ in_proj_weight^T + in_proj_bias
+        2) Split BCx into B, C, x_proj
+        3) Gating: Bx = B * x_proj
+        4) Left-pad: Bx_padded
+        5) Grouped conv with groups=B conceptually (per (b, channel c) independently); here we conv over H channels with per-channel weight
+           conv_out[b, c, t] = sum_{k=0..3} Bx_padded[b, c, t + k] * conv_weight[c, 0, k] + conv_bias[c]
+        6) Output gating: y = C * conv_out
+        7) Final linear: y_T -> output via out_proj_weight and out_proj_bias
+        """
+        assert x.is_cuda, "ModelNew requires CUDA tensors."
+        device = x.device
+        dtype = x.dtype
+
+        B, S, H = x.shape
+        M = 3 * H
+        K = conv_weight.shape[2]  # kernel size (e.g., 4)
+        PAD = K - 1
+        S_padded = S + PAD
+
+        # 1) in_proj: BCx (B, S, M) using Triton
+        BCx = torch.empty((B, S, M), device=device, dtype=torch.float32)
+        BLOCK_M = 64
+        grid_in = (B, S, triton.cdiv(M, BLOCK_M))
+        in_proj_kernel[grid_in](
+            x.contiguous(), in_proj_weight.contiguous(), in_proj_bias.contiguous(), BCx,
+            B=B, S=S, H=H, M=M, BLOCK_M=BLOCK_M,
+            num_warps=4, num_stages=2
+        )
+
+        # 2) Split BCx into B, C, x_proj
+        # Ensure dtype is float32; if original x is not float32, convert for computation
+        B_t = BCx[:, :, :H]         # (B, S, H)
+        C_t = BCx[:, :, H:(2 * H)]  # (B, S, H)
+        x_proj = BCx[:, :, (2 * H):]  # (B, S, H)
+
+        # 3) Element-wise gating: Bx = B_t * x_proj (Triton)
+        Bx = torch.empty((B, S, H), device=device, dtype=torch.float32)
+        BLOCK_H = 128
+        grid_gate = (B, S, triton.cdiv(H, BLOCK_H))
+        gating_kernel[grid_gate](
+            B_t, x_proj, Bx,
+            B=B, S=S, H=H, BLOCK_H=BLOCK_H,
+            num_warps=4, num_stages=2
+        )
+
+        # 4) Left-pad along sequence dim by PAD: Bx_padded (B, S_padded, H) (Triton)
+        Bxp = torch.empty((B, S_padded, H), device=device, dtype=torch.float32)
+        grid_pad = (B, S_padded, triton.cdiv(H, BLOCK_H))
+        left_pad_kernel[grid_pad](
+            Bx.contiguous(), Bxp,
+            B=B, S=S, H=H, PAD=PAD, BLOCK_H=BLOCK_H,
+            num_warps=4, num_stages=2
+        )
+
+        # 5) Grouped conv (groups=B conceptually). conv_weight shape (H, 1, K), conv_bias (H,)
+        # conv_out (B, H, S)
+        conv_out = torch.empty((B, H, S), device=device, dtype=torch.float32)
+        grid_conv = (B, H, S)
+        conv1d_groupsB_kernel[grid_conv](
+            Bxp, conv_weight.reshape(H, K).contiguous(), conv_bias.contiguous(), conv_out,
+            B=B, S_padded=S_padded, H=H, K=K, BLOCK_H=BLOCK_H,
+            num_warps=4, num_stages=2
+        )
+
+        # 6) Output gating: y = C_t * conv_out (elementwise) (Triton)
+        y = torch.empty((B, H, S), device=device, dtype=torch.float32)
+        grid_out_gate = (B, H, S)
+        out_gate_kernel[grid_out_gate](
+            C_t.contiguous(), conv_out, y,
+            B=B, S=S, H=H, BLOCK_H=BLOCK_H,
+            num_warps=4, num_stages=2
+        )
+
+        # 7) Transpose y to (B, S, H) for final linear
+        y_T = y.transpose(-1, -2).contiguous()  # (B, S, H)
+
+        # 8) Final linear projection (Triton), output (B, S, H)
+        out = torch.empty((B, S, H), device=device, dtype=torch.float32)
+        grid_out_proj = (B, S, triton.cdiv(H, BLOCK_H))
+        out_proj_kernel[grid_out_proj](
+            y_T, out_proj_weight.contiguous(), out_proj_bias.contiguous(), out,
+            B=B, S=S, H=H, BLOCK_H=BLOCK_H,
+            num_warps=4, num_stages=2
+        )
+
+        return out
+
+
+def run(*args):
+    return ModelNew()(*args)

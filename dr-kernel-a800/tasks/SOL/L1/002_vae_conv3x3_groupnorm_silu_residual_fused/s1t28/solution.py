@@ -1,0 +1,333 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv3x3_nchw_fp32(
+    x_ptr,           # *const float, input
+    w_ptr,           # *const float, weights (Cin, Cout, 3, 3)
+    y_ptr,           # *float, output
+    B, Cin, Cout, H, W, H_out, W_out,
+    x_stride_n, x_stride_c, x_stride_h, x_stride_w,
+    w_stride_cin, w_stride_cout, w_stride_kh, w_stride_kw,
+    y_stride_n, y_stride_c, y_stride_h, y_stride_w,
+    BLOCK_IN: tl.constexpr, BLOCK_HW: tl.constexpr,
+):
+    # program ids
+    n = tl.program_id(0)
+    cout = tl.program_id(1)
+    tile = tl.program_id(2)
+
+    # compute output spatial index for this tile
+    total = H_out * W_out
+    start = tile * BLOCK_HW
+    offs = start + tl.arange(0, BLOCK_HW)
+    mask = offs < total
+
+    h_out_vec = offs // W_out
+    w_out_vec = offs % W_out
+
+    # accumulator for output element
+    acc = tl.zeros([BLOCK_HW], dtype=tl.float32)
+
+    # loop over input channels in chunks
+    for cin_start in range(0, Cin, BLOCK_IN):
+        cin_offsets = cin_start + tl.arange(0, BLOCK_IN)
+        cin_mask = cin_offsets < Cin
+
+        # loop over 3x3 kernel window with masks for padding
+        for kh in range(0, 3):
+            for kw in range(0, 3):
+                h_in = h_out_vec + kh - 1  # pad=1 => output has H+2, input index h_in = h_out + kh - 1
+                w_in = w_out_vec + kw - 1
+                # valid positions: 0 <= h_in < H and 0 <= w_in < W
+                valid_hw = (h_in[:, None] >= 0) & (h_in[:, None] < H) & (w_in[:, None] >= 0) & (w_in[:, None] < W)
+                mask_vec = mask & valid_hw
+
+                # load input: x[n, cin, h_in, w_in] for vectorized h_out/w_out
+                # iterate cin chunk
+                for ci in range(BLOCK_IN):
+                    cin_idx = cin_offsets[ci]
+                    if cin_idx >= Cin:
+                        continue
+                    x_ptr_offs = x_ptr + n * x_stride_n + cin_idx * x_stride_c + h_in[:, None] * x_stride_h + w_in[:, None] * x_stride_w
+                    x_val = tl.load(x_ptr_offs, mask=mask_vec & (ci < Cin), other=0.0)  # shape [BLOCK_HW, 1]
+                    # load weight scalar: w[cin_idx, cout, kh, kw]
+                    w_ptr_offs = w_ptr + cin_idx * w_stride_cin + cout * w_stride_cout + kh * w_stride_kh + kw * w_stride_kw
+                    w_val = tl.load(w_ptr_offs)
+                    # accumulate
+                    acc += x_val * w_val
+
+    # store output y[n, cout, h_out, w_out] for vectorized offs
+    y_ptr_offs = y_ptr + n * y_stride_n + cout * y_stride_c + h_out_vec[:, None] * y_stride_h + w_out_vec[:, None] * y_stride_w
+    store_mask = mask[:, None]
+    tl.store(y_ptr_offs, acc, mask=store_mask)
+
+
+@triton.jit
+def groupnorm_affine_kernel(
+    x_ptr,           # *const float, input
+    scale_ptr,       # *const float, weight (C,)
+    bias_ptr,        # *const float, bias (C,)
+    y_ptr,           # *float, output
+    B, C, H_out, W_out, num_groups, eps,
+    BLOCK_HW: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    n = pid // num_groups
+    g = pid % num_groups
+    # channels in this group
+    group_size = (C + num_groups - 1) // num_groups
+    group_start = g * group_size
+    group_end = tl.minimum(group_start + group_size, C)
+
+    # pass 1: compute sum and sum of squares over group and all spatial positions
+    sum_val = tl.zeros((), dtype=tl.float32)
+    sum_sq = tl.zeros((), dtype=tl.float32)
+    for c in range(group_start, group_end):
+        for h in range(0, H_out):
+            for w in range(0, W_out):
+                x_off = x_ptr + n * (C * H_out * W_out) + c * (H_out * W_out) + h * W_out + w
+                x_val = tl.load(x_off)
+                sum_val += x_val
+                sum_sq += x_val * x_val
+
+    m = (group_end - group_start) * H_out * W_out
+    mean = sum_val / m
+    var = sum_sq / m - mean * mean
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    # pass 2: normalize and apply affine, store
+    for c in range(group_start, group_end):
+        scale = tl.load(scale_ptr + c)
+        bias = tl.load(bias_ptr + c)
+        for h in range(0, H_out):
+            for w in range(0, W_out):
+                x_off = x_ptr + n * (C * H_out * W_out) + c * (H_out * W_out) + h * W_out + w
+                x_val = tl.load(x_off)
+                y_val = (x_val - mean) * inv_std
+                y_val = y_val * scale + bias
+                y_off = y_ptr + n * (C * H_out * W_out) + c * (H_out * W_out) + h * W_out + w
+                tl.store(y_off, y_val)
+
+
+@triton.jit
+def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    start = pid * BLOCK
+    offs = start + tl.arange(0, BLOCK)
+    mask = offs < n_elements
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    # sigmoid
+    sig = 1.0 / (1.0 + tl.exp(-x))
+    y = x * sig
+    tl.store(y_ptr + offs, y, mask=mask)
+
+
+@triton.jit
+def add_residual_kernel(a_ptr, b_ptr, y_ptr, n_elements, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    start = pid * BLOCK
+    offs = start + tl.arange(0, BLOCK)
+    mask = offs < n_elements
+    a = tl.load(a_ptr + offs, mask=mask, other=0.0)
+    b = tl.load(b_ptr + offs, mask=mask, other=0.0)
+    y = a + b
+    tl.store(y_ptr + offs, y, mask=mask)
+
+
+@triton.jit
+def pad_to_out_kernel(x_ptr, y_ptr, B, C, H, W, H_out, W_out,
+                      x_stride_n, x_stride_c, x_stride_h, x_stride_w,
+                      y_stride_n, y_stride_c, y_stride_h, y_stride_w,
+                      BLOCK_HW: tl.constexpr):
+    # y_ptr points to output of shape (B, C, H_out, W_out), float32
+    # We set y to zeros. For positions where (h_out, w_out) are inside (H, W), copy from x; else keep zero.
+    # Since we need to write all elements, we implement: y = 0, then overwrite interior region from x.
+    # But Triton does not support easy memset in kernel; instead, we compute and store 0s and overwrite where valid.
+    # We'll assume x_ptr points to (B, C, H, W) float32 contiguous.
+    # We'll iterate over all (n,c,h_out,w_out) and check whether it corresponds to (h,w) in input.
+    total = B * C * H_out * W_out
+    pid = tl.program_id(0)
+    start = pid * BLOCK_HW
+    offs = start + tl.arange(0, BLOCK_HW)
+    mask = offs < total
+
+    # compute n, c, h_out, w_out for each offs
+    HW = H_out * W_out
+    C_HW = C * HW
+    n = offs // (C * HW)
+    rem = offs % (C * HW)
+    c = rem // HW
+    rem2 = rem % HW
+    h_out = rem2 // W_out
+    w_out = rem2 % W_out
+
+    # input indices
+    h_in = h_out - 1
+    w_in = w_out - 1
+
+    valid = (h_in >= 0) & (h_in < H) & (w_in >= 0) & (w_in < W)
+
+    # output pointers
+    y_offs = y_ptr + n * y_stride_n + c * y_stride_c + h_out * y_stride_h + w_out * y_stride_w
+
+    # For valid positions, load from x and store; otherwise store 0
+    # Note: Triton load with mask returns 0 where mask is False
+    x_offs = x_ptr + n * x_stride_n + c * x_stride_c + h_in * x_stride_h + w_in * x_stride_w
+    vals = tl.load(x_offs, mask=mask & valid, other=0.0)
+    tl.store(y_offs, vals, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, num_groups=32, eps=1e-5,
+                 conv_block_in=8, conv_block_hw=128,
+                 gn_block_hw=256, silu_block=1024, add_block=1024):
+        super().__init__()
+        self.num_groups = num_groups
+        self.eps = eps
+        self.conv_block_in = conv_block_in
+        self.conv_block_hw = conv_block_hw
+        self.gn_block_hw = gn_block_hw
+        self.silu_block = silu_block
+        self.add_block = add_block
+
+    def forward(self, x: torch.Tensor,
+                conv1_weight: torch.Tensor,
+                norm1_weight: torch.Tensor,
+                norm1_bias: torch.Tensor,
+                conv2_weight: torch.Tensor,
+                norm2_weight: torch.Tensor,
+                norm2_bias: torch.Tensor):
+        """
+        Triton-only fused residual block:
+        Conv3x3 -> GroupNorm -> SiLU
+        Conv3x3 -> GroupNorm -> SiLU
+        Add residual (original input padded to (B, C, H+2, W+2))
+        Input x: (B, C, H, W), conv weights: (C, C, 3, 3), norm weights/bias: (C,)
+        """
+        assert x.ndim == 4, "x must be (B, C, H, W)"
+        B, C, H, W = x.shape
+        device = x.device
+        dtype = torch.float32  # compute in fp32
+
+        # Ensure inputs and weights are float32 and contiguous
+        x_in = x.to(dtype=dtype).contiguous()
+        conv1_w = conv1_weight.to(dtype=dtype).contiguous()  # (Cin, Cout, 3, 3), here Cin=C
+        conv2_w = conv2_weight.to(dtype=dtype).contiguous()
+
+        # Compute output spatial sizes for convs (stride=1, padding=1 => H_out = H + 2, W_out = W + 2)
+        H_out = H + 2
+        W_out = W + 2
+
+        # Allocate conv1 output
+        conv1_out = torch.empty((B, C, H_out, W_out), device=device, dtype=dtype)
+
+        # Launch conv1 Triton kernel
+        grid_conv1 = (B, C, triton.cdiv(H_out * W_out, self.conv_block_hw))
+        x_stride_n, x_stride_c, x_stride_h, x_stride_w = x_in.stride()
+        w_stride_cin, w_stride_cout, w_stride_kh, w_stride_kw = conv1_w.stride()
+        y_stride_n, y_stride_c, y_stride_h, y_stride_w = conv1_out.stride()
+        conv3x3_nchw_fp32[grid_conv1](
+            x_in, conv1_w, conv1_out,
+            B, C, C, H, W, H_out, W_out,
+            x_stride_n, x_stride_c, x_stride_h, x_stride_w,
+            w_stride_cin, w_stride_cout, w_stride_kh, w_stride_kw,
+            y_stride_n, y_stride_c, y_stride_h, y_stride_w,
+            BLOCK_IN=self.conv_block_in, BLOCK_HW=self.conv_block_hw,
+            num_warps=4, num_stages=2
+        )
+
+        # GroupNorm 1
+        gn1_out = torch.empty_like(conv1_out)
+        grid_gn1 = (B * self.num_groups,)
+        groupnorm_affine_kernel[grid_gn1](
+            conv1_out, norm1_weight, norm1_bias, gn1_out,
+            B, C, H_out, W_out, self.num_groups, self.eps,
+            BLOCK_HW=self.gn_block_hw,
+            num_warps=4, num_stages=2
+        )
+
+        # SiLU 1
+        silu1_out = torch.empty_like(gn1_out)
+        n_elements1 = gn1_out.numel()
+        grid_silu1 = (triton.cdiv(n_elements1, self.silu_block),)
+        silu_kernel[grid_silu1](gn1_out, silu1_out, n_elements1, self.silu_block,
+                                num_warps=4, num_stages=2)
+
+        # conv2: input is silu1_out, output has same spatial size as conv1_out (B, C, H_out, W_out)
+        conv2_out = torch.empty((B, C, H_out, W_out), device=device, dtype=dtype)
+
+        # Input for conv2 is silu1_out (already float32 contiguous)
+        input2 = silu1_out
+        x_stride_n2, x_stride_c2, x_stride_h2, x_stride_w2 = input2.stride()
+
+        # conv2 weights
+        w_stride_cin2, w_stride_cout2, w_stride_kh2, w_stride_kw2 = conv2_w.stride()
+        y_stride_n2, y_stride_c2, y_stride_h2, y_stride_w2 = conv2_out.stride()
+
+        grid_conv2 = (B, C, triton.cdiv(H_out * W_out, self.conv_block_hw))
+        conv3x3_nchw_fp32[grid_conv2](
+            input2, conv2_w, conv2_out,
+            B, C, C, H_out, W_out, H_out, W_out,
+            x_stride_n2, x_stride_c2, x_stride_h2, x_stride_w2,
+            w_stride_cin2, w_stride_cout2, w_stride_kh2, w_stride_kw2,
+            y_stride_n2, y_stride_c2, y_stride_h2, y_stride_w2,
+            BLOCK_IN=self.conv_block_in, BLOCK_HW=self.conv_block_hw,
+            num_warps=4, num_stages=2
+        )
+
+        # GroupNorm 2
+        gn2_out = torch.empty_like(conv2_out)
+        grid_gn2 = (B * self.num_groups,)
+        groupnorm_affine_kernel[grid_gn2](
+            conv2_out, norm2_weight, norm2_bias, gn2_out,
+            B, C, H_out, W_out, self.num_groups, self.eps,
+            BLOCK_HW=self.gn_block_hw,
+            num_warps=4, num_stages=2
+        )
+
+        # SiLU 2
+        silu2_out = torch.empty_like(gn2_out)
+        n_elements2 = gn2_out.numel()
+        grid_silu2 = (triton.cdiv(n_elements2, self.silu_block),)
+        silu_kernel[grid_silu2](gn2_out, silu2_out, n_elements2, self.silu_block,
+                                num_warps=4, num_stages=2)
+
+        # Residual addition: add original x to final output via Triton. Shapes must match conv output size (B, C, H+2, W+2).
+        # Create residual tensor from x padded to (B, C, H+2, W+2) using Triton pad kernel.
+        residual = torch.empty((B, C, H_out, W_out), device=device, dtype=dtype)
+        # Ensure x residual matches conv output shape: we set residual to zeros and then copy interior. However, Triton kernel
+        # can directly compute padding: y = 0 everywhere, then overwrite interior positions (h_out in [1..H], w_out in [1..W]) with x[n, c, h_out-1, w_out-1].
+        total = B * C * H_out * W_out
+        grid_pad = (triton.cdiv(total, self.add_block),)
+        # Build strides for x (original) and residual
+        x_stride_n = x_in.stride(0)
+        x_stride_c = x_in.stride(1)
+        x_stride_h = x_in.stride(2)
+        x_stride_w = x_in.stride(3)
+        y_stride_n = residual.stride(0)
+        y_stride_c = residual.stride(1)
+        y_stride_h = residual.stride(2)
+        y_stride_w = residual.stride(3)
+        pad_to_out_kernel[grid_pad](
+            x_in, residual,
+            B, C, H, W, H_out, W_out,
+            x_stride_n, x_stride_c, x_stride_h, x_stride_w,
+            y_stride_n, y_stride_c, y_stride_h, y_stride_w,
+            BLOCK_HW=self.add_block,
+            num_warps=4, num_stages=2
+        )
+
+        final_out = torch.empty_like(silu2_out)
+        n_elements_final = silu2_out.numel()
+        grid_add = (triton.cdiv(n_elements_final, self.add_block),)
+        add_residual_kernel[grid_add](residual, silu2_out, final_out, n_elements_final, self.add_block,
+                                      num_warps=4, num_stages=2)
+
+        return final_out
+
+
+def run(*args):
+    return ModelNew()(*args)

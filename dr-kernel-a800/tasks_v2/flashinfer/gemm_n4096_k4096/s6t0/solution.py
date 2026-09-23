@@ -1,0 +1,96 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def matmul_at_bT_kernel(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Program ids for tiling across M and N
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Compute the row/col indices this program will handle
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float16)
+
+    # Loop over K in chunks
+    for k0 in range(0, K, BLOCK_K):
+        k_offsets = k0 + tl.arange(0, BLOCK_K)
+
+        # Pointers for tiles
+        A_tile_ptrs = A_ptr + m_offsets[:, None] * stride_am + k_offsets[None, :] * stride_ak  # [BLOCK_M, BLOCK_K]
+        B_tile_ptrs = B_ptr + k_offsets[:, None] * stride_bk + n_offsets[None, :] * stride_bn  # [BLOCK_K, BLOCK_N]
+
+        # Masks for loads
+        A_mask = (m_offsets[:, None] < M) & (k_offsets[None, :] < K)
+        B_mask = (k_offsets[:, None] < K) & (n_offsets[None, :] < N)
+
+        # Load tiles
+        A_tile = tl.load(A_tile_ptrs, mask=A_mask, other=0.0)  # [BLOCK_M, BLOCK_K]
+        B_tile = tl.load(B_tile_ptrs, mask=B_mask, other=0.0)  # [BLOCK_K, BLOCK_N]
+
+        # Accumulate
+        acc += tl.dot(A_tile, B_tile)
+
+    # Store results
+    C_tile_ptrs = C_ptr + m_offsets[:, None] * stride_cm + n_offsets[None, :] * stride_cn
+    C_mask = (m_offsets[:, None] < M) & (n_offsets[None, :] < N)
+    tl.store(C_tile_ptrs, acc, mask=C_mask)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, A, B):
+        # Validate shapes: A [M, K], B [K, N]
+        assert A.dim() == 2, f"A must be 2D, got shape {tuple(A.shape)}"
+        assert B.dim() == 2, f"B must be 2D, got shape {tuple(B.shape)}"
+        M, K = A.shape
+        K2, N = B.shape
+        assert K == K2, f"Incompatible shapes: A is (*, {K}), B is ({K2}, *)"
+
+        # Ensure contiguity for predictable strides
+        A = A.contiguous()
+        B = B.contiguous()
+
+        # Output tensor (float16, matching input dtype)
+        C = torch.empty((M, N), device=A.device, dtype=A.dtype)
+
+        # Strides (in elements)
+        stride_am, stride_ak = A.stride(0), A.stride(1)
+        stride_bk, stride_bn = B.stride(0), B.stride(1)
+        stride_cm, stride_cn = C.stride(0), C.stride(1)
+
+        # Tile sizes: reasonable defaults; can be tuned
+        BLOCK_M = 32
+        BLOCK_N = 64
+        BLOCK_K = 32
+
+        # Grid over M and N tiles
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+        # Launch Triton kernel
+        matmul_at_bT_kernel[grid](
+            A, B, C,
+            M, N, K,
+            stride_am, stride_ak,
+            stride_bk, stride_bn,
+            stride_cm, stride_cn,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            num_warps=4,
+            num_stages=2,
+        )
+
+        return C
+
+
+def run(*args):
+    return ModelNew()(*args)

@@ -1,0 +1,141 @@
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def attention_allheads_token_kernel(
+    q_nope_ptr, q_pe_ptr, Kc_all_ptr, Kp_all_ptr, sparse_idx_ptr,
+    out_ptr, lse_ptr,
+    N, H, Dk, Dp, topk,
+    sm_scale, inv_log2,
+):
+    # One program per token
+    t = tl.program_id(0)
+
+    # Load all indices for this token; sparse_idx_ptr is flattened [N*topk]
+    base_idx = t * topk
+    offs = tl.arange(0, topk)
+    idx_vals = tl.load(sparse_idx_ptr + base_idx + offs, mask=offs < topk, other=-1)
+    valid_mask = idx_vals != -1
+
+    # Scale and inv_log2 scalars
+    scale = sm_scale
+    inv_log2 = inv_log2
+
+    # For each head h
+    for h in range(0, H):
+        # Online logsumexp variables for this head
+        m = tl.full((), -1.0e30, dtype=tl.float32)  # running max
+        sum_exp = tl.full((), 0.0, dtype=tl.float32)  # sum of exp(logit_scaled - m)
+
+        # First pass: compute online lse for this head by scanning candidates j
+        for j in range(0, topk):
+            if valid_mask[j]:
+                tok_idx = idx_vals[j].to(tl.int32)
+                Kc_row_ptr = Kc_all_ptr + tok_idx * Dk
+                Kp_row_ptr = Kp_all_ptr + tok_idx * Dp
+
+                # Load query vectors q_nope[t, :, :] and q_pe[t, :, :]
+                # q_nope_ptr is [N, H, Dk]; q_nope[t, h, :] is at offset t*H*Dk + h*Dk + [0:Dk)
+                qn_flat_base = t * H * Dk + h * Dk
+                qn_vec = tl.load(q_nope_ptr + qn_flat_base + tl.arange(0, Dk), mask=tl.arange(0, Dk) < Dk, other=0.0)
+
+                # q_pe_ptr is [N, H, Dp]; q_pe[t, h, :] at offset t*H*Dp + h*Dp
+                qp_flat_base = t * H * Dp + h * Dp
+                qp_vec = tl.load(q_pe_ptr + qp_flat_base + tl.arange(0, Dp), mask=tl.arange(0, Dp) < Dp, other=0.0)
+
+                # Load K rows
+                Kc_row = tl.load(Kc_row_ptr + tl.arange(0, Dk), mask=tl.arange(0, Dk) < Dk, other=0.0)
+                Kp_row = tl.load(Kp_row_ptr + tl.arange(0, Dp), mask=tl.arange(0, Dp) < Dp, other=0.0)
+
+                # Dot products (sum over dims)
+                dot_qn = tl.sum(qn_vec * Kc_row, axis=0)
+                dot_qp = tl.sum(qp_vec * Kp_row, axis=0)
+                logit = dot_qn + dot_qp  # scalar float32
+
+                # Online logsumexp update: y = logit * scale
+                y = logit * scale
+                m_new = tl.maximum(m, y)
+                sum_exp = sum_exp * tl.exp(m - m_new) + tl.exp(y - m_new)
+                m = m_new
+
+        # Compute lse[h] = m / log(2)
+        lse_h = m * inv_log2
+        # Store lse[t, h]
+        tl.store(lse_ptr + t * H + h, lse_h)
+
+        # Second pass: compute attention and accumulate output
+        out_vec = tl.zeros((Dk,), dtype=tl.float32)
+        for j in range(0, topk):
+            if valid_mask[j]:
+                tok_idx = idx_vals[j].to(tl.int32)
+                Kc_row_ptr = Kc_all_ptr + tok_idx * Dk
+                Kp_row_ptr = Kp_all_ptr + tok_idx * Dp
+
+                qn_flat_base = t * H * Dk + h * Dk
+                qn_vec = tl.load(q_nope_ptr + qn_flat_base + tl.arange(0, Dk), mask=tl.arange(0, Dk) < Dk, other=0.0)
+
+                qp_flat_base = t * H * Dp + h * Dp
+                qp_vec = tl.load(q_pe_ptr + qp_flat_base + tl.arange(0, Dp), mask=tl.arange(0, Dp) < Dp, other=0.0)
+
+                Kc_row = tl.load(Kc_row_ptr + tl.arange(0, Dk), mask=tl.arange(0, Dk) < Dk, other=0.0)
+                Kp_row = tl.load(Kp_row_ptr + tl.arange(0, Dp), mask=tl.arange(0, Dp) < Dp, other=0.0)
+
+                dot_qn = tl.sum(qn_vec * Kc_row, axis=0)
+                dot_qp = tl.sum(qp_vec * Kp_row, axis=0)
+                logit = dot_qn + dot_qp
+
+                attn_j = tl.exp((logit * scale) - m) / sum_exp  # softmax weight for candidate j
+                out_vec = out_vec + attn_j * Kc_row
+
+        # Store output[t, h, :]
+        out_row_base = t * H * Dk + h * Dk
+        tl.store(out_ptr + out_row_base + tl.arange(0, Dk), out_vec, mask=tl.arange(0, Dk) < Dk)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
+        # Triton-only forward: no torch ops allowed here
+        assert q_nope.device.type == "cuda", "Triton kernels require CUDA tensors."
+
+        # Extract shapes (fixed in this task)
+        N, H, Dk = q_nope.shape
+        Dp = q_pe.shape[2]
+        assert H == 16, "num_qo_heads must be 16"
+        assert Dk == 512, "head_dim_ckv must be 512"
+        assert Dp == 64, "head_dim_kpe must be 64"
+        assert q_pe.shape[1] == H, "q_pe's head dimension must match q_nope's"
+
+        # Flatten paged KV caches
+        num_pages, _, _ = ckv_cache.shape
+        Kc_all = ckv_cache.reshape(-1, Dk)  # [(num_pages*64), 512]
+        Kp_all = kpe_cache.reshape(-1, Dp)  # [(num_pages*64), 64]
+
+        # Flatten sparse indices to [N*topk]
+        topk = sparse_indices.shape[1]
+        sparse_idx = sparse_indices.view(-1)
+
+        # Allocate outputs; Triton will write final values. Output dtype: bfloat16, lse: float32.
+        out = torch.empty((N, H, Dk), dtype=torch.bfloat16, device=q_nope.device)
+        lse = torch.empty((N, H), dtype=torch.float32, device=q_nope.device)
+
+        # Launch kernel: one program per token
+        grid = (N,)
+        inv_log2 = 1.0 / math.log(2.0)
+
+        attention_allheads_token_kernel[grid](
+            q_nope, q_pe, Kc_all, Kp_all, sparse_idx,
+            out, lse,
+            N, H, Dk, Dp, topk,
+            float(sm_scale), float(inv_log2),
+            num_warps=4,
+        )
+
+        # Return tensors (out is bfloat16, lse is float32), no torch ops in forward
+        return out, lse
+
+
+def run(*args):
+    return ModelNew()(*args)

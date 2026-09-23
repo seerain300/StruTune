@@ -1,0 +1,280 @@
+import torch
+import math
+import triton
+import triton.language as tl
+
+# Constants
+HEAD_DIM = 128
+NUM_QO_HEADS = 32
+NUM_KV_HEADS = 8
+GQA_RATIO = NUM_QO_HEADS // NUM_KV_HEADS  # 4
+LN2 = math.log(2.0)
+
+@triton.jit
+def _compute_logits_kernel(
+    Q, K_EXP, LOGITS,
+    num_q_tokens, num_kv_tokens, head_dim,
+    Q_stride_q, Q_stride_h, Q_stride_d,
+    K_EXP_stride_k, K_EXP_stride_h, K_EXP_stride_d,
+    LOGITS_stride_q, LOGITS_stride_h, LOGITS_stride_k,
+    BLOCK_Q: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr
+):
+    # Grid: (ceil(num_q_tokens/BLOCK_Q), ceil(head_dim/BLOCK_D), ceil(num_kv_tokens/BLOCK_K))
+    pid_q = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    q_offsets = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)  # [BLOCK_Q]
+    k_offsets = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)  # [BLOCK_K]
+    d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)  # [BLOCK_D]
+
+    q_mask = q_offsets < num_q_tokens
+    k_mask = k_offsets < num_kv_tokens
+    d_mask = d_offsets < head_dim
+
+    # Initialize accumulator LOGITS[q, k] as float32
+    LOGITS_ptrs = LOGITS + q_offsets[:, None, None] * LOGITS_stride_q + 0 * LOGITS_stride_h + k_offsets[None, None, :] * LOGITS_stride_k
+    acc = tl.zeros((BLOCK_Q, BLOCK_K, 1), dtype=tl.float32)
+
+    # Loop over d with compile-time bound
+    for d in range(0, 128, BLOCK_D):
+        d_offsets = d + tl.arange(0, BLOCK_D)  # [BLOCK_D]
+        d_mask = d_offsets < head_dim
+
+        # Load Q[q, h, d]
+        Q_ptrs = Q + q_offsets[:, None] * Q_stride_q + 0 * Q_stride_h + d_offsets[None, :] * Q_stride_d  # h=0
+        q_vals = tl.load(Q_ptrs, mask=(q_mask[:, None] & d_mask[None, :]), other=0.0)  # [BLOCK_Q, BLOCK_D], fp32
+
+        # Load K[k, h, d]
+        K_ptrs = K_EXP + k_offsets[:, None] * K_EXP_stride_k + 0 * K_EXP_stride_h + d_offsets[None, :] * K_EXP_stride_d  # h=0
+        k_vals = tl.load(K_ptrs, mask=(k_mask[:, None] & d_mask[None, :]), other=0.0)  # [BLOCK_K, BLOCK_D], fp32
+
+        # Outer product and accumulate: [BLOCK_Q, BLOCK_D] * [BLOCK_K, BLOCK_D]^T -> [BLOCK_Q, BLOCK_K]
+        # We need to broadcast q_vals over K and k_vals over Q:
+        # q_vals: [Q, D], k_vals: [K, D] => qk = sum_d q_vals[:, None, d] * k_vals[None, :, d]
+        # Implement via loop over d chunk:
+        # For each di in [0, BLOCK_D), compute contribution:
+        for di in range(0, BLOCK_D):
+            di_mask = (d + di) < head_dim
+            q_col = q_vals[:, di]  # [Q]
+            k_col = k_vals[:, di]  # [K]
+            contrib = q_col[:, None] * k_col[None, :]  # [Q, K]
+            acc += contrib[None, :, :]  # broadcast over D dimension: [1, Q, K]
+
+    # Store accumulated logits to LOGITS[q, k, d=0] (we use d=0 since we computed sum across D)
+    store_ptrs = LOGITS + q_offsets[:, None] * LOGITS_stride_q + 0 * LOGITS_stride_h + k_offsets[None, :] * LOGITS_stride_k
+    tl.store(store_ptrs, acc.squeeze(2), mask=(q_mask[:, None] & k_mask[None, :]))
+
+
+@triton.jit
+def _lse_masked_kernel(
+    LOGITS, LSE,
+    num_q_tokens, num_kv_tokens, head_dim,
+    LOGITS_stride_q, LOGITS_stride_h, LOGITS_stride_k,
+    LSE_stride_q, LSE_stride_h,
+    LN2: tl.constexpr, delta: tl.constexpr,  # delta = num_kv_tokens - num_q_tokens
+    BLOCK_Q: tl.constexpr, BLOCK_K: tl.constexpr
+):
+    # Grid: (ceil(num_q_tokens/BLOCK_Q), ceil(head_dim/BLOCK_K))
+    # Note: We reduce over K for each (q,h). Here we assume h=0 for simplicity, since head_dim is fixed.
+    pid_q = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    q_offsets = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)  # [BLOCK_Q]
+    k_offsets = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)  # [BLOCK_K]
+
+    q_mask = q_offsets < num_q_tokens
+    k_mask = k_offsets < num_kv_tokens
+
+    # Compute max over K (masked with causal mask)
+    max_vals = tl.full((BLOCK_Q,), -float("inf"), dtype=tl.float32)
+    LOGITS_ptrs = LOGITS + q_offsets[:, None] * LOGITS_stride_q + 0 * LOGITS_stride_h + k_offsets[None, :] * LOGITS_stride_k
+    allowed = k_offsets[None, :] < (q_offsets[:, None] + 1 + delta)
+    vals = tl.load(LOGITS_ptrs, mask=(q_mask[:, None] & k_mask[None, :] & allowed), other=-float("inf"))
+    m = tl.max(vals, axis=1)  # [Q]
+    max_vals = tl.maximum(max_vals, m)
+
+    # Compute sum exp(vals - max)
+    sum_exp = tl.zeros((BLOCK_Q,), dtype=tl.float32)
+    for di in range(0, BLOCK_K):
+        k_idx = di
+        LOGITS_ptrs = LOGITS + q_offsets[:, None] * LOGITS_stride_q + 0 * LOGITS_stride_h + k_idx[None, :] * LOGITS_stride_k
+        allowed = k_idx[None, :] < (q_offsets[:, None] + 1 + delta)
+        vals = tl.load(LOGITS_ptrs, mask=(q_mask[:, None] & (k_idx < num_kv_tokens) & allowed), other=-float("inf"))
+        exp_vals = tl.exp(vals - max_vals[:, None])
+        sum_exp += tl.sum(exp_vals, axis=1)
+
+    lse_vals = max_vals + tl.log(sum_exp) * LN2  # [Q]
+    LSE_ptrs = LSE + q_offsets * LSE_stride_q + 0 * LSE_stride_h
+    tl.store(LSE_ptrs, lse_vals, mask=q_mask)
+
+
+@triton.jit
+def _softmax_output_kernel(
+    LOGITS, V_EXP, LSE, OUT,
+    num_q_tokens, num_kv_tokens, head_dim,
+    LOGITS_stride_q, LOGITS_stride_h, LOGITS_stride_k,
+    V_EXP_stride_k, V_EXP_stride_h, V_EXP_stride_d,
+    OUT_stride_q, OUT_stride_h, OUT_stride_d,
+    BLOCK_Q: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr
+):
+    # Grid: (ceil(num_q_tokens/BLOCK_Q), ceil(head_dim/BLOCK_D))
+    pid_q = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    q_offsets = pid_q * BLOCK_Q + tl.arange(0, BLOCK_Q)  # [BLOCK_Q]
+    d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)  # [BLOCK_D]
+
+    q_mask = q_offsets < num_q_tokens
+    d_mask = d_offsets < head_dim
+
+    # Load lse for this q
+    LSE_ptrs = LSE + q_offsets * LSE_stride_q + 0 * LSE_stride_h
+    lse_vals = tl.load(LSE_ptrs, mask=q_mask, other=-float("inf"))  # [Q]
+
+    # Accumulate output[q, d] = sum_k softmax(logits[q,k]) * V[k,d]
+    out_row = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
+
+    for di in range(0, BLOCK_D):
+        d_idx = d + di
+        d_mask = d_idx < head_dim
+
+        # Compute softmax over K per q
+        sum_exp_q = tl.zeros((BLOCK_Q,), dtype=tl.float32)
+        for k0 in range(0, 128, BLOCK_K):
+            k_offsets = k0 + tl.arange(0, BLOCK_K)  # [BLOCK_K]
+            k_mask = k_offsets < num_kv_tokens
+            allowed = k_offsets[None, :] < (q_offsets[:, None] + 1 + delta)
+
+            LOGITS_ptrs = LOGITS + q_offsets[:, None] * LOGITS_stride_q + 0 * LOGITS_stride_h + k_offsets[None, :] * LOGITS_stride_k
+            vals = tl.load(LOGITS_ptrs, mask=(q_mask[:, None] & k_mask[None, :] & allowed), other=-float("inf"))  # [Q, K]
+            vals = vals - lse_vals[:, None]  # [Q, K]
+            exp_vals = tl.exp(vals)  # [Q, K]
+            sum_exp_q += tl.sum(exp_vals, axis=1)  # [Q]
+
+        # Compute output contributions for this d
+        for k0 in range(0, 128, BLOCK_K):
+            k_offsets = k0 + tl.arange(0, BLOCK_K)  # [BLOCK_K]
+            k_mask = k_offsets < num_kv_tokens
+            allowed = k_offsets[None, :] < (q_offsets[:, None] + 1 + delta)
+
+            # Softmax probabilities
+            LOGITS_ptrs = LOGITS + q_offsets[:, None] * LOGITS_stride_q + 0 * LOGITS_stride_h + k_offsets[None, :] * LOGITS_stride_k
+            vals = tl.load(LOGITS_ptrs, mask=(q_mask[:, None] & k_mask[None, :] & allowed), other=-float("inf"))  # [Q, K]
+            vals = vals - lse_vals[:, None]  # [Q, K]
+            probs = tl.exp(vals) / sum_exp_q[:, None]  # [Q, K]
+
+            # V_exp[k, d]
+            V_ptrs = V_EXP + k_offsets[:, None] * V_EXP_stride_k + 0 * V_EXP_stride_h + d_idx * V_EXP_stride_d
+            v_vals = tl.load(V_ptrs, mask=(k_mask[:, None] & d_mask[None, :]), other=0.0)  # [K, D_sub] -> here D_sub=1
+
+            # Contribution: sum_k probs[q,k] * v[k, d] -> [Q, 1]
+            contrib = tl.sum(probs * v_vals, axis=1)  # [Q]
+            out_row[:, di] += contrib  # accumulate across K tiles
+
+    # Store out_row
+    OUT_ptrs = OUT + q_offsets[:, None] * OUT_stride_q + 0 * OUT_stride_h + d_offsets[None, :] * OUT_stride_d
+    tl.store(OUT_ptrs, out_row, mask=(q_mask[:, None] & d_mask[None, :]))
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, q, k, v, qo_indptr, kv_indptr, sm_scale):
+        total_q, num_qo_heads, head_dim = q.shape
+        total_kv, num_kv_heads, _ = k.shape
+        len_indptr = qo_indptr.shape[0]
+
+        # Checks (same as original)
+        assert num_qo_heads == 32
+        assert num_kv_heads == 8
+        assert head_dim == 128
+        assert total_q == int(qo_indptr[-1].item())
+        assert total_kv == int(kv_indptr[-1].item())
+
+        device = q.device
+        output = torch.empty((total_q, num_qo_heads, head_dim), dtype=torch.float32, device=device)
+        lse = torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=device)
+
+        gqa_ratio = num_qo_heads // num_kv_heads
+
+        # Pre-expand K and V by GQA ratio along heads
+        k_expanded = k.repeat_interleave(gqa_ratio, dim=1)  # [total_kv, 32, 128]
+        v_expanded = v.repeat_interleave(gqa_ratio, dim=1)  # [total_kv, 32, 128]
+
+        # Process segments
+        for b in range(len_indptr - 1):
+            q_start = int(qo_indptr[b].item())
+            q_end = int(qo_indptr[b + 1].item())
+
+            kv_start = int(kv_indptr[b].item())
+            kv_end = int(kv_indptr[b + 1].item())
+
+            if q_start >= q_end or kv_start >= kv_end:
+                continue
+
+            # Slice tensors
+            q_batch = q[q_start:q_end]                      # [num_q_tokens, 32, 128]
+            k_batch = k_expanded[kv_start:kv_end]          # [num_kv_tokens, 32, 128]
+            v_batch = v_expanded[kv_start:kv_end]          # [num_kv_tokens, 32, 128]
+
+            num_q_tokens = q_batch.shape[0]
+            num_kv_tokens = k_batch.shape[0]
+            delta = num_kv_tokens - num_q_tokens
+
+            # Allocate per-segment outputs
+            out_seg = torch.empty((num_q_tokens, num_qo_heads, head_dim), dtype=torch.float32, device=device)
+            lse_seg = torch.empty((num_q_tokens, num_qo_heads), dtype=torch.float32, device=device)
+
+            # Launch Triton kernels
+
+            # 1) Compute logits: Q @ K^T per (q,h). We set h=0 since we compute over all heads via grid over heads.
+            # We need to compute LOGITS[num_q_tokens, num_kv_tokens] for each head h. To do this, we launch for h in range(num_qo_heads).
+            for h in range(num_qo_heads):
+                LOGITS_seg = torch.empty((num_q_tokens, num_kv_tokens), dtype=torch.float32, device=device)
+                grid = lambda meta: (triton.cdiv(num_q_tokens, meta['BLOCK_Q']),
+                                     triton.cdiv(head_dim, meta['BLOCK_D']),
+                                     triton.cdiv(num_kv_tokens, meta['BLOCK_K']))
+                _compute_logits_kernel[grid](
+                    q_batch, k_batch, LOGITS_seg,
+                    num_q_tokens, num_kv_tokens, head_dim,
+                    q_batch.stride(0), q_batch.stride(1), q_batch.stride(2),
+                    k_batch.stride(0), k_batch.stride(1), k_batch.stride(2),
+                    LOGITS_seg.stride(0), LOGITS_seg.stride(1),
+                    BLOCK_Q=1, BLOCK_K=64, BLOCK_D=16
+                )
+
+                # 2) LSE with causal mask
+                grid_lse = lambda meta: (triton.cdiv(num_q_tokens, meta['BLOCK_Q']),
+                                         triton.cdiv(head_dim, meta['BLOCK_K']))
+                _lse_masked_kernel[grid_lse](
+                    LOGITS_seg, lse_seg,
+                    num_q_tokens, num_kv_tokens, head_dim,
+                    LOGITS_seg.stride(0), LOGITS_seg.stride(1),
+                    lse_seg.stride(0), lse_seg.stride(1),
+                    LN2, delta,
+                    BLOCK_Q=1, BLOCK_K=64
+                )
+
+                # 3) Softmax + output
+                grid_out = lambda meta: (triton.cdiv(num_q_tokens, meta['BLOCK_Q']),
+                                         triton.cdiv(head_dim, meta['BLOCK_D']))
+                _softmax_output_kernel[grid_out](
+                    LOGITS_seg, v_batch, lse_seg, out_seg,
+                    num_q_tokens, num_kv_tokens, head_dim,
+                    LOGITS_seg.stride(0), LOGITS_seg.stride(1),
+                    v_batch.stride(0), v_batch.stride(1), v_batch.stride(2),
+                    out_seg.stride(0), out_seg.stride(1), out_seg.stride(2),
+                    BLOCK_Q=1, BLOCK_K=64, BLOCK_D=16
+                )
+
+            # Copy segment results to global output/lse
+            output[q_start:q_end] = out_seg
+            lse[q_start:q_end] = lse_seg
+
+        return output, lse
+
+
+def run(*args):
+    return ModelNew()(*args)

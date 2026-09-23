@@ -1,0 +1,319 @@
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def apply_mask_to_h_triton(
+    h_ptr,          # *f32, input h [B, C1, T]
+    mask_ptr,       # *f32, mask [B, 1, T]
+    out_ptr,        # *f32, output masked_h [B, C1, T]
+    B: tl.constexpr, C1: tl.constexpr, T: tl.constexpr,
+    h_stride_b: tl.constexpr, h_stride_c: tl.constexpr, h_stride_t: tl.constexpr,
+    mask_stride_b: tl.constexpr, mask_stride_c: tl.constexpr, mask_stride_t: tl.constexpr,
+    out_stride_b: tl.constexpr, out_stride_c: tl.constexpr, out_stride_t: tl.constexpr,
+    BLOCK_C: tl.constexpr, BLOCK_T: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    pid_t = tl.program_id(2)
+
+    c_start = pid_c * BLOCK_C
+    t_start = pid_t * BLOCK_T
+
+    c_offsets = c_start + tl.arange(0, BLOCK_C)  # [BLOCK_C]
+    t_offsets = t_start + tl.arange(0, BLOCK_T)  # [BLOCK_T]
+
+    c_mask = c_offsets < C1
+    t_mask = t_offsets < T
+
+    # load h tile: [BLOCK_C, BLOCK_T]
+    h_ptrs = h_ptr + pid_b * h_stride_b + c_offsets[:, None] * h_stride_c + t_offsets[None, :] * h_stride_t
+    h_vals = tl.load(h_ptrs, mask=c_mask[:, None] & t_mask[None, :], other=0.0)
+
+    # load mask along time: mask shape [B, 1, T], so mask_ptr + pid_b * mask_stride_b + t * mask_stride_t
+    mask_ptrs = mask_ptr + pid_b * mask_stride_b + t_offsets[None, :] * mask_stride_t
+    mask_vals = tl.load(mask_ptrs, mask=t_mask[None, :], other=1.0)
+
+    # elementwise multiply: broadcast mask along channels
+    out_vals = h_vals * mask_vals  # shape [BLOCK_C, BLOCK_T]
+
+    # store
+    out_ptrs = out_ptr + pid_b * out_stride_b + c_offsets[:, None] * out_stride_c + t_offsets[None, :] * out_stride_t
+    tl.store(out_ptrs, out_vals, mask=c_mask[:, None] & t_mask[None, :])
+
+
+@triton.jit
+def add_h_to_x1_triton(
+    x1_ptr,         # *f32, input x1 [B, C1, T]
+    h_ptr,          # *f32, input h [B, C1, T]
+    out_ptr,        # *f32, output x1_out [B, C1, T]
+    B: tl.constexpr, C1: tl.constexpr, T: tl.constexpr,
+    x1_stride_b: tl.constexpr, x1_stride_c: tl.constexpr, x1_stride_t: tl.constexpr,
+    h_stride_b: tl.constexpr, h_stride_c: tl.constexpr, h_stride_t: tl.constexpr,
+    out_stride_b: tl.constexpr, out_stride_c: tl.constexpr, out_stride_t: tl.constexpr,
+    ADD: tl.constexpr,  # bool: True for add, False for subtract
+    BLOCK_C: tl.constexpr, BLOCK_T: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    pid_t = tl.program_id(2)
+
+    c_start = pid_c * BLOCK_C
+    t_start = pid_t * BLOCK_T
+
+    c_offsets = c_start + tl.arange(0, BLOCK_C)  # [BLOCK_C]
+    t_offsets = t_start + tl.arange(0, BLOCK_T)  # [BLOCK_T]
+
+    c_mask = c_offsets < C1
+    t_mask = t_offsets < T
+
+    x1_ptrs = x1_ptr + pid_b * x1_stride_b + c_offsets[:, None] * x1_stride_c + t_offsets[None, :] * x1_stride_t
+    h_ptrs  = h_ptr  + pid_b * h_stride_b   + c_offsets[:, None] * h_stride_c   + t_offsets[None, :] * h_stride_t
+    out_ptrs = out_ptr + pid_b * out_stride_b + c_offsets[:, None] * out_stride_c + t_offsets[None, :] * out_stride_t
+
+    x1_vals = tl.load(x1_ptrs, mask=c_mask[:, None] & t_mask[None, :], other=0.0)
+    h_vals  = tl.load(h_ptrs,  mask=c_mask[:, None] & t_mask[None, :], other=0.0)
+    res = x1_vals + (h_vals if ADD else -h_vals)
+    tl.store(out_ptrs, res, mask=c_mask[:, None] & t_mask[None, :])
+
+
+@triton.jit
+def concat_and_add_v1(
+    x0_ptr,         # *f32, x0 [B, C0, T]
+    x1_ptr,         # *f32, x1 [B, C1, T]
+    out_ptr,        # *f32, output [B, C0+C1, T]
+    B: tl.constexpr, C0: tl.constexpr, C1: tl.constexpr, T: tl.constexpr,
+    x0_stride_b: tl.constexpr, x0_stride_c: tl.constexpr, x0_stride_t: tl.constexpr,
+    x1_stride_b: tl.constexpr, x1_stride_c: tl.constexpr, x1_stride_t: tl.constexpr,
+    out_stride_b: tl.constexpr, out_stride_c: tl.constexpr, out_stride_t: tl.constexpr,
+    BLOCK_C0: tl.constexpr, BLOCK_C1: tl.constexpr, BLOCK_T: tl.constexpr,
+):
+    # Grid: (B, 2, ceil(T/BLOCK_T)) so we can separate writing x0 and x1 halves
+    pid_b = tl.program_id(0)
+    half = tl.program_id(1)  # 0 for x0, 1 for x1
+    pid_t = tl.program_id(2)
+
+    t_start = pid_t * BLOCK_T
+    t_offsets = t_start + tl.arange(0, BLOCK_T)
+    t_mask = t_offsets < T
+
+    if half == 0:
+        c0_start = tl.program_id(3) * BLOCK_C0
+        c_offsets = c0_start + tl.arange(0, BLOCK_C0)
+        c_mask = c_offsets < C0
+        src_ptrs = x0_ptr + pid_b * x0_stride_b + c_offsets[:, None] * x0_stride_c + t_offsets[None, :] * x0_stride_t
+        dst_c_base = 0
+    else:
+        c1_start = tl.program_id(3) * BLOCK_C1
+        c_offsets = c1_start + tl.arange(0, BLOCK_C1)
+        c_mask = c_offsets < C1
+        src_ptrs = x1_ptr + pid_b * x1_stride_b + c_offsets[:, None] * x1_stride_c + t_offsets[None, :] * x1_stride_t
+        dst_c_base = C0
+
+    vals = tl.load(src_ptrs, mask=c_mask[:, None] & t_mask[None, :], other=0.0)
+    dst_ptrs = out_ptr + pid_b * out_stride_b + (dst_c_base + c_offsets)[:, None] * out_stride_c + t_offsets[None, :] * out_stride_t
+    tl.store(dst_ptrs, vals, mask=c_mask[:, None] & t_mask[None, :])
+
+
+@triton.jit
+def concat_and_add_v2(
+    x0_ptr,         # *f32, x0 [B, C0, T]
+    x1_ptr,         # *f32, x1 [B, C1, T]
+    out_ptr,        # *f32, output [B, C0+C1, T]
+    B: tl.constexpr, C0: tl.constexpr, C1: tl.constexpr, T: tl.constexpr,
+    x0_stride_b: tl.constexpr, x0_stride_c: tl.constexpr, x0_stride_t: tl.constexpr,
+    x1_stride_b: tl.constexpr, x1_stride_c: tl.constexpr, x1_stride_t: tl.constexpr,
+    out_stride_b: tl.constexpr, out_stride_c: tl.constexpr, out_stride_t: tl.constexpr,
+    BLOCK_C0: tl.constexpr, BLOCK_C1: tl.constexpr, BLOCK_T: tl.constexpr,
+):
+    # Grid: (B, 2, ceil(T/BLOCK_T)) so we can separate writing x0 and x1 halves
+    pid_b = tl.program_id(0)
+    half = tl.program_id(1)  # 0 for x0, 1 for x1
+    pid_t = tl.program_id(2)
+
+    t_start = pid_t * BLOCK_T
+    t_offsets = t_start + tl.arange(0, BLOCK_T)
+    t_mask = t_offsets < T
+
+    if half == 0:
+        c0_start = tl.program_id(3) * BLOCK_C0
+        c_offsets = c0_start + tl.arange(0, BLOCK_C0)
+        c_mask = c_offsets < C0
+        src_ptrs = x0_ptr + pid_b * x0_stride_b + c_offsets[:, None] * x0_stride_c + t_offsets[None, :] * x0_stride_t
+        dst_c_base = 0
+    else:
+        c1_start = tl.program_id(3) * BLOCK_C1
+        c_offsets = c1_start + tl.arange(0, BLOCK_C1)
+        c_mask = c_offsets < C1
+        src_ptrs = x1_ptr + pid_b * x1_stride_b + c_offsets[:, None] * x1_stride_c + t_offsets[None, :] * x1_stride_t
+        dst_c_base = C0
+
+    vals = tl.load(src_ptrs, mask=c_mask[:, None] & t_mask[None, :], other=0.0)
+    dst_ptrs = out_ptr + pid_b * out_stride_b + (dst_c_base + c_offsets)[:, None] * out_stride_c + t_offsets[None, :] * out_stride_t
+    tl.store(dst_ptrs, vals, mask=c_mask[:, None] & t_mask[None, :])
+
+
+def run(
+    x: torch.Tensor,
+    x_mask: torch.Tensor,
+    reverse: bool,
+    transform_0_conv0_weight: torch.Tensor,
+    transform_0_conv0_bias: torch.Tensor,
+    transform_0_conv1_weight: torch.Tensor,
+    transform_0_conv1_bias: torch.Tensor,
+    transform_0_conv2_weight: torch.Tensor,
+    transform_0_conv2_bias: torch.Tensor,
+    transform_1_conv0_weight: torch.Tensor,
+    transform_1_conv0_bias: torch.Tensor,
+    transform_1_conv1_weight: torch.Tensor,
+    transform_1_conv1_bias: torch.Tensor,
+    transform_1_conv2_weight: torch.Tensor,
+    transform_1_conv2_bias: torch.Tensor,
+    transform_2_conv0_weight: torch.Tensor,
+    transform_2_conv0_bias: torch.Tensor,
+    transform_2_conv1_weight: torch.Tensor,
+    transform_2_conv1_bias: torch.Tensor,
+    transform_2_conv2_weight: torch.Tensor,
+    transform_2_conv2_bias: torch.Tensor,
+    transform_3_conv0_weight: torch.Tensor,
+    transform_3_conv0_bias: torch.Tensor,
+    transform_3_conv1_weight: torch.Tensor,
+    transform_3_conv1_bias: torch.Tensor,
+    transform_3_conv2_weight: torch.Tensor,
+    transform_3_conv2_bias: torch.Tensor,
+):
+    """
+    Residual coupling flow block.
+    Forward: x1 = x1 + transform(x0) for each layer
+    Reverse: x1 = x1 - transform(x0) for each layer (in reverse order)
+    """
+    # Ensure CUDA tensors
+    device = x.device
+    B, C, T = x.shape
+    half_channels = C // 2
+
+    # Split into halves
+    x0 = x[:, :half_channels, :]
+    x1 = x[:, half_channels:, :]
+
+    # List of transforms
+    transforms = [
+        (transform_0_conv0_weight, transform_0_conv0_bias,
+         transform_0_conv1_weight, transform_0_conv1_bias,
+         transform_0_conv2_weight, transform_0_conv2_bias),
+        (transform_1_conv0_weight, transform_1_conv0_bias,
+         transform_1_conv1_weight, transform_1_conv1_bias,
+         transform_1_conv2_weight, transform_1_conv2_bias),
+        (transform_2_conv0_weight, transform_2_conv0_bias,
+         transform_2_conv1_weight, transform_2_conv1_bias,
+         transform_2_conv2_weight, transform_2_conv2_bias),
+        (transform_3_conv0_weight, transform_3_conv0_bias,
+         transform_3_conv1_weight, transform_3_conv1_bias,
+         transform_3_conv2_weight, transform_3_conv2_bias),
+    ]
+
+    if not reverse:
+        # Forward: apply transforms sequentially, then update x1, concatenate
+        for i, (conv0_w, conv0_b, conv1_w, conv1_b, conv2_w, conv2_b) in enumerate(transforms):
+            # conv0: input (B, half_channels, T), output (B, hidden_channels, T), then ReLU
+            h0 = torch.nn.functional.conv1d(x0, conv0_w, conv0_b, stride=1, padding=(conv0_w.shape[2] - 1) // 2, dilation=1, groups=1)
+            h0 = torch.relu(h0)
+            # conv1: input h0, output same shape, then ReLU
+            h1 = torch.nn.functional.conv1d(h0, conv1_w, conv1_b, stride=1, padding=(conv1_w.shape[2] - 1) // 2, dilation=1, groups=1)
+            h1 = torch.relu(h1)
+            # conv2: input h1, output (B, half_channels, T)
+            h = torch.nn.functional.conv1d(h1, conv2_w, conv2_b, stride=1, padding=(conv2_w.shape[2] - 1) // 2, dilation=1, groups=1)
+
+            # Apply mask to h: broadcast along channels
+            masked_h = torch.empty_like(h)
+            apply_mask_to_h_triton[(B, triton.cdiv(h.shape[1], 64), triton.cdiv(h.shape[2], 64))](
+                h, x_mask, masked_h,
+                B, h.shape[1], h.shape[2],
+                h.stride(0), h.stride(1), h.stride(2),
+                x_mask.stride(0), x_mask.stride(1), x_mask.stride(2),
+                masked_h.stride(0), masked_h.stride(1), masked_h.stride(2),
+                BLOCK_C=64, BLOCK_T=64,
+            )
+
+            # Update x1: x1 = x1 + masked_h
+            x1_out = torch.empty_like(x1)
+            add_h_to_x1_triton[(B, triton.cdiv(x1.shape[1], 64), triton.cdiv(x1.shape[2], 64))](
+                x1, masked_h, x1_out,
+                B, x1.shape[1], x1.shape[2],
+                x1.stride(0), x1.stride(1), x1.stride(2),
+                masked_h.stride(0), masked_h.stride(1), masked_h.stride(2),
+                x1_out.stride(0), x1_out.stride(1), x1_out.stride(2),
+                ADD=True, BLOCK_C=64, BLOCK_T=64,
+            )
+
+            # Concatenate back: out = [x0, x1_out]
+            out = torch.empty((B, C, T), dtype=torch.float32, device=device)
+            # Write x0 to out[:, :half_channels, :]
+            concat_and_add_v1[(B, 2, triton.cdiv(T, 64), triton.cdiv(half_channels, 64))](
+                x0, x1_out, out,
+                B, half_channels, x1.shape[1], T,
+                x0.stride(0), x0.stride(1), x0.stride(2),
+                x1_out.stride(0), x1_out.stride(1), x1_out.stride(2),
+                out.stride(0), out.stride(1), out.stride(2),
+                BLOCK_C0=64, BLOCK_C1=64, BLOCK_T=64,
+            )
+            x = out
+    else:
+        # Reverse: apply transforms in reverse order, subtract h from x1
+        for conv0_w, conv0_b, conv1_w, conv1_b, conv2_w, conv2_b in reversed(transforms):
+            # Forward the convs again to get h (then subtract)
+            # conv0
+            h0 = torch.nn.functional.conv1d(x0, conv0_w, conv0_b, stride=1, padding=(conv0_w.shape[2] - 1) // 2, dilation=1, groups=1)
+            h0 = torch.relu(h0)
+            # conv1
+            h1 = torch.nn.functional.conv1d(h0, conv1_w, conv1_b, stride=1, padding=(conv1_w.shape[2] - 1) // 2, dilation=1, groups=1)
+            h1 = torch.relu(h1)
+            # conv2
+            h = torch.nn.functional.conv1d(h1, conv2_w, conv2_b, stride=1, padding=(conv2_w.shape[2] - 1) // 2, dilation=1, groups=1)
+
+            # Mask h
+            masked_h = torch.empty_like(h)
+            apply_mask_to_h_triton[(B, triton.cdiv(h.shape[1], 64), triton.cdiv(h.shape[2], 64))](
+                h, x_mask, masked_h,
+                B, h.shape[1], h.shape[2],
+                h.stride(0), h.stride(1), h.stride(2),
+                x_mask.stride(0), x_mask.stride(1), x_mask.stride(2),
+                masked_h.stride(0), masked_h.stride(1), masked_h.stride(2),
+                BLOCK_C=64, BLOCK_T=64,
+            )
+
+            # Update x1: x1 = x1 - masked_h
+            x1_out = torch.empty_like(x1)
+            add_h_to_x1_triton[(B, triton.cdiv(x1.shape[1], 64), triton.cdiv(x1.shape[2], 64))](
+                x1, masked_h, x1_out,
+                B, x1.shape[1], x1.shape[2],
+                x1.stride(0), x1.stride(1), x1.stride(2),
+                masked_h.stride(0), masked_h.stride(1), masked_h.stride(2),
+                x1_out.stride(0), x1_out.stride(1), x1_out.stride(2),
+                ADD=False, BLOCK_C=64, BLOCK_T=64,
+            )
+
+            # Concatenate back: out = [x0, x1_out]
+            out = torch.empty((B, C, T), dtype=torch.float32, device=device)
+            concat_and_add_v2[(B, 2, triton.cdiv(T, 64), triton.cdiv(x1.shape[1], 64))](
+                x0, x1_out, out,
+                B, half_channels, x1.shape[1], T,
+                x0.stride(0), x0.stride(1), x0.stride(2),
+                x1_out.stride(0), x1_out.stride(1), x1_out.stride(2),
+                out.stride(0), out.stride(1), out.stride(2),
+                BLOCK_C0=64, BLOCK_C1=64, BLOCK_T=64,
+            )
+            x = out
+
+    return x
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, *args):
+        return run(*args)
+
+
+def run(*args):
+    return ModelNew()(*args)

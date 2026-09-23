@@ -1,0 +1,331 @@
+import torch
+import math
+import triton
+import triton.language as tl
+
+
+# Triton LayerNorm: one program per row. Two-pass: reduce -> normalize -> affine.
+@triton.jit
+def _layer_norm_kernel(x_ptr, y_ptr, ln_weight_ptr, ln_bias_ptr,
+                        N, C, eps,
+                        BLOCK_SIZE: tl.constexpr):
+    """
+    x_ptr: *bf16, shape [N, C], row-major
+    y_ptr: *bf16, shape [N, C], output
+    ln_weight_ptr, ln_bias_ptr: *bf16, shape [C]
+    eps: float32
+    """
+    row = tl.program_id(0)
+    if row >= N:
+        return
+
+    x_row_ptr = x_ptr + row * C
+    y_row_ptr = y_ptr + row * C
+
+    # Pass 1: compute mean and variance (fp32) over the row
+    sum_val = 0.0
+    sum_sq = 0.0
+    col = 0
+    while col < C:
+        offs = col + tl.arange(0, BLOCK_SIZE)
+        mask = offs < C
+        x = tl.load(x_row_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        sum_val += tl.sum(x, axis=0)
+        sum_sq += tl.sum(x * x, axis=0)
+        col += BLOCK_SIZE
+
+    mean = sum_val / C
+    var = sum_sq / C
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    # Pass 2: normalize and apply affine, then store
+    col = 0
+    while col < C:
+        offs = col + tl.arange(0, BLOCK_SIZE)
+        mask = offs < C
+        x = tl.load(x_row_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(ln_weight_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+        b = tl.load(ln_bias_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        y = (x - mean) * inv_std
+        y = y * w + b
+        tl.store(y_row_ptr + offs, y.to(tl.bfloat16), mask=mask)
+        col += BLOCK_SIZE
+
+
+# Triton kernel: Exact 2x2 spatial shuffle per grid. Produces hidden_shuffled for that grid only.
+# This kernel assumes we feed hidden_norm per-grid (as done by the host: concatenation of grids
+# into one tensor, but we launch per-grid and index accordingly). It writes output rows for that grid
+# into a per-grid out tensor. The host will concatenate these per-grid outputs into a single tensor.
+@triton.jit
+def _shuffle_2x2_per_grid_kernel(hidden_ptr, grid_thw_ptr, out_ptr,
+                                 NUM_T, H, W, HMERGED, WMERGED,
+                                 C,  # hidden_size
+                                 BLOCK_M: tl.constexpr):
+    """
+    hidden_ptr: *bf16, shape [NUM_T * H * W, C] (flattened row-major)
+    grid_thw_ptr: *int64, shape [1, 3] (only one grid processed per program)
+    out_ptr: *bf16, shape [NUM_T * HMERGED * WMERGED, 4*C] (flattened)
+    We launch one program per grid (here, per program_id(0) corresponds to grid 0; the host
+    would duplicate this for each grid). The kernel reads hidden rows for this grid and writes
+    shuffled rows.
+    """
+    g = tl.program_id(0)  # single grid assumed per program; host will launch multiple if needed
+    # Load grid dims
+    t = tl.load(grid_thw_ptr + g * 3 + 0).to(tl.int32)
+    h = tl.load(grid_thw_ptr + g * 3 + 1).to(tl.int32)
+    w = tl.load(grid_thw_ptr + g * 3 + 2).to(tl.int32)
+
+    # h_merged and w_merged are passed as HMERGED, WMERGED (since merge_size=2)
+    h_merged = HMERGED
+    w_merged = WMERGED
+    num_merged_rows = t * h_merged * w_merged
+
+    # We will write per original patch m in [0, t*h*w)
+    m = 0
+    while m < t * h * w:
+        # Decode indices
+        t_index = m // (h * w)
+        rem = m % (h * w)
+        h2 = rem // w
+        w2 = rem % w
+
+        # Output row index for this original patch
+        out_row = t_index * (h_merged * w_merged) + (h2 // 2) * w_merged + (w2 // 2)
+        base_out = out_ptr + out_row * (4 * C)
+
+        # Map each of the 4 positions in the 2x2 patch to its source and store contiguously
+        # idx=0: (r=0,c=0) -> hidden[t_index, h2, w2]
+        idx0 = 0
+        col0 = (h2 * 2 + 0) * w_merged * C + (w2 * 2 + 0) * C  # = h2*2*w*w*C + w2*2*C
+        src_offset0 = t_index * (h * w) + h2 * w + w2
+        val0 = tl.load(hidden_ptr + src_offset0 * C + 0, mask=(h2 < h) & (w2 < w), other=0.0).to(tl.bfloat16)
+        tl.store(base_out + idx0 * C, val0)
+
+        # idx=1: (r=0,c=1) -> hidden[t_index, h2, w2+1]
+        idx1 = 1
+        col1 = (h2 * 2 + 0) * w_merged * C + (w2 * 2 + 1) * C
+        src_offset1 = t_index * (h * w) + h2 * w + (w2 + 1)
+        val1 = tl.load(hidden_ptr + src_offset1 * C + 0, mask=(h2 < h) & (w2 + 1 < w), other=0.0).to(tl.bfloat16)
+        tl.store(base_out + idx1 * C, val1)
+
+        # idx=2: (r=1,c=0) -> hidden[t_index, h2+1, w2]
+        idx2 = 2
+        col2 = (h2 * 2 + 1) * w_merged * C + (w2 * 2 + 0) * C
+        src_offset2 = t_index * (h * w) + (h2 + 1) * w + w2
+        val2 = tl.load(hidden_ptr + src_offset2 * C + 0, mask=(h2 + 1 < h) & (w2 < w), other=0.0).to(tl.bfloat16)
+        tl.store(base_out + idx2 * C, val2)
+
+        # idx=3: (r=1,c=1) -> hidden[t_index, h2+1, w2+1]
+        idx3 = 3
+        col3 = (h2 * 2 + 1) * w_merged * C + (w2 * 2 + 1) * C
+        src_offset3 = t_index * (h * w) + (h2 + 1) * w + (w2 + 1)
+        val3 = tl.load(hidden_ptr + src_offset3 * C + 0, mask=(h2 + 1 < h) & (w2 + 1 < w), other=0.0).to(tl.bfloat16)
+        tl.store(base_out + idx3 * C, val3)
+
+        m += 1
+
+
+# Triton kernel: GELU activation elementwise on a single row. We launch per row.
+@triton.jit
+def _gelu_row_kernel(x_ptr, y_ptr, C, BLOCK_SIZE: tl.constexpr):
+    """
+    x_ptr: *bf16, shape [N, C], row-major
+    y_ptr: *bf16, shape [N, C]
+    GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+    Use erf from libdevice.
+    """
+    row = tl.program_id(0)
+    if row >= N:
+        return
+    x_row_ptr = x_ptr + row * C
+    y_row_ptr = y_ptr + row * C
+
+    col = 0
+    while col < C:
+        offs = col + tl.arange(0, BLOCK_SIZE)
+        mask = offs < C
+        x = tl.load(x_row_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        inv_sqrt2 = 0.7071067811865476  # 1/sqrt(2)
+        y = 0.5 * x * (1.0 + tl.libdevice.erf(x * inv_sqrt2))
+        tl.store(y_row_ptr + offs, y.to(tl.bfloat16), mask=mask)
+        col += BLOCK_SIZE
+
+
+# Triton row-wise GEMM: y[row, k_out] = sum_k x[row, k] * W[k_out, k] + bias[k_out]
+# Specialized for hidden_size_expanded=6144 (Linear1) and out_hidden_size=3584 (Linear2).
+@triton.jit
+def _row_gemm_linear1_kernel(x_ptr, W_ptr, b_ptr, y_ptr,
+                              NUM_ROWS, K, K_OUT,
+                              BLOCK_K: tl.constexpr, BLOCK_K_OUT: tl.constexpr):
+    """
+    x_ptr: *bf16, shape [NUM_ROWS, K] (row-major)
+    W_ptr: *bf16, shape [K_OUT, K] (row-major, i.e., weight tensor with [out_dim, in_dim])
+    b_ptr: *bf16, shape [K_OUT]
+    y_ptr: *bf16, shape [NUM_ROWS, K_OUT] (row-major)
+    Compute y[row, :] = x[row, :] @ W.T + b, with reductions over K in blocks.
+    """
+    row = tl.program_id(0)
+    if row >= NUM_ROWS:
+        return
+
+    x_row_ptr = x_ptr + row * K
+    y_row_ptr = y_ptr + row * K_OUT
+
+    # Reduction over K in blocks
+    k_block = 0
+    while k_block < K:
+        offs_k = k_block + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+
+        # Load W block [BLOCK_K_OUT, BLOCK_K]
+        # We will compute acc for all BLOCK_K_OUT columns for this row.
+        acc = tl.zeros((BLOCK_K_OUT,), dtype=tl.float32)
+        k_sub = 0
+        while k_sub < BLOCK_K:
+            offs_k_sub = k_sub + tl.arange(0, BLOCK_K)
+            mask_k_sub = offs_k_sub < K
+            # W[offs_k, offs_k_sub] -> row-major, so pointer is W_ptr + offs_k * K + offs_k_sub
+            W_block = tl.load(W_ptr + offs_k * K + offs_k_sub, mask=mask_k_sub, other=0.0).to(tl.float32)
+            # Load x for these K_sub
+            x_block = tl.load(x_row_ptr + offs_k_sub, mask=mask_k_sub, other=0.0).to(tl.float32)
+            # Accumulate: for each kk in BLOCK_K, acc[kk] += sum(W_block[kk, :] * x_block[:])
+            # Manually loop to keep it simple (BLOCK_K is constexpr).
+            kk = 0
+            while kk < BLOCK_K:
+                w_vec = W_block[kk, :]
+                x_val = x_block[kk]
+                acc += w_vec * x_val
+                kk += 1
+            k_sub += BLOCK_K
+
+        # Add bias
+        offs_k_out = tl.arange(0, BLOCK_K_OUT)
+        mask_k_out = offs_k_out < K_OUT
+        b_vec = tl.load(b_ptr + offs_k, mask=mask_k_out, other=0.0).to(tl.float32)
+        acc += b_vec
+
+        # Store results
+        tl.store(y_row_ptr + offs_k, acc.to(tl.bfloat16), mask=mask_k)
+        k_block += BLOCK_K
+
+
+# Forward: Triton-only model
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Constants from the original code
+        self.hidden_size = 1536
+        self.hidden_size_expanded = 6144
+        self.out_hidden_size = 3584
+        self.eps = 1e-6
+        # Triton block sizes (can be tuned)
+        self.block_size_ln = 1024
+        self.block_rows = 1
+        self.block_k = 128
+        self.block_k_out = 128
+
+    def forward(self, hidden: torch.Tensor,
+                grid_thw: torch.Tensor,
+                ln_weight: torch.Tensor,
+                ln_bias: torch.Tensor,
+                fc1_weight: torch.Tensor,
+                fc1_bias: torch.Tensor,
+                fc2_weight: torch.Tensor,
+                fc2_bias: torch.Tensor,
+                device: torch.device):
+        """
+        hidden: [num_patches, hidden_size] bfloat16, assumed contiguous
+        grid_thw: [num_grids, 3] int64, each row is [t, h, w]
+        """
+        # Ensure all tensors are on CUDA
+        assert hidden.is_cuda and grid_thw.is_cuda and ln_weight.is_cuda and ln_bias.is_cuda \
+               and fc1_weight.is_cuda and fc1_bias.is_cuda and fc2_weight.is_cuda and fc2_bias.is_cuda, \
+            "All tensors must be on CUDA for Triton kernels."
+
+        num_patches = hidden.shape[0]
+        hidden_norm = torch.empty_like(hidden)  # output of LayerNorm
+        # LayerNorm: one program per row
+        N = num_patches
+        C = hidden.shape[1]
+        grid = (N,)
+        _layer_norm_kernel[grid](hidden, hidden_norm, ln_weight, ln_bias,
+                                 N, C, self.eps,
+                                 BLOCK_SIZE=self.block_size_ln)
+
+        # Prepare per-grid outputs for spatial shuffle (we will concatenate later).
+        # However, to keep single output, we reconstruct hidden_shuffled by concatenating
+        # per-grid outputs in Python. This is acceptable since num_grids is small.
+        total_merged_patches = 0
+        for i in range(grid_thw.shape[0]):
+            t = int(grid_thw[i, 0].item())
+            h = int(grid_thw[i, 1].item())
+            w = int(grid_thw[i, 2].item())
+            h_merged = h // 2
+            w_merged = w // 2
+            num_merged_rows = t * h_merged * w_merged
+            total_merged_patches += num_merged_rows
+
+        # We need hidden_norm reshaped as per-grid. The original code concatenates all
+        # per-grid patches into a single hidden. Our hidden_norm already contains that
+        # concatenation (since hidden was concatenated). We will simulate per-grid reading
+        # by using grid_thw to compute how many patches each grid has, and launch
+        # _shuffle_2x2_per_grid_kernel multiple times (one per grid), writing into per-grid
+        # outputs, then we concatenate them.
+
+        # Create per-grid outputs buffers
+        out_per_grid_list = []
+        for i in range(grid_thw.shape[0]):
+            t = int(grid_thw[i, 0].item())
+            h = int(grid_thw[i, 1].item())
+            w = int(grid_thw[i, 2].item())
+            h_merged = h // 2
+            w_merged = w // 2
+            num_merged_rows = t * h_merged * w_merged
+
+            out_per_grid = torch.empty((num_merged_rows, self.hidden_size_expanded), dtype=torch.bfloat16, device=device)
+            # Launch shuffle kernel for this grid. We pass pointers to the relevant slice of hidden_norm.
+            # Since hidden_norm is a concatenation, we cannot directly slice it. Instead, we recompute
+            # the per-grid rows by using the grid contribution to num_patches and reading hidden_norm
+            # according to t,h,w. In this implementation, the hidden input is already the concatenated
+            # tensor; we can iterate over the grid_thw and read the corresponding rows from hidden_norm
+            # by computing the start index for each grid. But to keep it simple, we assume hidden
+            # is already in the expected concatenated order (which it is, by construction in get_inputs).
+            # Hence we can pass hidden_norm as the source.
+            _shuffle_2x2_per_grid_kernel[(1,)](hidden_norm, grid_thw, out_per_grid,
+                                               t, h, w, h_merged, w_merged,
+                                               self.hidden_size,
+                                               BLOCK_M=self.hidden_size)
+            out_per_grid_list.append(out_per_grid)
+
+        # Concatenate per-grid outputs to form hidden_shuffled
+        hidden_shuffled = torch.cat(out_per_grid_list, dim=0)
+
+        # Linear1: row-wise GEMM for demonstration (Triton)
+        linear1_out = torch.empty((hidden_shuffled.shape[0], self.hidden_size_expanded), dtype=torch.bfloat16, device=device)
+        NUM_ROWS = hidden_shuffled.shape[0]
+        K = self.hidden_size_expanded  # in input to Linear1
+        K_OUT = self.hidden_size_expanded  # output dim
+        _row_gemm_linear1_kernel[(NUM_ROWS,)](hidden_shuffled, fc1_weight, fc1_bias, linear1_out,
+                                              NUM_ROWS, K, K_OUT,
+                                              BLOCK_K=self.block_k, BLOCK_K_OUT=self.block_k_out)
+
+        # GELU activation (Triton per-row)
+        gelu_out = torch.empty_like(linear1_out)
+        # Launch one program per row
+        _gelu_row_kernel[(NUM_ROWS,)](linear1_out, gelu_out, self.hidden_size_expanded,
+                                      BLOCK_SIZE=self.block_size_ln)
+
+        # Linear2: row-wise GEMM
+        output = torch.empty((gelu_out.shape[0], self.out_hidden_size), dtype=torch.bfloat16, device=device)
+        NUM_ROWS = gelu_out.shape[0]
+        K = self.hidden_size_expanded  # input dim to Linear2
+        K_OUT = self.out_hidden_size  # output dim
+        _row_gemm_linear1_kernel[(NUM_ROWS,)](gelu_out, fc2_weight, fc2_bias, output,
+                                              NUM_ROWS, K, K_OUT,
+                                              BLOCK_K=self.block_k, BLOCK_K_OUT=self.block_k_out)
+
+        return output
+
+
+def run(*args):
+    return ModelNew()(*args)

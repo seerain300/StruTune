@@ -1,0 +1,192 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def cat_rows_kernel(
+    out_ptr,           # *float32, output X_cat[b, p, :]
+    e_ptr,             # *float32, encoder_hidden_states[b, :, :]
+    h_ptr,             # *float32, hidden_states[b, :, :]
+    M,                 # int: total rows = T + I
+    H,                 # int: hidden_dim
+    stride_e_b, stride_e_m, stride_e_n,  # strides for e
+    stride_h_b, stride_h_m, stride_h_n,  # strides for h
+    stride_o_b, stride_o_m, stride_o_n,  # strides for out
+    T,                 # int: text_seq_len
+    b,                 # int: batch id for this program (optional, can derive from grid)
+):
+    # program ids: grid is (B, M)
+    pid_b = tl.program_id(0)
+    pid_p = tl.program_id(1)
+
+    # Bounds check: p in [0, M)
+    # Triton supports masks for vectorized operations
+    if pid_p >= M:
+        return
+
+    # Compute pointers for the source rows
+    # If pid_p < T: take from encoder; else take from hidden starting at index pid_p - T
+    is_encoder = pid_p < T
+
+    # Encoders offset: pid_p selects row in [0, T)
+    # Hidden offset: pid_p - T selects row in [0, I)
+    e_row = pid_p
+    h_row = pid_p - T
+
+    # Base pointers for batch
+    e_base = e_ptr + pid_b * stride_e_b
+    h_base = h_ptr + pid_b * stride_h_b
+    out_base = out_ptr + pid_b * stride_o_b
+
+    # Compute row pointers
+    e_row_ptr = e_base + e_row * stride_e_m
+    h_row_ptr = h_base + h_row * stride_h_m
+    out_row_ptr = out_base + pid_p * stride_o_m
+
+    # Load the row
+    # Use masks to ensure we only load when is_encoder or not
+    # We'll load both if we need to, but we can compute based on is_encoder
+    # Initialize out row with zeros
+    # Triton does not have direct memset; we can set to 0 via tl.store with zeros
+    # First, fill zeros to out row
+    # Create a vector of indices for columns
+    cols = tl.arange(0, H)
+    out_vals = tl.zeros([H], dtype=tl.float32)
+    tl.store(out_row_ptr + cols * stride_o_n, out_vals, mask=True)
+
+    # Now, overwrite with source depending on is_encoder
+    if is_encoder:
+        vals = tl.load(e_row_ptr + cols * stride_e_n, mask=True, other=0.0)
+        tl.store(out_row_ptr + cols * stride_o_n, vals, mask=True)
+    else:
+        vals = tl.load(h_row_ptr + cols * stride_h_n, mask=True, other=0.0)
+        tl.store(out_row_ptr + cols * stride_o_n, vals, mask=True)
+
+
+@triton.jit
+def batched_matmul_kernel(
+    out_ptr,           # *float32, Y[b, p, :]
+    a_ptr,             # *float32, X_cat[b, p, :]
+    w_ptr,             # *float32, process_weight[h, k]
+    M,                 # int: rows = T + I
+    H,                 # int: hidden_dim (cols of A, rows of W, cols of Output)
+    stride_a_b, stride_a_m, stride_a_n,  # strides for A (X_cat)
+    stride_w_k, stride_w_n,              # strides for W
+    stride_o_b, stride_o_m, stride_o_n,  # strides for Out (Y)
+    BLOCK_M: tl.constexpr,               # tile size for M
+    BLOCK_N: tl.constexpr,               # tile size for N
+    BLOCK_K: tl.constexpr,               # tile size for K
+):
+    # One program per batch b
+    pid_b = tl.program_id(0)
+
+    # Output base pointer for this batch
+    out_base = out_ptr + pid_b * stride_o_b
+    a_base = a_ptr + pid_b * stride_a_b
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension in tiles
+    for k0 in range(0, H, BLOCK_K):
+        # Tile indices
+        m = tl.arange(0, BLOCK_M)  # rows
+        n = tl.arange(0, BLOCK_N)  # cols
+        k = tl.arange(0, BLOCK_K)  # reduction dim
+
+        # Masks for boundaries
+        m_mask = m < M
+        n_mask = n < H
+        k_mask = k + k0 < H
+
+        # Compute addresses
+        a_ptrs = a_base + m[:, None] * stride_a_m + (k[None, :] + k0) * stride_a_n  # shape [BM, BK]
+        w_ptrs = w_ptr + (k[None, :] + k0) * stride_w_k + n[:, None] * stride_w_n     # shape [BK, BN]
+
+        # Load tiles
+        a = tl.load(a_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        w = tl.load(w_ptrs, mask=k_mask[None, :] & n_mask[:, None], other=0.0)
+
+        # Accumulate
+        acc += tl.dot(a, w)  # [BM, BN]
+
+    # Store result tile
+    out_ptrs = out_base + m[:, None] * stride_o_m + n[None, :] * stride_o_n
+    tl.store(out_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
+
+
+class ModelNew(torch.nn.Module):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        process_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Triton-only implementation:
+        - Concatenate encoder_hidden_states and hidden_states along sequence dimension using Triton.
+        - Apply linear projection using Triton GEMM.
+        - Split into encoder and hidden streams on host.
+        """
+        assert hidden_states.is_cuda and encoder_hidden_states.is_cuda and process_weight.is_cuda, "Inputs must be CUDA tensors"
+        B = hidden_states.shape[0]
+        T = encoder_hidden_states.shape[1]
+        I = hidden_states.shape[1]
+        H = hidden_states.shape[2]
+
+        # Ensure contiguous
+        e = encoder_hidden_states.contiguous()
+        h = hidden_states.contiguous()
+        w = process_weight.contiguous()
+
+        # 1) Build X_cat[b, :, :] using Triton, shape [B, T+I, H]
+        M = T + I
+
+        # Allocate float32 outputs for kernels (we'll cast to original dtype after)
+        x_cat = torch.empty((B, M, H), dtype=torch.float32, device=hidden_states.device)
+
+        # Launch cat_rows_kernel
+        grid_cat = (B, M)
+        cat_rows_kernel[grid_cat](
+            x_cat,
+            e, h,
+            M, H,
+            e.stride(0), e.stride(1), e.stride(2),
+            h.stride(0), h.stride(1), h.stride(2),
+            x_cat.stride(0), x_cat.stride(1), x_cat.stride(2),
+            T,
+            num_warps=1, num_stages=1,
+        )
+
+        # 2) Apply linear projection using Triton GEMM: Y[b] = X_cat[b] @ w
+        y = torch.empty((B, M, H), dtype=torch.float32, device=hidden_states.device)
+
+        # Launch batched_matmul_kernel, one program per batch
+        grid_mm = (B,)
+        # Choose tile sizes based on H; for generality, use moderate tiles
+        # You can tune these for better performance:
+        BLOCK_M = 64
+        BLOCK_N = 64
+        BLOCK_K = 32
+
+        batched_matmul_kernel[grid_mm](
+            y, x_cat, w,
+            M, H,
+            x_cat.stride(0), x_cat.stride(1), x_cat.stride(2),
+            w.stride(0), w.stride(1),
+            y.stride(0), y.stride(1), y.stride(2),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            num_warps=4, num_stages=2,
+        )
+
+        # 3) Split into encoder and hidden streams (host-side slicing)
+        # Cast back to original dtype to match original function behavior
+        processed_encoder = y[:, :T, :].to(hidden_states.dtype)
+        processed_hidden = y[:, T:, :].to(hidden_states.dtype)
+
+        return processed_encoder, processed_hidden
+
+
+def run(*args):
+    return ModelNew()(*args)

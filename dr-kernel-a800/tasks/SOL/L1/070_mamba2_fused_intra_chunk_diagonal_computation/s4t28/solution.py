@@ -1,0 +1,239 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _build_lower_tri_exp_kernel(
+    A_ptr, L_ptr,
+    N, H, T, L_hs,
+    stride_A_n, stride_A_h, stride_A_t, stride_A_l,
+    stride_L_n, stride_L_h, stride_L_t, stride_L_i, stride_L_j,
+    num_warps: tl.constexpr, num_stages: tl.constexpr
+):
+    # One program per (n, h, t)
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_t = tl.program_id(2)
+
+    # Iterate rows i and cols j within the chunk size
+    # Use fixed 1D range to avoid dynamic loop issues; mask i, j < L_hs
+    for i in range(128):
+        i_scalar = i
+        i_valid = i_scalar < L_hs
+        # Initialize segment_sum for this i
+        segment_sum = 0.0
+        # Accumulate segment_sum[i, j] = sum_{m=0..j} A[n, h, t, i] if i <= j else 0
+        for j in range(128):
+            j_valid = j < L_hs
+            i_le_j = i_scalar <= j
+            # Only add A[n, h, t, i] when i<=j and both i,j valid
+            a_val = tl.load(
+                A_ptr + pid_n * stride_A_n + pid_h * stride_A_h + pid_t * stride_A_t + i_scalar * stride_A_l,
+                mask=i_valid & j_valid & i_le_j,
+                other=0.0
+            )
+            segment_sum += a_val
+        # Compute L[i, j] = exp(segment_sum) for i<=j, else 0
+        for j in range(128):
+            j_valid = j < L_hs
+            i_le_j = i_scalar <= j
+            l_val = tl.where(i_valid & j_valid & i_le_j, tl.exp(segment_sum), 0.0)
+            tl.store(
+                L_ptr + pid_n * stride_L_n + pid_h * stride_L_h + pid_t * stride_L_t + i_scalar * stride_L_i + j * stride_L_j,
+                l_val
+            )
+
+
+@triton.jit
+def _contract_bc_to_g_kernel(
+    B_ptr, C_ptr, G_ptr,
+    N, T, L_hs, H, G_const, K_const,
+    stride_B_n, stride_B_t, stride_B_l, stride_B_g, stride_B_k,
+    stride_C_n, stride_C_t, stride_C_l, stride_C_g, stride_C_k,
+    stride_G_n, stride_G_t, stride_G_l_i, stride_G_l_j, stride_G_h,
+    num_warps: tl.constexpr, num_stages: tl.constexpr
+):
+    # Grid over (n, t, i, j, h)
+    pid_n = tl.program_id(0)
+    pid_t = tl.program_id(1)
+    pid_i = tl.program_id(2)
+    pid_j = tl.program_id(3)
+    pid_h = tl.program_id(4)
+
+    acc = 0.0
+    # Sum over groups and K
+    g = 0
+    while g < G_const:
+        k = 0
+        while k < K_const:
+            b_val = tl.load(
+                B_ptr + pid_n * stride_B_n + pid_t * stride_B_t + pid_j * stride_B_l + g * stride_B_g + k * stride_B_k
+            )
+            c_val = tl.load(
+                C_ptr + pid_n * stride_C_n + pid_t * stride_C_t + pid_i * stride_C_l + g * stride_C_g + k * stride_C_k
+            )
+            acc += b_val * c_val
+            k += 1
+        g += 1
+    tl.store(
+        G_ptr + pid_n * stride_G_n + pid_t * stride_G_t + pid_i * stride_G_l_i + pid_j * stride_G_l_j + pid_h * stride_G_h,
+        acc
+    )
+
+
+@triton.jit
+def _apply_mask_and_store_M_kernel(
+    G_ptr, L_ptr, M_ptr,
+    N, T, L_hs, H,
+    stride_G_n, stride_G_t, stride_G_l_i, stride_G_l_j, stride_G_h,
+    stride_L_n, stride_L_h, stride_L_t, stride_L_i, stride_L_j,
+    stride_M_n, stride_M_t, stride_M_l_i, stride_M_l_j, stride_M_h,
+    num_warps: tl.constexpr, num_stages: tl.constexpr
+):
+    # Grid over (n, t, i, j, h)
+    pid_n = tl.program_id(0)
+    pid_t = tl.program_id(1)
+    pid_i = tl.program_id(2)
+    pid_j = tl.program_id(3)
+    pid_h = tl.program_id(4)
+
+    g_val = tl.load(
+        G_ptr + pid_n * stride_G_n + pid_t * stride_G_t + pid_i * stride_G_l_i + pid_j * stride_G_l_j + pid_h * stride_G_h
+    )
+    l_val = tl.load(
+        L_ptr + pid_n * stride_L_n + pid_h * stride_L_h + pid_t * stride_L_t + pid_i * stride_L_i + pid_j * stride_L_j
+    )
+    m_val = g_val * l_val
+    tl.store(
+        M_ptr + pid_n * stride_M_n + pid_t * stride_M_t + pid_i * stride_M_l_i + pid_j * stride_M_l_j + pid_h * stride_M_h,
+        m_val
+    )
+
+
+@triton.jit
+def _diag_matvec_sum_kernel(
+    M_ptr, HS_ptr, Y_ptr,
+    N, T, L_hs, H, D,
+    stride_M_n, stride_M_t, stride_M_l_i, stride_M_l_j, stride_M_h,
+    stride_HS_n, stride_HS_t, stride_HS_l, stride_HS_h, stride_HS_d,
+    stride_Y_n, stride_Y_t, stride_Y_l, stride_Y_h, stride_Y_d,
+    num_warps: tl.constexpr, num_stages: tl.constexpr
+):
+    # Grid over (n, t, i, h, d) - compute one Y element per program
+    pid_n = tl.program_id(0)
+    pid_t = tl.program_id(1)
+    pid_i = tl.program_id(2)
+    pid_h = tl.program_id(3)
+    pid_d = tl.program_id(4)
+
+    acc = 0.0
+    for j in range(128):
+        j_valid = j < L_hs
+        lower = pid_i >= j  # lower-triangular: i >= j
+        m_val = tl.load(
+            M_ptr + pid_n * stride_M_n + pid_t * stride_M_t + pid_i * stride_M_l_i + j * stride_M_l_j + pid_h * stride_M_h,
+            mask=j_valid & lower,
+            other=0.0
+        )
+        hs_val = tl.load(
+            HS_ptr + pid_n * stride_HS_n + pid_t * stride_HS_t + j * stride_HS_l + pid_h * stride_HS_h + pid_d * stride_HS_d,
+            mask=j_valid,
+            other=0.0
+        )
+        acc += m_val * hs_val
+    tl.store(
+        Y_ptr + pid_n * stride_Y_n + pid_t * stride_Y_t + pid_i * stride_Y_l + pid_h * stride_Y_h + pid_d * stride_Y_d,
+        acc
+    )
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor,
+                A_cumsum: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
+        """
+        Compute intra-chunk diagonal output Y_diag for Mamba2 SSD.
+        Steps:
+        1) Build lower-triangular mask L: segment_sum(A) to get cumulative decay factors, exp() for causal mask.
+        2) Contract B and C matrices to form attention-like weights G.
+        3) Apply mask: M = G * L.
+        4) Compute output: Y_diag = sum(M * hidden_states) over sequence dimension.
+        """
+        device = hidden_states.device
+        dtype = torch.float32  # compute in float32
+
+        # Extract shapes
+        N = hidden_states.shape[0]  # batch_size
+        T = hidden_states.shape[1]  # num_chunks
+        L_hs = hidden_states.shape[2]  # chunk_size
+        H = hidden_states.shape[3]  # num_heads
+        D = hidden_states.shape[4]  # head_dim
+
+        # Ensure inputs are contiguous and in float32 for compute
+        A = A_cumsum.to(torch.float32).contiguous()
+        Bc = B.to(torch.float32).contiguous()
+        Cc = C.to(torch.float32).contiguous()
+        HS = hidden_states.to(torch.float32).contiguous()
+
+        # 1) Build L in Triton: [N, H, T, L_hs, L_hs]
+        L = torch.empty((N, H, T, L_hs, L_hs), device=device, dtype=torch.float32)
+        # Compute strides
+        stride_A_n, stride_A_h, stride_A_t, stride_A_l = A.stride()
+        stride_L_n, stride_L_h, stride_L_t, stride_L_i, stride_L_j = L.stride()
+        grid_build = (N, H, T)
+        _build_lower_tri_exp_kernel[grid_build](
+            A, L,
+            N, H, T, L_hs,
+            stride_A_n, stride_A_h, stride_A_t, stride_A_l,
+            stride_L_n, stride_L_h, stride_L_t, stride_L_i, stride_L_j,
+            num_warps=1, num_stages=1
+        )
+
+        # 2) Compute G = B @ C^T in Triton: [N, T, L_hs, L_hs, H]
+        G = torch.empty((N, T, L_hs, L_hs, H), device=device, dtype=torch.float32)
+        stride_B_n, stride_B_t, stride_B_l, stride_B_g, stride_B_k = Bc.stride()
+        stride_C_n, stride_C_t, stride_C_l, stride_C_g, stride_C_k = Cc.stride()
+        stride_G_n, stride_G_t, stride_G_l_i, stride_G_l_j, stride_G_h = G.stride()
+        grid_contract = (N, T, L_hs, L_hs, H)
+        _contract_bc_to_g_kernel[grid_contract](
+            Bc, Cc, G,
+            N, T, L_hs, H, 8, 32,
+            stride_B_n, stride_B_t, stride_B_l, stride_B_g, stride_B_k,
+            stride_C_n, stride_C_t, stride_C_l, stride_C_g, stride_C_k,
+            stride_G_n, stride_G_t, stride_G_l_i, stride_G_l_j, stride_G_h,
+            num_warps=1, num_stages=1
+        )
+
+        # 3) Apply mask: M = G * L in Triton
+        M = torch.empty((N, T, L_hs, L_hs, H), device=device, dtype=torch.float32)
+        grid_apply = (N, T, L_hs, L_hs, H)
+        _apply_mask_and_store_M_kernel[grid_apply](
+            G, L, M,
+            N, T, L_hs, H,
+            stride_G_n, stride_G_t, stride_G_l_i, stride_G_l_j, stride_G_h,
+            stride_L_n, stride_L_h, stride_L_t, stride_L_i, stride_L_j,
+            stride_M_n, stride_M_t, stride_M_l_i, stride_M_l_j, stride_M_h,
+            num_warps=1, num_stages=1
+        )
+
+        # 4) Compute Y_diag via diagonal matvec in Triton: [N, T, L_hs, H, D]
+        Y = torch.empty((N, T, L_hs, H, D), device=device, dtype=torch.float32)
+        stride_M_n, stride_M_t, stride_M_l_i, stride_M_l_j, stride_M_h = M.stride()
+        stride_HS_n, stride_HS_t, stride_HS_l, stride_HS_h, stride_HS_d = HS.stride()
+        stride_Y_n, stride_Y_t, stride_Y_l, stride_Y_h, stride_Y_d = Y.stride()
+        grid_diag = (N, T, L_hs, H, D)
+        _diag_matvec_sum_kernel[grid_diag](
+            M, HS, Y,
+            N, T, L_hs, H, D,
+            stride_M_n, stride_M_t, stride_M_l_i, stride_M_l_j, stride_M_h,
+            stride_HS_n, stride_HS_t, stride_HS_l, stride_HS_h, stride_HS_d,
+            stride_Y_n, stride_Y_t, stride_Y_l, stride_Y_h, stride_Y_d,
+            num_warps=1, num_stages=1
+        )
+
+        # Return in bfloat16 to match original behavior
+        return Y.to(torch.bfloat16)
+
+
+def run(*args):
+    return ModelNew()(*args)

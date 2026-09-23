@@ -1,0 +1,337 @@
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+# Triton Conv1d forward kernel: y[n, co, lo] = bias[co] + sum_{ci,k} x[n, ci, li] * w[co, ci, k]
+# li = lo + P - k, P = K//2. Mask li in [0, L_in).
+@triton.jit
+def conv1d_forward_kernel(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    N, C_in, C_out, L_in, L_out, K,
+    stride_x_n, stride_x_c, stride_x_l,
+    stride_w_co, stride_w_ci, stride_w_k,
+    stride_y_n, stride_y_c, stride_y_l,
+    BLOCK_L: tl.constexpr,
+):
+    n = tl.program_id(0)
+    co = tl.program_id(1)
+    tile = tl.program_id(2)
+
+    l_out_offsets = tile * BLOCK_L + tl.arange(0, BLOCK_L)
+    mask_out = l_out_offsets < L_out
+
+    acc = tl.zeros([BLOCK_L], dtype=tl.float32)
+
+    # Bias for this output channel
+    b_val = tl.load(b_ptr + co).to(tl.float32)
+    acc += b_val
+
+    P = K // 2
+    # Loop over input channels and kernel taps
+    for ci in range(0, C_in):
+        for k in range(0, K):
+            li = l_out_offsets + P - k
+            mask_in = (li >= 0) & (li < L_in)
+            x_ptrs = x_ptr + n * stride_x_n + ci * stride_x_c + li * stride_x_l
+            x_vals = tl.load(x_ptrs, mask=mask_in & mask_out, other=0.0).to(tl.float32)
+            w_ptr_k = w_ptr + co * stride_w_co + ci * stride_w_ci + k * stride_w_k
+            w_val = tl.load(w_ptr_k).to(tl.float32)
+            acc += x_vals * w_val
+
+    # Store result
+    y_ptrs = y_ptr + n * stride_y_n + co * stride_y_c + l_out_offsets * stride_y_l
+    tl.store(y_ptrs, acc, mask=mask_out)
+
+
+# Triton ReLU kernel: y = max(y, 0)
+@triton.jit
+def relu_kernel(
+    x_ptr, y_ptr,
+    N, C, L,
+    stride_x_n, stride_x_c, stride_x_l,
+    stride_y_n, stride_y_c, stride_y_l,
+    BLOCK_L: tl.constexpr,
+):
+    n = tl.program_id(0)
+    c = tl.program_id(1)
+    tile = tl.program_id(2)
+    l_offsets = tile * BLOCK_L + tl.arange(0, BLOCK_L)
+    mask_out = l_offsets < L
+
+    x_ptrs = x_ptr + n * stride_x_n + c * stride_x_c + l_offsets * stride_x_l
+    y_ptrs = y_ptr + n * stride_y_n + c * stride_y_c + l_offsets * stride_y_l
+
+    x_vals = tl.load(x_ptrs, mask=mask_out, other=0.0)
+    # ReLU
+    y_vals = tl.maximum(x_vals, 0.0)
+    tl.store(y_ptrs, y_vals, mask=mask_out)
+
+
+# Triton split halves forward: y_full [N, 2*C_half, L] -> y0 [N, C_half, L], y1 [N, C_half, L]
+@triton.jit
+def split_halves_forward(
+    y_full_ptr, y0_ptr, y1_ptr,
+    N, C_half, L,
+    stride_y_full_n, stride_y_full_c, stride_y_full_l,
+    stride_y0_n, stride_y0_c, stride_y0_l,
+    stride_y1_n, stride_y1_c, stride_y1_l,
+    BLOCK_L: tl.constexpr,
+):
+    n = tl.program_id(0)
+    ch = tl.program_id(1)  # channel index in [0, C_half)
+    tile = tl.program_id(2)
+    l_offsets = tile * BLOCK_L + tl.arange(0, BLOCK_L)
+    mask_out = l_offsets < L
+
+    full0_ptrs = y_full_ptr + n * stride_y_full_n + ch * stride_y_full_c + l_offsets * stride_y_full_l
+    full1_ptrs = y_full_ptr + n * stride_y_full_n + (ch + C_half) * stride_y_full_c + l_offsets * stride_y_full_l
+    out0_ptrs = y0_ptr + n * stride_y0_n + ch * stride_y0_c + l_offsets * stride_y0_l
+    out1_ptrs = y1_ptr + n * stride_y1_n + ch * stride_y1_c + l_offsets * stride_y1_l
+
+    y0_vals = tl.load(full0_ptrs, mask=mask_out, other=0.0)
+    y1_vals = tl.load(full1_ptrs, mask=mask_out, other=0.0)
+    tl.store(out0_ptrs, y0_vals, mask=mask_out)
+    tl.store(out1_ptrs, y1_vals, mask=mask_out)
+
+
+# Triton concat halves forward: y0 [N, C_half, L], y1 [N, C_half, L] -> y_full [N, 2*C_half, L]
+@triton.jit
+def concat_halves_forward(
+    y0_ptr, y1_ptr, y_full_ptr,
+    N, C_half, L,
+    stride_y0_n, stride_y0_c, stride_y0_l,
+    stride_y1_n, stride_y1_c, stride_y1_l,
+    stride_y_full_n, stride_y_full_c, stride_y_full_l,
+    BLOCK_L: tl.constexpr,
+):
+    n = tl.program_id(0)
+    ch = tl.program_id(1)  # channel index in [0, C_half)
+    tile = tl.program_id(2)
+    l_offsets = tile * BLOCK_L + tl.arange(0, BLOCK_L)
+    mask_out = l_offsets < L
+
+    in0_ptrs = y0_ptr + n * stride_y0_n + ch * stride_y0_c + l_offsets * stride_y0_l
+    in1_ptrs = y1_ptr + n * stride_y1_n + ch * stride_y1_c + l_offsets * stride_y1_l
+    out0_ptrs = y_full_ptr + n * stride_y_full_n + ch * stride_y_full_c + l_offsets * stride_y_full_l
+    out1_ptrs = y_full_ptr + n * stride_y_full_n + (ch + C_half) * stride_y_full_c + l_offsets * stride_y_full_l
+
+    y0_vals = tl.load(in0_ptrs, mask=mask_out, other=0.0)
+    y1_vals = tl.load(in1_ptrs, mask=mask_out, other=0.0)
+    tl.store(out0_ptrs, y0_vals, mask=mask_out)
+    tl.store(out1_ptrs, y1_vals, mask=mask_out)
+
+
+# Triton mul mask kernel: y[i, j, k] *= mask[i, 0, k]
+@triton.jit
+def mul_mask_kernel(
+    y_ptr, mask_ptr,
+    N, C, L,
+    stride_y_n, stride_y_c, stride_y_l,
+    stride_mask_n, stride_mask_c, stride_mask_l,
+    BLOCK_L: tl.constexpr,
+):
+    n = tl.program_id(0)
+    c = tl.program_id(1)
+    tile = tl.program_id(2)
+    l_offsets = tile * BLOCK_L + tl.arange(0, BLOCK_L)
+    mask_out = l_offsets < L
+
+    y_ptrs = y_ptr + n * stride_y_n + c * stride_y_c + l_offsets * stride_y_l
+    mask_ptrs = mask_ptr + n * stride_mask_n + 0 * stride_mask_c + l_offsets * stride_mask_l
+
+    y_vals = tl.load(y_ptrs, mask=mask_out, other=0.0)
+    m_vals = tl.load(mask_ptrs, mask=mask_out, other=1.0)
+    y_vals = y_vals * m_vals
+    tl.store(y_ptrs, y_vals, mask=mask_out)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        # You may set default block sizes; we’ll adapt in launch
+        self.block_l = 128
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_mask: torch.Tensor,
+        reverse: bool,
+        transform_0_conv0_weight: torch.Tensor,
+        transform_0_conv0_bias: torch.Tensor,
+        transform_0_conv1_weight: torch.Tensor,
+        transform_0_conv1_bias: torch.Tensor,
+        transform_0_conv2_weight: torch.Tensor,
+        transform_0_conv2_bias: torch.Tensor,
+        transform_1_conv0_weight: torch.Tensor,
+        transform_1_conv0_bias: torch.Tensor,
+        transform_1_conv1_weight: torch.Tensor,
+        transform_1_conv1_bias: torch.Tensor,
+        transform_1_conv2_weight: torch.Tensor,
+        transform_1_conv2_bias: torch.Tensor,
+        transform_2_conv0_weight: torch.Tensor,
+        transform_2_conv0_bias: torch.Tensor,
+        transform_2_conv1_weight: torch.Tensor,
+        transform_2_conv1_bias: torch.Tensor,
+        transform_2_conv2_weight: torch.Tensor,
+        transform_2_conv2_bias: torch.Tensor,
+        transform_3_conv0_weight: torch.Tensor,
+        transform_3_conv0_bias: torch.Tensor,
+        transform_3_conv1_weight: torch.Tensor,
+        transform_3_conv1_bias: torch.Tensor,
+        transform_3_conv2_weight: torch.Tensor,
+        transform_3_conv2_bias: torch.Tensor,
+    ):
+        """
+        Triton-only forward: no torch.conv1d, torch.relu, torch.cat in computation.
+        """
+        N, C, L = x.shape
+        C_half = C // 2
+
+        # Determine L_out for each conv: L_in=L, P=K//2, L_out = L_in - 2P + 1 (since padding=K//2)
+        def conv_out_len(L_in, K):
+            P = K // 2
+            return L_in - 2 * P + 1
+
+        # Launch sequence for each transform
+        transforms = [
+            (transform_0_conv0_weight, transform_0_conv0_bias,
+             transform_0_conv1_weight, transform_0_conv1_bias,
+             transform_0_conv2_weight, transform_0_conv2_bias),
+            (transform_1_conv0_weight, transform_1_conv0_bias,
+             transform_1_conv1_weight, transform_1_conv1_bias,
+             transform_1_conv2_weight, transform_1_conv2_bias),
+            (transform_2_conv0_weight, transform_2_conv0_bias,
+             transform_2_conv1_weight, transform_2_conv1_bias,
+             transform_2_conv2_weight, transform_2_conv2_bias),
+            (transform_3_conv0_weight, transform_3_conv0_bias,
+             transform_3_conv1_weight, transform_3_conv1_bias,
+             transform_3_conv2_weight, transform_3_conv2_bias),
+        ]
+
+        # We will maintain x_full and update x1 in-place via concatenation kernels.
+        # Initialize x_full to zeros (will be overwritten per transform step).
+        x_full = torch.empty((N, C, L), device=x.device, dtype=x.dtype)
+
+        for idx, (conv0_w, conv0_b, conv1_w, conv1_b, conv2_w, conv2_b) in enumerate(transforms):
+            # Split into halves
+            x0 = torch.empty((N, C_half, L), device=x.device, dtype=x.dtype)
+            x1 = torch.empty((N, C_half, L), device=x.device, dtype=x.dtype)
+            split_halves_forward[(N, C_half, triton.cdiv(L, self.block_l))](
+                x, x0, x1,
+                N, C_half, L,
+                x.stride(0), x.stride(1), x.stride(2),
+                x0.stride(0), x0.stride(1), x0.stride(2),
+                x1.stride(0), x1.stride(1), x1.stride(2),
+                BLOCK_L=self.block_l,
+            )
+
+            # Compute h via convs and ReLU in Triton
+            # conv0: y0
+            C_in0 = conv0_w.shape[1]
+            C_out0 = conv0_w.shape[0]
+            L_in0 = L
+            L_out0 = conv_out_len(L_in0, conv0_w.shape[2])
+            y0 = torch.empty((N, C_out0, L_out0), device=x.device, dtype=x.dtype)
+            conv1d_forward_kernel[(N, C_out0, triton.cdiv(L_out0, self.block_l))](
+                x0, conv0_w, conv0_b, y0,
+                N, C_in0, C_out0, L_in0, L_out0, conv0_w.shape[2],
+                x0.stride(0), x0.stride(1), x0.stride(2),
+                conv0_w.stride(0), conv0_w.stride(1), conv0_w.stride(2),
+                y0.stride(0), y0.stride(1), y0.stride(2),
+                BLOCK_L=self.block_l,
+            )
+            # ReLU on y0
+            y0_relu = torch.empty_like(y0)
+            relu_kernel[(N, C_out0, triton.cdiv(L_out0, self.block_l))](
+                y0, y0_relu,
+                N, C_out0, L_out0,
+                y0.stride(0), y0.stride(1), y0.stride(2),
+                y0_relu.stride(0), y0_relu.stride(1), y0_relu.stride(2),
+                BLOCK_L=self.block_l,
+            )
+            # conv1 on y0_relu
+            C_in1 = conv1_w.shape[1]
+            C_out1 = conv1_w.shape[0]
+            L_in1 = L_out0
+            L_out1 = conv_out_len(L_in1, conv1_w.shape[2])
+            y1 = torch.empty((N, C_out1, L_out1), device=x.device, dtype=x.dtype)
+            conv1d_forward_kernel[(N, C_out1, triton.cdiv(L_out1, self.block_l))](
+                y0_relu, conv1_w, conv1_b, y1,
+                N, C_in1, C_out1, L_in1, L_out1, conv1_w.shape[2],
+                y0_relu.stride(0), y0_relu.stride(1), y0_relu.stride(2),
+                conv1_w.stride(0), conv1_w.stride(1), conv1_w.stride(2),
+                y1.stride(0), y1.stride(1), y1.stride(2),
+                BLOCK_L=self.block_l,
+            )
+            # ReLU on y1
+            y1_relu = torch.empty_like(y1)
+            relu_kernel[(N, C_out1, triton.cdiv(L_out1, self.block_l))](
+                y1, y1_relu,
+                N, C_out1, L_out1,
+                y1.stride(0), y1.stride(1), y1.stride(2),
+                y1_relu.stride(0), y1_relu.stride(1), y1_relu.stride(2),
+                BLOCK_L=self.block_l,
+            )
+            # conv2 on y1_relu (no ReLU)
+            C_in2 = conv2_w.shape[1]
+            C_out2 = conv2_w.shape[0]
+            L_in2 = L_out1
+            L_out2 = conv_out_len(L_in2, conv2_w.shape[2])
+            h = torch.empty((N, C_out2, L_out2), device=x.device, dtype=x.dtype)
+            conv1d_forward_kernel[(N, C_out2, triton.cdiv(L_out2, self.block_l))](
+                y1_relu, conv2_w, conv2_b, h,
+                N, C_in2, C_out2, L_in2, L_out2, conv2_w.shape[2],
+                y1_relu.stride(0), y1_relu.stride(1), y1_relu.stride(2),
+                conv2_w.stride(0), conv2_w.stride(1), conv2_w.stride(2),
+                h.stride(0), h.stride(1), h.stride(2),
+                BLOCK_L=self.block_l,
+            )
+            # Apply mask to h
+            h_masked = torch.empty_like(h)
+            mul_mask_kernel[(N, C_out2, triton.cdiv(L_out2, self.block_l))](
+                h, x_mask,
+                N, C_out2, L_out2,
+                h.stride(0), h.stride(1), h.stride(2),
+                x_mask.stride(0), x_mask.stride(1), x_mask.stride(2),
+                BLOCK_L=self.block_l,
+            )
+
+            # Update x1: forward add; reverse subtract
+            if reverse:
+                x1 = x1 - h_masked
+            else:
+                x1 = x1 + h_masked
+
+            # Concatenate halves back into x_full
+            # x_full is [N, 2*C_half, L]; write x0 into [:, :C_half, :], x1 into [:, C_half:, :]
+            x_full_tmp = torch.empty((N, 2 * C_half, L), device=x.device, dtype=x.dtype)
+            concat_halves_forward[(N, C_half, triton.cdiv(L, self.block_l))](
+                x0, x1, x_full_tmp,
+                N, C_half, L,
+                x0.stride(0), x0.stride(1), x0.stride(2),
+                x1.stride(0), x1.stride(1), x1.stride(2),
+                x_full_tmp.stride(0), x_full_tmp.stride(1), x_full_tmp.stride(2),
+                BLOCK_L=self.block_l,
+            )
+            # Assign x_full to the current tensor
+            x_full = x_full_tmp
+
+            # Apply mask to x_full
+            x_full_masked = torch.empty_like(x_full)
+            mul_mask_kernel[(N, x_full.shape[1], triton.cdiv(L, self.block_l))](
+                x_full, x_mask,
+                N, x_full.shape[1], L,
+                x_full.stride(0), x_full.stride(1), x_full.stride(2),
+                x_mask.stride(0), x_mask.stride(1), x_mask.stride(2),
+                BLOCK_L=self.block_l,
+            )
+            # Overwrite x_full for next transform
+            x_full = x_full_masked
+
+        return x_full
+
+
+def run(*args):
+    return ModelNew()(*args)

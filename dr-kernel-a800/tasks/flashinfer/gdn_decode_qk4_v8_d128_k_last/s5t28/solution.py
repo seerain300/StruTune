@@ -1,0 +1,180 @@
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _compute_g_kernel(A_log_ptr, x_ptr, g_ptr, H: tl.constexpr):
+    """
+    Compute g[h] = exp(-exp(A_log[h]) * softplus(x[h])) for h in [0..H-1]
+    A_log_ptr: [H], float32
+    x_ptr: [H], float32  (x[h] = a[b,1,h] + dt_bias[h] passed in)
+    g_ptr: [H], float32
+    """
+    h = tl.program_id(0)
+    a_plus_bias = x_ptr[h]
+    softplus_x = tl.log(1.0 + tl.exp(a_plus_bias))
+    g_val = tl.exp(-tl.exp(A_log_ptr[h]) * softplus_x)
+    tl.store(g_ptr + h, g_val)
+
+
+@triton.jit
+def _compute_beta_kernel(b_ptr, beta_ptr, H: tl.constexpr):
+    """
+    Compute beta[h] = sigmoid(b_ptr[h]) for h in [0..H-1]
+    b_ptr: [H], float32 (we pass b[0,1,:] flattened)
+    beta_ptr: [H], float32
+    """
+    h = tl.program_id(0)
+    b_val = b_ptr[h]
+    beta_val = 1.0 / (1.0 + tl.exp(-b_val))
+    tl.store(beta_ptr + h, beta_val)
+
+
+@triton.jit
+def _update_all_kernel(q_ptr, k_ptr, v_ptr, state_in_ptr, g_ptr, beta_ptr,
+                        new_state_ptr, out_ptr,
+                        B: tl.constexpr, H: tl.constexpr, V: tl.constexpr, K: tl.constexpr, scale: tl.float32):
+    """
+    For each (b,h), compute:
+      - old_v = sum_k k[b,h,k] @ state[b,h,k,:]     (reduce over K)
+      - new_v = beta[h] * v[b,h,:] + (1 - beta[h]) * old_v
+      - old_state_row = g[h] * state[b,h,:]
+      - state_remove = sum_k k[b,h,k] @ old_state_row  (reduce over K)
+      - state_update = sum_k k[b,h,k] @ new_v          (reduce over K)
+      - new_state[b,h,m,:] = (g[h] - 1) * state[b,h,m,:] - state_remove + state_update
+      - output[b,h] = scale * q[b,h,:] @ new_state[b,h,:]
+
+    All tensors are assumed contiguous. q: [B,4,K], k: [B,4,K], v: [B,8,V], state_in: [B,8,V,K], new_state: [B,8,V,K], out: [B,H]
+    """
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+
+    # Load scalars
+    g_val = tl.load(g_ptr + h)
+    beta_val = tl.load(beta_ptr + h)
+
+    # Base pointers
+    q_base = q_ptr + b * (4 * K)
+    v_base = v_ptr + b * (8 * V)
+    state_base = state_in_ptr + b * (H * V * K)
+
+    # Compute old_v = sum_k k @ state_row for each row m
+    old_v = tl.zeros([1], dtype=tl.float32)  # scalar
+    for k_idx in tl.static_range(4):
+        k_k_ptr = k_ptr + b * (4 * K) + k_idx * K
+        for m in tl.static_range(V):
+            row_start = h * V * K + m * K
+            k_h = tl.load(k_k_ptr + tl.arange(0, K), mask=tl.arange(0, K) < K, other=0.0)  # [K]
+            row = tl.load(state_base + row_start + tl.arange(0, K), mask=tl.arange(0, K) < K, other=0.0)  # [K]
+            old_v += tl.sum(k_h * row)
+
+    # Compute new_v per row m
+    new_v_vals = tl.zeros([V], dtype=tl.float32)
+    for m in tl.static_range(V):
+        v_row = tl.load(v_base + m * V + tl.arange(0, V), mask=tl.arange(0, V) < V, other=0.0)  # [V]
+        v_m = v_row[0]  # scalar
+        new_v_vals[m] = beta_val * v_m + (1.0 - beta_val) * old_v
+
+    # Compute state_remove and state_update
+    state_remove = tl.zeros([1], dtype=tl.float32)  # scalar
+    state_update = tl.zeros([1], dtype=tl.float32)  # scalar
+    for k_idx in tl.static_range(4):
+        k_k_ptr = k_ptr + b * (4 * K) + k_idx * K
+        for m in tl.static_range(V):
+            row_start = h * V * K + m * K
+            k_h = tl.load(k_k_ptr + tl.arange(0, K), mask=tl.arange(0, K) < K, other=0.0)  # [K]
+            row = tl.load(state_base + row_start + tl.arange(0, K), mask=tl.arange(0, K) < K, other=0.0)  # [K]
+            # state_remove += sum_k k_h * row
+            state_remove += tl.sum(k_h * row)
+            # state_update += sum_k k_h * new_v[m]
+            state_update += tl.sum(k_h * new_v_vals[m])
+
+    # Compute new_state row-wise
+    for m in tl.static_range(V):
+        row_start = h * V * K + m * K
+        row_old = tl.load(state_base + row_start + tl.arange(0, K), mask=tl.arange(0, K) < K, other=0.0)  # [K]
+        # new_row = (g - 1) * old - state_remove + state_update
+        # Note: state_remove and state_update are scalars, added to each element
+        new_row = (g_val - 1.0) * row_old - state_remove + state_update
+        tl.store(new_state_ptr + b * (H * V * K) + row_start + tl.arange(0, K),
+                 new_row, mask=tl.arange(0, K) < K)
+
+    # Compute output[b,h] = scale * q[b,h,:] @ new_row m
+    # Use m=0 to compute dot with any row; all rows are identical due to scalar update
+    m = 0
+    row_start_old = h * V * K + m * K
+    row_old = tl.load(state_base + row_start_old + tl.arange(0, K), mask=tl.arange(0, K) < K, other=0.0)  # [K]
+    q_h = tl.load(q_base + h * K + tl.arange(0, K), mask=tl.arange(0, K) < K, other=0.0)  # [K]
+    # Compute with new_row (same as above) and scale
+    out_val = tl.sum(q_h * new_row) * scale
+    tl.store(out_ptr + b * H + h, out_val)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, q, k, v, state, A_log, a, dt_bias, b, scale):
+        """
+        q: [B, 1, 4, K]
+        k: [B, 1, 4, K]
+        v: [B, 1, 8, V]
+        state: [B, 8, V, K] float32
+        A_log: [8] float32
+        a: [B, 1, 8] (we use a[b,1,h])
+        dt_bias: [8] float32
+        b: [B, 1, 8] (we use b[b,1,h])
+        scale: float
+        Returns:
+        - output: [B, H, V] bfloat16
+        - new_state: [B, H, V, K] float32
+        """
+        assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4 and state.dim() == 4
+        B, _, H, K = q.shape
+        _, _, num_k_heads, _ = k.shape  # 4
+        _, _, num_v_heads, V = v.shape  # 8
+        _, _, out_H, out_K = state.shape  # H should be num_v_heads = 8, K should be 128
+        assert out_H == H and out_K == K and num_v_heads == H and num_k_heads == 4
+
+        # Cast and flatten parameters for Triton
+        a_flat = a.index_select(2, torch.arange(H)).float().flatten()  # [B*H]
+        dt_bias_flat = dt_bias.float()  # [H]
+        A_log_flat = A_log.float()  # [H]
+        b_flat = b.index_select(2, torch.arange(H)).float().flatten()  # [B*H]
+        B_idx = torch.arange(B)
+        a_flat = a_flat[B_idx]  # reshape back to [B,H] implicitly via indexing inside kernel, but we pass [B*H]
+        b_flat = b_flat[B_idx]  # [B,H]
+
+        # Allocate outputs
+        g = torch.empty(H, dtype=torch.float32, device=state.device)
+        beta = torch.empty(H, dtype=torch.float32, device=state.device)
+        out = torch.empty(B * H, dtype=torch.float32, device=state.device)  # [B,H]
+        new_state = torch.empty((B, H, V, K), dtype=torch.float32, device=state.device)
+
+        # Compute x = a + dt_bias, 1D [H]
+        x = a_flat[B_idx, 0, :] + dt_bias_flat  # [H]
+
+        # Launch Triton kernels
+        # Kernel 1: compute g
+        _compute_g_kernel[(H,)](A_log_flat, x, g, H=H)
+
+        # Kernel 2: compute beta
+        _compute_beta_kernel[(H,)](b_flat, beta, H=H)
+
+        # Kernel 3: update_all
+        # Ensure contiguous
+        q_c = q.contiguous()
+        k_c = k.contiguous()
+        v_c = v.contiguous()
+        state_c = state.contiguous()
+        new_state_c = new_state  # not used in kernel; we write into it
+        _update_all_kernel[(B, H)](q_c, k_c, v_c, state_c, g, beta, new_state_c, out, B=B, H=H, V=V, K=K, scale=float(scale))
+
+        # Reshape output to [B,H,V]
+        # Note: the original 'run' returns [B,H,V] without V; given the original code, we assume H=8, V=8. If V!=8, you can adjust.
+        # But to match the original signature, we return [B,H,V], where V=8.
+        out = out.view(B, H).unsqueeze(-1).expand(B, H, V).contiguous().to(torch.bfloat16)
+        return out, new_state
+
+
+def run(*args):
+    return ModelNew()(*args)

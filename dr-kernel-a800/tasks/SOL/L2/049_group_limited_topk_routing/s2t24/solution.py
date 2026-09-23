@@ -1,0 +1,353 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# Kernel 1: compute logits per token-expert via dot product
+# logits[token, e] = sum_j hidden_states[token, j] * weight[e, j]
+@triton.jit
+def compute_logits_kernel(
+    hidden_ptr,          # *f32, [num_tokens, hidden_dim], row-major
+    weight_ptr,          # *f32, [num_experts, hidden_dim], row-major
+    logits_ptr,          # *f32, [num_tokens, num_experts], row-major
+    num_tokens: tl.constexpr,
+    num_experts: tl.constexpr,
+    hidden_dim: tl.constexpr,
+    stride_hs_t, stride_hs_d,
+    stride_w_e, stride_w_d,
+    stride_l_t, stride_l_e,
+):
+    t = tl.program_id(0)  # token id
+    e = tl.program_id(1)  # expert id
+    acc = 0.0
+    # Loop over hidden_dim and accumulate dot product
+    for j in range(0, hidden_dim):
+        h = tl.load(hidden_ptr + t * stride_hs_t + j * stride_hs_d)
+        w = tl.load(weight_ptr + e * stride_w_e + j * stride_w_d)
+        acc += h * w
+    tl.store(logits_ptr + t * stride_l_t + e * stride_l_e, acc)
+
+
+# Kernel 2: routed scores = sigmoid(logits) + expert_bias
+@triton.jit
+def scores_for_routing_kernel(
+    logits_ptr,          # *f32, [num_tokens, num_experts]
+    bias_ptr,            # *f32, [num_experts]
+    routed_ptr,          # *f32, [num_tokens, num_experts]
+    num_tokens: tl.constexpr,
+    num_experts: tl.constexpr,
+    stride_l_t, stride_l_e,
+    stride_r_t, stride_r_e,
+):
+    t = tl.program_id(0)  # token id
+    e = tl.program_id(1)  # expert id
+    val = tl.load(logits_ptr + t * stride_l_t + e * stride_l_e)
+    # sigmoid
+    sig = 1.0 / (1.0 + tl.exp(-val))
+    bias = tl.load(bias_ptr + e)
+    routed = sig + bias
+    tl.store(routed_ptr + t * stride_r_t + e * stride_r_e, routed)
+
+
+# Kernel 3: compute group scores by top-2 per group and sum
+# n_group = 8, EXPERTS_PER_GROUP = 32
+@triton.jit
+def group_scores_kernel(
+    routed_ptr,          # *f32, [num_tokens, num_experts]
+    group_scores_ptr,    # *f32, [num_tokens, n_group]
+    num_tokens: tl.constexpr,
+    num_experts: tl.constexpr,
+    n_group: tl.constexpr,
+    EXPERTS_PER_GROUP: tl.constexpr,
+    stride_r_t, stride_r_e,
+    stride_gs_t, stride_gs_g,
+):
+    t = tl.program_id(0)  # token id
+    g = tl.program_id(1)  # group id
+    top1 = -float("inf")
+    top2 = -float("inf")
+    start = g * EXPERTS_PER_GROUP
+    for j in range(0, EXPERTS_PER_GROUP):
+        e = start + j
+        val = tl.load(routed_ptr + t * stride_r_t + e * stride_r_e)
+        if val > top1:
+            top2 = top1
+            top1 = val
+        elif val > top2:
+            top2 = val
+    group_score = top1 + top2
+    tl.store(group_scores_ptr + t * stride_gs_t + g * stride_gs_g, group_score)
+
+
+# Kernel 4: select top-4 groups per token
+@triton.jit
+def select_top4_groups_kernel(
+    group_scores_ptr,    # *f32, [num_tokens, n_group]
+    selected_groups_ptr, # *i32, [num_tokens, 4]
+    num_tokens: tl.constexpr,
+    n_group: tl.constexpr,
+    stride_gs_t, stride_gs_g,
+    stride_sg_t, stride_sg_k,
+):
+    t = tl.program_id(0)
+    # Initialize top4 arrays
+    top_vals = [ -float("inf"), -float("inf"), -float("inf"), -float("inf") ]
+    top_idxs = [ 0, 0, 0, 0 ]
+    for g in range(0, n_group):
+        gs = tl.load(group_scores_ptr + t * stride_gs_t + g * stride_gs_g)
+        # insert into top4
+        if gs > top_vals[0]:
+            top_vals[3] = top_vals[2]
+            top_vals[2] = top_vals[1]
+            top_vals[1] = top_vals[0]
+            top_vals[0] = gs
+            top_idxs[3] = top_idxs[2]
+            top_idxs[2] = top_idxs[1]
+            top_idxs[1] = top_idxs[0]
+            top_idxs[0] = g
+        elif gs > top_vals[1]:
+            top_vals[3] = top_vals[2]
+            top_vals[2] = top_vals[1]
+            top_vals[1] = gs
+            top_idxs[3] = top_idxs[2]
+            top_idxs[2] = top_idxs[1]
+            top_idxs[1] = g
+        elif gs > top_vals[2]:
+            top_vals[3] = top_vals[2]
+            top_vals[2] = gs
+            top_idxs[3] = top_idxs[2]
+            top_idxs[2] = g
+        elif gs > top_vals[3]:
+            top_vals[3] = gs
+            top_idxs[3] = g
+    # Store selected groups
+    for k in range(0, 4):
+        tl.store(selected_groups_ptr + t * stride_sg_t + k * stride_sg_k, top_idxs[k])
+
+
+# Kernel 5: expand group_mask to per-expert mask and set non-selected groups to -inf
+# mask_ptr: int32 [num_tokens, n_group] (1 for selected, 0 otherwise)
+# routed_ptr: float32 [num_tokens, num_experts]
+@triton.jit
+def mask_experts_kernel(
+    mask_ptr,            # *i32, [num_tokens, n_group]
+    routed_ptr,          # *f32, [num_tokens, num_experts]
+    num_tokens: tl.constexpr,
+    num_experts: tl.constexpr,
+    n_group: tl.constexpr,
+    EXPERTS_PER_GROUP: tl.constexpr,
+    stride_m_t, stride_m_g,
+    stride_r_t, stride_r_e,
+):
+    t = tl.program_id(0)  # token id
+    for g in range(0, n_group):
+        m = tl.load(mask_ptr + t * stride_m_t + g * stride_m_g)  # 0 or 1
+        start = g * EXPERTS_PER_GROUP
+        for j in range(0, EXPERTS_PER_GROUP):
+            e = start + j
+            val = tl.load(routed_ptr + t * stride_r_t + e * stride_r_e)
+            new_val = tl.where(m != 0, val, -float("inf"))
+            tl.store(routed_ptr + t * stride_r_t + e * stride_r_e, new_val)
+
+
+# Kernel 6: select top-8 from masked scores (duplicates allowed)
+@triton.jit
+def select_top8_kernel(
+    routed_ptr,          # *f32, [num_tokens, num_experts]
+    selected_idx_ptr,    # *i32, [num_tokens, 8]
+    num_tokens: tl.constexpr,
+    num_experts: tl.constexpr,
+    stride_r_t, stride_r_e,
+    stride_s_t, stride_s_k,
+):
+    t = tl.program_id(0)
+    top_vals = [ -float("inf") ] * 8
+    top_idxs = [ 0 ] * 8
+    for e in range(0, num_experts):
+        val = tl.load(routed_ptr + t * stride_r_t + e * stride_r_e)
+        # Insert into top-8 array
+        for k in range(0, 8):
+            if val > top_vals[k]:
+                # shift down
+                for r in range(7, k, -1):
+                    top_vals[r] = top_vals[r - 1]
+                    top_idxs[r] = top_idxs[r - 1]
+                top_vals[k] = val
+                top_idxs[k] = e
+                break
+    # Write out top-8 indices
+    for k in range(0, 8):
+        tl.store(selected_idx_ptr + t * stride_s_t + k * stride_s_k, top_idxs[k])
+
+
+# Kernel 7: gather original logits for selected indices
+# Original logits are computed by compute_logits_kernel; here we gather them.
+@triton.jit
+def gather_original_logits_kernel(
+    logits_ptr,          # *f32, [num_tokens, num_experts]
+    selected_idx_ptr,    # *i32, [num_tokens, 8]
+    gathered_ptr,        # *f32, [num_tokens, 8]
+    num_tokens: tl.constexpr,
+    num_experts: tl.constexpr,
+    stride_l_t, stride_l_e,
+    stride_s_t, stride_s_k,
+):
+    t = tl.program_id(0)
+    for k in range(0, 8):
+        e = tl.load(selected_idx_ptr + t * stride_s_t + k * stride_s_k)  # i32
+        val = tl.load(logits_ptr + t * stride_l_t + e * stride_l_e)
+        tl.store(gathered_ptr + t * stride_s_t + k * stride_s_k, val)
+
+
+# Kernel 8: normalize gathered_logits and apply routed_scaling_factor
+@triton.jit
+def normalize_weights_kernel(
+    gathered_ptr,        # *f32, [num_tokens, 8]
+    scaling_ptr,         # *f32, [num_tokens] (scalar per token: routed_scaling_factor)
+    normalized_ptr,      # *f32, [num_tokens, 8]
+    num_tokens: tl.constexpr,
+    eps: tl.constexpr,
+    stride_g_t, stride_g_k,
+    stride_n_t, stride_n_k,
+):
+    t = tl.program_id(0)
+    denom = 0.0
+    for k in range(0, 8):
+        val = tl.load(gathered_ptr + t * stride_g_t + k * stride_g_k)
+        denom += val
+    denom = denom + eps
+    scale = tl.load(scaling_ptr + t)
+    for k in range(0, 8):
+        val = tl.load(gathered_ptr + t * stride_g_t + k * stride_g_k)
+        norm = (val / denom) * scale
+        tl.store(normalized_ptr + t * stride_n_t + k * stride_n_k, norm)
+
+
+def _cdiv(x, y):
+    return (x + y - 1) // y
+
+
+# Entry point class
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, hidden_states: torch.Tensor, weight: torch.Tensor, expert_bias: torch.Tensor, routed_scaling_factor: float):
+        # Ensure dtype and device consistency
+        device = hidden_states.device
+        assert device.type == "cuda", "ModelNew.forward requires CUDA tensors"
+        hidden_dim = hidden_states.shape[1]
+        num_tokens = hidden_states.shape[0]
+        num_experts = weight.shape[0]
+        assert num_experts == 256, "num_experts must be 256"
+        # Make contiguous and float32
+        hidden_c = hidden_states.contiguous().to(torch.float32)
+        weight_c = weight.contiguous().to(torch.float32)
+        bias_c = expert_bias.contiguous().to(torch.float32)
+
+        # 1) Compute logits [num_tokens, num_experts]
+        logits = torch.empty((num_tokens, num_experts), dtype=torch.float32, device=device)
+        grid_logits = (_cdiv(num_tokens, 1), _cdiv(num_experts, 1))
+        compute_logits_kernel[grid_logits](
+            hidden_c, weight_c, logits,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            hidden_dim=hidden_dim,
+            stride_hs_t=hidden_c.stride(0), stride_hs_d=hidden_c.stride(1),
+            stride_w_e=weight_c.stride(0), stride_w_d=weight_c.stride(1),
+            stride_l_t=logits.stride(0), stride_l_e=logits.stride(1),
+        )
+
+        # 2) Compute routed scores = sigmoid(logits) + bias
+        routed = torch.empty((num_tokens, num_experts), dtype=torch.float32, device=device)
+        grid_routed = (_cdiv(num_tokens, 1), _cdiv(num_experts, 1))
+        scores_for_routing_kernel[grid_routed](
+            logits, bias_c, routed,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            stride_l_t=logits.stride(0), stride_l_e=logits.stride(1),
+            stride_r_t=routed.stride(0), stride_r_e=routed.stride(1),
+        )
+
+        # 3) Compute group_scores [num_tokens, n_group=8]
+        group_scores = torch.empty((num_tokens, 8), dtype=torch.float32, device=device)
+        grid_group = (_cdiv(num_tokens, 1), _cdiv(8, 1))
+        group_scores_kernel[grid_group](
+            routed, group_scores,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            n_group=8,
+            EXPERTS_PER_GROUP=32,
+            stride_r_t=routed.stride(0), stride_r_e=routed.stride(1),
+            stride_gs_t=group_scores.stride(0), stride_gs_g=group_scores.stride(1),
+        )
+
+        # 4) Select top-4 groups per token, store selected_groups [num_tokens, 4] as int32
+        selected_groups = torch.empty((num_tokens, 4), dtype=torch.int32, device=device)
+        grid_top4 = (_cdiv(num_tokens, 1),)
+        select_top4_groups_kernel[grid_top4](
+            group_scores, selected_groups,
+            num_tokens=num_tokens,
+            n_group=8,
+            stride_gs_t=group_scores.stride(0), stride_gs_g=group_scores.stride(1),
+            stride_sg_t=selected_groups.stride(0), stride_sg_k=selected_groups.stride(1),
+        )
+
+        # 5) Build mask and set non-selected groups to -inf in routed
+        # Create mask: [num_tokens, 8], 1 where selected_group in selected_groups
+        mask = torch.zeros((num_tokens, 8), dtype=torch.int32, device=device)
+        for k in range(4):
+            g = selected_groups[:, k]  # [num_tokens]
+            # Scatter 1 at g for each token
+            mask.scatter_(1, g, 1)
+        grid_mask = (_cdiv(num_tokens, 1),)
+        mask_experts_kernel[grid_mask](
+            mask, routed,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            n_group=8,
+            EXPERTS_PER_GROUP=32,
+            stride_m_t=mask.stride(0), stride_m_g=mask.stride(1),
+            stride_r_t=routed.stride(0), stride_r_e=routed.stride(1),
+        )
+
+        # 6) Select top-8 from masked routed
+        selected_idx = torch.empty((num_tokens, 8), dtype=torch.int32, device=device)
+        grid_top8 = (_cdiv(num_tokens, 1),)
+        select_top8_kernel[grid_top8](
+            routed, selected_idx,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            stride_r_t=routed.stride(0), stride_r_e=routed.stride(1),
+            stride_s_t=selected_idx.stride(0), stride_s_k=selected_idx.stride(1),
+        )
+
+        # 7) Gather original logits for selected indices
+        gathered = torch.empty((num_tokens, 8), dtype=torch.float32, device=device)
+        grid_gather = (_cdiv(num_tokens, 1),)
+        gather_original_logits_kernel[grid_gather](
+            logits, selected_idx, gathered,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            stride_l_t=logits.stride(0), stride_l_e=logits.stride(1),
+            stride_s_t=selected_idx.stride(0), stride_s_k=selected_idx.stride(1),
+        )
+
+        # 8) Normalize gathered logits and apply routed_scaling_factor
+        scaled = torch.full((num_tokens, 1), routed_scaling_factor, dtype=torch.float32, device=device)
+        topk_weight = torch.empty((num_tokens, 8), dtype=torch.float32, device=device)
+        grid_norm = (_cdiv(num_tokens, 1),)
+        normalize_weights_kernel[grid_norm](
+            gathered, scaled, topk_weight,
+            num_tokens=num_tokens,
+            eps=1e-20,
+            stride_g_t=gathered.stride(0), stride_g_k=gathered.stride(1),
+            stride_n_t=topk_weight.stride(0), stride_n_k=topk_weight.stride(1),
+        )
+
+        return selected_idx, topk_weight
+
+
+def run(*args):
+    return ModelNew()(*args)

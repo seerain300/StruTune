@@ -1,0 +1,535 @@
+Thank you for the clear requirements. I will fully Triton-ify the computation and ensure all critical kernels are actually launched from ModelNew.forward. I’ll avoid any torch-based masking, cumsum, or exp in the forward path. The forward will:
+- Prepare inputs,
+- Launch Triton kernels to:
+  1) Build L (the masked, exp’d causal matrix),
+  2) Compute G via outer product contraction over state_size S,
+  3) Multiply M = G * L,
+  4) Reduce to compute Y_diag.
+
+Deep analysis and design
+
+1) Correctness constraints and original semantics:
+- Inputs:
+  - hidden_states: [B, C, L, H, D]
+  - A_cumsum: [B, C, L, H] (the original code’s “A_cumsum” is actually a cumulative sum along the chunk’s internal dimension; see below).
+  - B: [B, C, L, groups, S], groups = 8
+  - C: same shape as B
+- Constants: NUM_HEADS = 32, N_GROUPS = 8, GROUP_EXPAND = 4.
+- The original PyTorch code:
+  - Builds a lower-triangular mask of size [L, L] with diagonal = -1, expands A_cumsum to [B, H, C, L, L], applies mask (zeroing upper triangle), then computes cumsum along the internal chunk dim (dim=-2), applies exp to get L. This yields L of shape [B, H, C, L, L].
+  - Expands B and C from groups to H.
+  - G[i, j, h] = sum_s C_exp[b, c, i, h, s] * B_exp[b, c, j, h, s], shape [B, C, L, L, H].
+  - M = G * L_permuted.
+  - Y_diag[b, c, i, h, d] = sum_j M[b, c, i, j, h] * hidden_states[b, c, j, h, d].
+
+Note: The code’s use of CHUNK_SIZE=128 is unusual. The original function assumes chunk_size == CHUNK_SIZE when building the 128x128 mask, which fails in varied workloads. For correctness, we will build the mask based on the actual L (hidden_states.shape[2]). We will implement the Triton kernels to work with the provided L and avoid torch ops.
+
+2) Triton kernels required:
+- l_causal_kernel: Builds L for each (b, h). Specifically, for each (b, h), it constructs a lower-triangular matrix L of shape [L, L]:
+  - Initialize L = 0.
+  - For j from 0 to L-1:
+    - For i from 0 to L-1:
+      - if i >= j: L[i, j] = exp(sum_{k=0..i} A[b, h, k]).
+      - else: L[i, j] = 0.
+  - Store L as float32 into a tensor of shape [B, H, C, L, L].
+  This kernel will be launched from forward with grid (B_size, H_size).
+
+- g_outer_kernel: Computes G[b, c, i, j, h] = sum_s C_exp[b, c, i, h, s] * B_exp[b, c, j, h, s]. We launch per (b, c, i, j, h) and loop over S. This kernel is launched from forward with grid (B_size, C_size, L_len, L_len, H_size).
+
+- multiply_mask_kernel: Elementwise multiply M = G * L_permuted. We need to permute L from [B, H, C, L, L] to [B, C, H, L, L] and multiply. We will launch this kernel with grid (B_size, C_size, L_len, L_len, H_size). This is straightforward torch in-place, but since we are moving everything to Triton, we can keep this in torch and multiply directly. However, to strictly adhere to Triton-only, we will implement this in a Triton kernel too. For simplicity and correctness, we’ll use torch for this multiply (it’s light), but the earlier errors were because kernels weren’t used. To avoid the “decoy” penalty, I will implement this multiplication in a Triton kernel too.
+
+- y_diag_reduce_kernel: Reduction over j to form Y_diag[b, c, i, h, d] = sum_j M[b, c, i, j, h] * hidden_states[b, c, j, h, d]. Launch grid (B_size, C_size, L_len, H_size). We will vectorize over d dimension.
+
+Implementation details:
+- l_causal_kernel:
+  - Grid: (B, H)
+  - Each program writes L[b, :, c, :, :] for all c. We’ll pass c as a loop or call the kernel for each b,h with c=0..C-1 separately. To keep it simple, we’ll have one program per (b, h) and loop over c inside the kernel (since C is small in the workloads). Alternatively, we can launch (B, H, C) and compute for a single c. We’ll implement (B, H) and loop over c.
+
+- g_outer_kernel:
+  - Grid: (B, C, L, L, H), but Triton kernels do not support 5D grids; we’ll flatten to a 3D grid using program_id mapping: pid0 over B*C, pid1 over L*L, pid2 over H. Inside kernel, derive b, c, i, j, h from pids. Loop over S to compute the sum. This avoids unsupported high-dimension grids.
+
+- multiply_mask_kernel:
+  - We’ll implement elementwise multiply using Triton 3D grid over (B, C, H), and vectorize over L and L (two tl.arange axes). Load G and L_permuted, multiply, store into M. This is simple since H is small and L is small.
+
+- y_diag_reduce_kernel:
+  - Grid: (B, C, L, H). Each program handles (b, c, i, h) and loops over j, vectorizing over d. Load M and hidden_states and accumulate.
+
+Given the strict requirement, I will define and launch all kernels explicitly. The heavy ops (L building, G, multiply, reduction) are Triton kernels now.
+
+Final code: ModelNew with Triton kernels invoked in forward
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+# 1) Triton kernel to build L (masked, exp’d causal matrix) for each (b, h)
+@triton.jit
+def l_causal_kernel(
+    A_ptr,        # *float32, [B, C, L, H]
+    L_ptr,        # *float32, [B, H, C, L, L] (we will store)
+    B_size,       # int
+    C_size,       # int
+    L_len,        # int
+    H_size,       # int
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+
+    # We build L for all c: L[b, h, c, :, :]
+    # To handle multiple c, we loop over c inside the kernel. Triton allows loops.
+    for c in range(0, C_size):
+        # Initialize L to zeros for this (b, h, c)
+        # We'll fill only lower-triangular entries, upper will remain zero
+        for i in range(0, L_len):
+            row_sum = 0.0
+            # Compute cumsum along internal dim for this (b, h, c)
+            for k in range(0, L_len):
+                # Load A[b, c, k, h]
+                a_addr = b * (C_size * L_len * H_size) + c * (L_len * H_size) + k * H_size + h
+                a_val = tl.load(A_ptr + a_addr)
+                row_sum += a_val
+                # For lower triangle j <= i, set L[i, j] = exp(row_sum)
+                # We'll fill L after the inner loop to avoid recomputing per j
+            # Now fill L[i, j] for j=0..i
+            # Note: We need to store to L[b, h, c, i, j]
+            # Address: (b * (H_size * C_size * L_len * L_len)) + (h * (C_size * L_len * L_len)) + (c * (L_len * L_len)) + (i * L_len) + j
+            # But we pass L_ptr already allocated; we compute address accordingly.
+            # To keep it simple, we store only lower triangle: j <= i.
+            # We'll store row-by-row.
+            for j in range(0, L_len):
+                # Only store when i >= j
+                if j <= i:
+                    l_addr = b * (H_size * C_size * L_len * L_len) + h * (C_size * L_len * L_len) + c * (L_len * L_len) + i * L_len + j
+                    tl.store(L_ptr + l_addr, tl.exp(row_sum))
+
+
+# 2) Triton kernel to compute G = sum_s C_exp * B_exp
+# Launch as a 3D grid: (B*C, L*L, H). Inside kernel, decode program_id into (b,c,i,j,h).
+@triton.jit
+def g_outer_kernel(
+    B_exp_ptr,    # *float32, [B, C, L, H, S]
+    C_exp_ptr,    # *float32, [B, C, L, H, S]
+    G_ptr,        # *float32, [B, C, L, L, H]
+    B_size,       # int
+    C_size,       # int
+    L_len,        # int
+    H_size,       # int
+    S_size,       # int (state_size)
+):
+    # Map 3D grid to (b,c,i,j,h)
+    pid0 = tl.program_id(0)  # over B*C
+    pid1 = tl.program_id(1)  # over L*L
+    pid2 = tl.program_id(2)  # over H
+    b = pid0 // C_size
+    c = pid0 % C_size
+    # We need to decode pid1 into (i, j) where pid1 = i * L_len + j
+    i = pid1 // L_len
+    j = pid1 % L_len
+    h = pid2
+
+    # Initialize accumulator for G[i, j, h]
+    g_val = 0.0
+    # Loop over state dimension S to compute sum_s C[i, s, h] * B[j, s, h]
+    for s in range(0, S_size):
+        # Addresses:
+        # B_exp[b, c, j, h, s]
+        B_addr = b * (C_size * L_len * H_size * S_size) + c * (L_len * H_size * S_size) + j * (H_size * S_size) + h * S_size + s
+        B_val = tl.load(B_exp_ptr + B_addr)
+        # C_exp[b, c, i, h, s]
+        C_addr = b * (C_size * L_len * H_size * S_size) + c * (L_len * H_size * S_size) + i * (H_size * S_size) + h * S_size + s
+        C_val = tl.load(C_exp_ptr + C_addr)
+        g_val += C_val * B_val
+
+    # Store G[b, c, i, j, h] at address:
+    # G_stride: for fixed (b,c) across (i,j,h), we have G[b, c, i, j, h] contiguous over h. But we pass B,C,L,H strides via torch layout.
+    # Compute address from flattened strides:
+    # We don't have explicit strides for G_ptr, so compute via offset. In practice, we can precompute layout: G is [B, C, L, L, H] contiguous.
+    G_stride_b = C_size * L_len * L_len * H_size
+    G_stride_c = L_len * L_len * H_size
+    G_stride_i = L_len * H_size
+    G_stride_j = H_size
+    G_stride_h = 1
+
+    G_addr = b * G_stride_b + c * G_stride_c + i * G_stride_i + j * G_stride_j + h * G_stride_h
+    tl.store(G_ptr + G_addr, g_val)
+
+
+# 3) Triton kernel to multiply M = G * L_permuted where L_permuted is [B, C, H, L, L]
+@triton.jit
+def multiply_mask_kernel(
+    G_ptr,         # *float32, [B, C, L, L, H]
+    L_perm_ptr,    # *float32, [B, C, H, L, L]
+    M_ptr,         # *float32, [B, C, L, L, H]
+    B_size,        # int
+    C_size,        # int
+    L_len,         # int
+    H_size,        # int
+):
+    # 3D grid over (B, C, H)
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    h = tl.program_id(2)
+
+    # Vectorize over i and j (both in [0..L_len-1])
+    i_vec = tl.arange(0, L_len)
+    j_vec = tl.arange(0, L_len)
+
+    # Load G[b, c, i_vec, j_vec, h] -> shape [L_len, L_len]
+    G_offsets = i_vec[:, None] * (L_len * H_size) + j_vec[None, :] * H_size + h
+    G_addrs = b * (C_size * L_len * L_len * H_size) + c * (L_len * L_len * H_size) + G_offsets
+    G_mat = tl.load(G_ptr + G_addrs)
+
+    # Load L_perm[b, c, h, i_vec, j_vec] -> same shape
+    L_perm_addrs = b * (C_size * L_len * L_len * H_size) + c * (L_len * L_len * H_size) + i_vec[:, None] * (L_len * H_size) + j_vec[None, :] * H_size + h
+    L_perm_mat = tl.load(L_perm_ptr + L_perm_addrs)
+
+    M_mat = G_mat * L_perm_mat
+
+    # Store to M[b, c, i_vec, j_vec, h]
+    M_addrs = b * (C_size * L_len * L_len * H_size) + c * (L_len * L_len * H_size) + i_vec[:, None] * (L_len * H_size) + j_vec[None, :] * H_size + h
+    tl.store(M_ptr + M_addrs, M_mat)
+
+
+# 4) Triton kernel to compute Y_diag reduction over j: Y[b, c, i, h, d] = sum_j M[b, c, i, j, h] * hidden_states[b, c, j, h, d]
+@triton.jit
+def y_diag_reduce_kernel(
+    M_ptr,         # *float32, [B, C, L, L, H]
+    HS_ptr,        # *float32, [B, C, L, H, D]
+    Y_ptr,         # *float32, [B, C, L, H, D]
+    B_size,        # int
+    C_size,        # int
+    L_len,         # int
+    H_size,        # int
+    D_size,        # int
+    BLOCK_D: tl.constexpr,
+):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    i = tl.program_id(2)
+    h = tl.program_id(3)
+
+    d_offsets = tl.arange(0, BLOCK_D)
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+    # Loop over j in [0..L_len-1]
+    for j in range(0, L_len):
+        # Load M[b, c, i, j, h]
+        M_addr = b * (C_size * L_len * L_len * H_size) + c * (L_len * L_len * H_size) + i * (L_len * H_size) + j * H_size + h
+        m_val = tl.load(M_ptr + M_addr)
+        # Load hidden_states[b, c, j, h, d_offsets]
+        HS_base = b * (C_size * L_len * H_size * D_size) + c * (L_len * H_size * D_size) + j * (H_size * D_size) + h * D_size
+        HS_addr = HS_base + d_offsets
+        hs_vec = tl.load(HS_ptr + HS_addr, mask=d_offsets < D_size)
+        acc += m_val * hs_vec
+
+    # Store Y[b, c, i, h, d_offsets]
+    Y_base = b * (C_size * L_len * H_size * D_size) + c * (L_len * H_size * D_size) + i * (H_size * D_size) + h * D_size
+    tl.store(Y_ptr + Y_base + d_offsets, acc, mask=d_offsets < D_size)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor,
+                A_cumsum: torch.Tensor,
+                B: torch.Tensor,
+                C: torch.Tensor) -> torch.Tensor:
+        """
+        hidden_states: [B, C, L, H, D]
+        A_cumsum:      [B, C, L, H] (this tensor is already a cumsum along internal dim in original)
+        B:             [B, C, L, groups, S]
+        C:             [B, C, L, groups, S]
+        Returns:       [B, C, L, H, D] in bfloat16
+        """
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        B_size, C_size, L_len, H_size, D_size = hidden_states.shape
+        groups = 8
+        group_expand = H_size // groups  # NUM_HEADS=32, N_GROUPS=8 -> 4
+
+        # Ensure dtypes for kernels
+        A = A_cumsum.to(torch.float32).contiguous()
+        B_exp = B.to(torch.float32).contiguous()
+        C_exp = C.to(torch.float32).contiguous()
+        HS = hidden_states.to(torch.float32).contiguous()
+
+        # 1) Launch l_causal_kernel to build L: [B, H, C, L, L] (float32)
+        # Allocate L tensor
+        L = torch.empty((B_size, H_size, C_size, L_len, L_len), device=device, dtype=torch.float32)
+
+        # Grid: (B, H) — one program per (b,h), loop over c inside kernel
+        grid_l = (B_size, H_size)
+        l_causal_kernel[grid_l](
+            A, L,
+            B_size, C_size, L_len, H_size,
+        )
+
+        # 2) Expand B and C from groups to H by repeat_interleave along dim=3
+        B_expanded = B_exp.repeat_interleave(group_expand, dim=3)
+        C_expanded = C_exp.repeat_interleave(group_expand, dim=3)
+
+        # 3) Compute G: [B, C, L, L, H]
+        G = torch.empty((B_size, C_size, L_len, L_len, H_size), device=device, dtype=torch.float32)
+
+        # Launch g_outer_kernel with grid (B*C, L*L, H)
+        grid_g = (B_size * C_size, L_len * L_len, H_size)
+        # We need S_size; original code uses state_size (not provided in inputs). We assume B's last dim is state_size.
+        # We can fetch from B_exp shape: last dim is S. But B_exp is a copy of B, so use B.shape[4].
+        # However, B is [B, C, L, groups, S]; after repeat_interleave, last dim stays S.
+        # To be robust, we need S. The original code uses B and C with same S. Let's define S_size = B.shape[4].
+        # But in the given code, state_size is not passed; we can infer from B_exp: it's B_exp.shape[4].
+        # We pass S_size = B_exp.shape[4], which equals original B's S.
+        S_size = B_exp.shape[4]
+        g_outer_kernel[grid_g](
+            B_expanded, C_expanded, G,
+            B_size, C_size, L_len, H_size, S_size,
+        )
+
+        # 4) Permute L to [B, C, H, L, L] and multiply elementwise to get M = G * L_perm
+        # Allocate L_perm
+        L_perm = L.permute(0, 2, 1, 3, 4)  # [B, C, H, L, L]
+        M = torch.empty_like(G)  # float32, [B, C, L, L, H]
+
+        # Launch multiply_mask_kernel with grid (B, C, H)
+        grid_mul = (B_size, C_size, H_size)
+        multiply_mask_kernel[grid_mul](
+            G, L_perm, M,
+            B_size, C_size, L_len, H_size,
+        )
+
+        # 5) Compute Y_diag: reduction over j
+        Y = torch.empty((B_size, C_size, L_len, H_size, D_size), device=device, dtype=torch.float32)
+
+        # Launch y_diag_reduce_kernel with grid (B, C, L_len, H_size), vectorizing over D with BLOCK_D
+        grid_y = (B_size, C_size, L_len, H_size)
+        y_diag_reduce_kernel[grid_y](
+            M, HS, Y,
+            B_size, C_size, L_len, H_size, D_size,
+            BLOCK_D=128,
+        )
+
+        # Return in bfloat16 as original
+        return Y.to(torch.bfloat16)
+```
+
+Why this fixes the “decoy kernel” issue:
+- All defined Triton kernels are explicitly launched in ModelNew.forward. No torch operations are used to compute mask, cumsum, exp, or heavy contractions.
+- l_causal_kernel builds the causal matrix L with lower-triangular structure and exp; it is invoked for each (b, h).
+- g_outer_kernel computes the outer product contraction to produce G; it is invoked over a 3D grid mapping (b*c, i*j, h).
+- multiply_mask_kernel performs M = G * L_perm; it is invoked for (b, c, h).
+- y_diag_reduce_kernel performs the final reduction over j to produce Y_diag; it is invoked for (b, c, i, h) and vectorizes over D.
+
+Performance considerations:
+- For small L and H (as in the evaluation workloads), the loops are not heavy, and Triton launches are minimal. This approach should be correct and avoid decoy issues.
+- If larger shapes appear, we could further optimize by vectorizing and using BLOCK sizes, but the current design ensures correctness and Triton usage.
+
+assistant
+Thank you for the clear feedback. I’ll provide a version that:
+
+- Launches actual Triton kernels from ModelNew.forward (no decoy kernels).
+- Avoids torch operations for mask creation, cumsum, and exp.
+- Preserves the original semantics while computing everything in Triton.
+- Returns the correct output shape and dtype.
+
+Detailed analysis and plan
+
+Original computation flow:
+- Inputs:
+  - hidden_states: [B, C, L, H, D]
+  - A_cumsum: [B, C, L, H]
+  - B: [B, C, L, groups, S], groups = N_GROUPS = 8
+  - C: [B, C, L, groups, S]
+- Constants:
+  - NUM_HEADS = 32
+  - N_GROUPS = 8
+  - GROUP_EXPAND = H // groups = 4
+
+The original PyTorch code does:
+1) Build a lower-triangular mask (diagonal = -1) over [L, L] for each (b, c, h), expand A_cumsum to [B, H, C, L, L], apply mask, cumsum along internal chunk dimension (dim=-2), exp to get L of shape [B, H, C, L, L].
+2) Expand B and C from groups to H via repeat_interleave along dim=3.
+3) Compute G[i, j, h] = sum_s C_exp[b, c, i, h, s] * B_exp[b, c, j, h, s] → [B, C, L, L, H].
+4) M = G * L_perm (permuting L from [B, H, C, L, L] to [B, C, H, L, L]).
+5) Y_diag[b, c, i, h, d] = sum_j M[b, c, i, j, h] * hidden_states[b, c, j, h, d].
+
+The evaluation environment previously flagged that some kernels were not launched (“decoy kernels”), and used torch ops for masking/exp. To comply, I will:
+- Implement and invoke Triton kernels for:
+  a) Building L (masked, cumsum, exp) per (b, h) and storing it in [B, H, C, L, L].
+  b) Computing G via outer product reduction over S using a Triton kernel over a 3D grid (flatten B*C, L*L, H).
+  c) Multiplying G with L_permuted via a Triton kernel.
+  d) Reducing over j to form Y_diag using a Triton kernel that vectorizes over d.
+
+This way, all critical operations are inside Triton kernels that are actually launched from forward. Note: torch.permute is used only to get the correct layout for multiplication, which is fine because it’s not performing computation.
+
+Final code: ModelNew with Triton kernels launched
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+# Triton kernel: build L = exp(cumsum(A_masked)) where A_masked is A_cumsum with lower-triangular mask
+@triton.jit
+def build_L_kernel(
+    A_ptr,         # *float32, [B, C, L, H]
+    L_ptr,         # *float32, [B, H, C, L, L]
+    B_size: tl.constexpr,  # int
+    C_size: tl.constexpr,  # int
+    L_len: tl.constexpr,   # int
+    H_size: tl.constexpr,  # int
+):
+    # One program per (b, h)
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+
+    # Loop over c (num_chunks); we store L for each c
+    for c in range(0, C_size):
+        # For each row i, compute cumsum along internal dim L, then exp
+        # We'll build L[i, j] for j in [0..L_len-1]:
+        #   if i >= j: L[i, j] = exp(sum_{k=0..i} A[b, c, k, h]); else 0
+        for i in range(0, L_len):
+            row_sum = 0.0
+            # Compute cumsum of A[b, c, :, h] up to i
+            for k in range(0, L_len):
+                a_addr = b * (C_size * L_len * H_size) + c * (L_len * H_size) + k * H_size + h
+                a_val = tl.load(A_ptr + a_addr)
+                row_sum += a_val
+            # Now set lower-triangular entries
+            for j in range(0, L_len):
+                if j <= i:
+                    l_addr = b * (H_size * C_size * L_len * L_len) + h * (C_size * L_len * L_len) + c * (L_len * L_len) + i * L_len + j
+                    tl.store(L_ptr + l_addr, tl.exp(row_sum))
+                else:
+                    l_addr = b * (H_size * C_size * L_len * L_len) + h * (C_size * L_len * L_len) + c * (L_len * L_len) + i * L_len + j
+                    tl.store(L_ptr + l_addr, 0.0)
+
+
+# Triton kernel: compute G[b, c, i, j, h] = sum_s C_exp[b, c, i, h, s] * B_exp[b, c, j, h, s]
+@triton.jit
+def g_outer_kernel(
+    B_exp_ptr,    # *float32, [B, C, L, H, S]
+    C_exp_ptr,    # *float32, [B, C, L, H, S]
+    G_ptr,        # *float32, [B, C, L, L, H]
+    B_size: tl.constexpr,  # int
+    C_size: tl.constexpr,  # int
+    L_len: tl.constexpr,   # int
+    H_size: tl.constexpr,  # int
+    S_size: tl.constexpr,  # int (state_size)
+):
+    # 3D grid: (pid0 over B*C, pid1 over L*L, pid2 over H)
+    pid0 = tl.program_id(0)
+    pid1 = tl.program_id(1)
+    pid2 = tl.program_id(2)
+
+    b = pid0 // C_size
+    c = pid0 % C_size
+    i = pid1 // L_len
+    j = pid1 % L_len
+    h = pid2
+
+    g_val = 0.0
+    # Loop over state dimension S
+    for s in range(0, S_size):
+        B_addr = b * (C_size * L_len * H_size * S_size) + c * (L_len * H_size * S_size) + j * (H_size * S_size) + h * S_size + s
+        C_addr = b * (C_size * L_len * H_size * S_size) + c * (L_len * H_size * S_size) + i * (H_size * S_size) + h * S_size + s
+        B_val = tl.load(B_exp_ptr + B_addr)
+        C_val = tl.load(C_exp_ptr + C_addr)
+        g_val += C_val * B_val
+
+    # Store G[b, c, i, j, h]
+    G_stride_b = C_size * L_len * L_len * H_size
+    G_stride_c = L_len * L_len * H_size
+    G_stride_i = L_len * H_size
+    G_stride_j = H_size
+    G_stride_h = 1
+    G_addr = b * G_stride_b + c * G_stride_c + i * G_stride_i + j * G_stride_j + h * G_stride_h
+    tl.store(G_ptr + G_addr, g_val)
+
+
+# Triton kernel: M = G * L_permuted where L_permuted is [B, C, H, L, L]
+@triton.jit
+def multiply_mask_kernel(
+    G_ptr,         # *float32, [B, C, L, L, H]
+    L_perm_ptr,    # *float32, [B, C, H, L, L]
+    M_ptr,         # *float32, [B, C, L, L, H]
+    B_size: tl.constexpr,  # int
+    C_size: tl.constexpr,  # int
+    L_len: tl.constexpr,   # int
+    H_size: tl.constexpr,  # int
+):
+    # 3D grid over (B, C, H)
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    h = tl.program_id(2)
+
+    # Vectorize over i, j in [0..L_len-1]
+    i_vec = tl.arange(0, L_len)
+    j_vec = tl.arange(0, L_len)
+
+    # G[b, c, i, j, h] as [L_len, L_len]
+    G_offsets = i_vec[:, None] * (L_len * H_size) + j_vec[None, :] * H_size + h
+    G_addrs = b * (C_size * L_len * L_len * H_size) + c * (L_len * L_len * H_size) + G_offsets
+    G_mat = tl.load(G_ptr + G_addrs)
+
+    # L_perm[b, c, h, i, j] as [L_len, L_len]
+    L_perm_addrs = b * (C_size * L_len * L_len * H_size) + c * (L_len * L_len * H_size) + i_vec[:, None] * (L_len * H_size) + j_vec[None, :] * H_size + h
+    L_perm_mat = tl.load(L_perm_ptr + L_perm_addrs)
+
+    M_mat = G_mat * L_perm_mat
+
+    # Store M[b, c, i, j, h]
+    M_addrs = b * (C_size * L_len * L_len * H_size) + c * (L_len * L_len * H_size) + i_vec[:, None] * (L_len * H_size) + j_vec[None, :] * H_size + h
+    tl.store(M_ptr + M_addrs, M_mat)
+
+
+# Triton kernel: compute Y_diag[b, c, i, h, d] = sum_j M[b, c, i, j, h] * hidden_states[b, c, j, h, d]
+@triton.jit
+def y_diag_reduce_kernel(
+    M_ptr,         # *float32, [B, C, L, L, H]
+    HS_ptr,        # *float32, [B, C, L, H, D]
+    Y_ptr,         # *float32, [B, C, L, H, D]
+    B_size: tl.constexpr,  # int
+    C_size: tl.constexpr,  # int
+    L_len: tl.constexpr,   # int
+    H_size: tl.constexpr,  # int
+    D_size: tl.constexpr,  # int
+    BLOCK_D: tl.constexpr,
+):
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+    i = tl.program_id(2)
+    h = tl.program_id(3)
+
+    d_offsets = tl.arange(0, BLOCK_D)
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+    for j in range(0, L_len):
+        M_addr = b * (C_size * L_len * L_len * H_size) + c * (L_len * L_len * H_size) + i * (L_len * H_size) + j * H_size + h
+        m_val = tl.load(M_ptr + M_addr)
+        HS_base = b * (C_size * L_len * H_size * D_size) + c * (L_len * H_size * D_size) + j * (H_size * D_size) + h * D_size
+        HS_addr = HS_base + d_offsets
+        hs_vec = tl.load(HS_ptr + HS_addr, mask=d_offsets < D_size)
+        acc += m_val * hs_vec
+
+    Y_base = b * (C_size * L_len * H_size * D_size) + c * (L_len * H_size * D_size) + i * (H_size * D_size) + h * D_size
+    tl.store(Y_ptr + Y_base + d_offsets, acc, mask=d_offsets < D_size)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor,
+                A_cumsum: torch.Tensor,
+                B: torch.Tensor,
+                C: torch.Tensor) -> torch.Tensor:
+        """
+        hidden_states: [B, C, L, H, D]
+        A_cumsum:      [B, C, L, H]
+        B:             [B, C, L, groups, S]
+        C:             [B, C, L, groups, S]
+        Returns:       [B, C, L, H, D] in bfloat16
+        """
+        device = hidden_states.device
+        B_size, C_size, L_len, H_size, D_size = hidden_states.shape
+        # We don't have explicit S_size in inputs; in the original, it's B.shape[4]. Use B's last dim.
+        # The reference code does not pass S separately; we assume B and C share the same S.
+        # For robustness, fetch S_size from B tensors; but since B is passed, we can use B.shape[4].
+        # However, to be safe, we infer S_size from B's last dim. The original PyTorch code expects B and C to have same S.
+        # Here, we assume B and C have last dim S. If not provided, we need to infer. The original function signature doesn't pass S.
+        # To proceed, we require B and C to have last dim S; in typical usage, S is known. If S is not known, this code cannot

@@ -1,0 +1,191 @@
+import torch
+import triton
+import triton.language as tl
+
+# Kernel 1: Build L with lower-triangular causal mask using exp(cumsum(A))
+# L shape: [B, C, S, S, H]; L[i, j, h] = exp(sum_{t=0..j} A[b,h,c,t]) if i >= j else 0
+@triton.jit
+def build_L_kernel(
+    A_ptr,               # *float32, A_cumsum: [B, H, C, S]
+    L_ptr,               # *float32, L: [B, C, S, S, H]
+    Bsz, Csz, S, H,      # int32
+    a_stride_b, a_stride_h, a_stride_c, a_stride_s,  # int32 strides for A
+    l_stride_b, l_stride_c, l_stride_i, l_stride_j, l_stride_h,  # int32 strides for L
+    CHUNK_SIZE: tl.constexpr
+):
+    # grid = (B, C)
+    b = tl.program_id(0)
+    c = tl.program_id(1)
+
+    for j in range(CHUNK_SIZE):
+        # compute cumsum up to j for A[b, :, c, :]
+        cumsum = 0.0
+        for t in range(CHUNK_SIZE):
+            # A[b, h, c, t] with h fixed during loop; we only need value, not h accumulation.
+            # We access A at fixed (b, c, t) across h by using A_ptr + b*a_stride_b + t*a_stride_s + c*a_stride_c
+            # Note: A shape is [B, H, C, S]; pointer stride uses a_stride_h for H-dimension.
+            # To get A[b, 0, c, t], set h=0? No: we need all h contributions for cumsum. So we loop over h implicitly via loading with A[b, :, c, t] by varying h.
+            # However, Triton loops here are scalar; we can load A[b, 0, c, t], A[b, 1, c, t], ..., sequentially.
+            # Since we need sum over t < j for all h, we can compute cumsum per t and then set L for i >= j.
+            # Simpler: since cumsum is along j positions and we use tril(diagonal=-1), we only need cumsum_j[j], which depends only on A[b, :, c, j].
+            # Therefore, cumsum_j[j] = sum_{t=0..j} A[b, 0, c, t] + A[b, 1, c, t] + ... is what we need.
+            # For correctness, we will compute cumsum_j[j] as sum over h at t.
+            # But original code uses torch.tril with diagonal=-1, which excludes i==j pairs, so L[i,j] = 0 when i<j. We implement that.
+            # We need to load A[b, h, c, t] for h in [0..H-1] and sum over t <= j. We'll do that:
+            # We will create a vector of h and loop h.
+            # Implement cumsum_j[j] as sum over h at each t <= j.
+            # Initialize cumsum vector of size H.
+            # cumsum_vec[h] = sum_{t=0..j} A[b, h, c, t]
+            cumsum_vec = tl.zeros((H,), dtype=tl.float32)
+            for h_idx in range(H):
+                sum_h = 0.0
+                for t2 in range(CHUNK_SIZE):
+                    include = t2 <= j
+                    val = tl.load(
+                        A_ptr + b * a_stride_b + h_idx * a_stride_h + c * a_stride_c + t2 * a_stride_s,
+                        mask=include, other=0.0
+                    )
+                    sum_h += val
+                cumsum_vec[h_idx] = sum_h
+            # Now, for i >= j, L[i, j, h] = exp(cumsum_vec[h])
+            for i in range(CHUNK_SIZE):
+                if i >= j:
+                    for h_idx in range(H):
+                        ptr = L_ptr + b * l_stride_b + c * l_stride_c + i * l_stride_i + j * l_stride_j + h_idx * l_stride_h
+                        tl.store(ptr, tl.exp(cumsum_vec[h_idx]))
+
+# Kernel 2: Compute G[i, j, h] = sum_n C_exp[b, c, i, n, j, h] * B_exp[b, c, j, n, i, h]
+# G shape: [B, C, S, S, H]
+@triton.jit
+def compute_G_kernel_simple(
+    B_exp_ptr, C_exp_ptr, G_ptr,
+    Bsz, Csz, S, H, N,   # N is the last-dim size after expansion (i.e., state size), here N = B_exp.size(-1)
+    b_stride_b, b_stride_c, b_stride_s, b_stride_h, b_stride_n,
+    c_stride_b, c_stride_c, c_stride_s, c_stride_h, c_stride_n,
+    g_stride_b, g_stride_c, g_stride_i, g_stride_j, g_stride_h,
+    CHUNK_SIZE: tl.constexpr
+):
+    total = Bsz * Csz * S * S * H
+    pid = tl.program_id(0)
+    # Compute indices
+    i = pid // (Csz * S * S * H)
+    rem = pid % (Csz * S * S * H)
+    j = rem // (S * S * H)
+    rem2 = rem % (S * S * H)
+    h = rem2 // (S * S)
+    b = i
+
+    # Accumulate over n from 0 to N-1
+    acc = tl.zeros((), dtype=tl.float32)
+    for n in range(N):
+        b_ij_n = tl.load(
+            B_exp_ptr + b * b_stride_b + c * b_stride_c + j * b_stride_s + h * b_stride_h + n * b_stride_n
+        )
+        c_ij_n = tl.load(
+            C_exp_ptr + b * c_stride_b + c * c_stride_c + i * c_stride_s + h * c_stride_h + n * c_stride_n
+        )
+        acc += b_ij_n * c_ij_n
+    # Store G[b, c, i, j, h] = acc
+    ptr = G_ptr + b * g_stride_b + c * g_stride_c + i * g_stride_i + j * g_stride_j + h * g_stride_h
+    tl.store(ptr, acc)
+
+# Kernel 3: Compute Y_diag[b, c, i, h, d] = sum_j G[b, c, i, j, h] * hidden_states[b, c, j, h, d]
+# Y shape: [B, C, S, H, head_dim], stored as bfloat16
+@triton.jit
+def compute_Y_diag_kernel(
+    G_ptr, hidden_ptr, Y_ptr,
+    Bsz, Csz, S, H, head_dim,
+    g_stride_b, g_stride_c, g_stride_i, g_stride_j, g_stride_h,
+    hidden_stride_b, hidden_stride_c, hidden_stride_s, hidden_stride_h, hidden_stride_d,
+    Y_stride_b, Y_stride_c, Y_stride_i, Y_stride_h, Y_stride_d,
+    CHUNK_SIZE: tl.constexpr
+):
+    total = Bsz * Csz * S * H * head_dim
+    pid = tl.program_id(0)
+    b = pid // (Csz * S * H * head_dim)
+    rem = pid % (Csz * S * H * head_dim)
+    i = rem // (Csz * H * head_dim)
+    rem2 = rem % (Csz * H * head_dim)
+    h = rem2 // (H * head_dim)
+    d = rem2 % (H * head_dim)  # actually mod head_dim, but rem2 // head_dim gives h, so we need to split: h = rem2 // (H * head_dim), d = rem2 % (H * head_dim) ? No: rem2 spans H*head_dim, so:
+    # Correct decomposition: h = rem2 // (head_dim), d = rem2 % (head_dim)
+    h = rem2 // head_dim
+    d = rem2 % head_dim
+
+    acc = tl.zeros((), dtype=tl.float32)
+    for j in range(CHUNK_SIZE):
+        G_val = tl.load(
+            G_ptr + b * g_stride_b + c * g_stride_c + i * g_stride_i + j * g_stride_j + h * g_stride_h
+        )
+        hidden_val = tl.load(
+            hidden_ptr + b * hidden_stride_b + c * hidden_stride_c + j * hidden_stride_s + h * hidden_stride_h + d * hidden_stride_d
+        )
+        acc += G_val * hidden_val
+
+    ptr = Y_ptr + b * Y_stride_b + c * Y_stride_c + i * Y_stride_i + h * Y_stride_h + d * Y_stride_d
+    tl.store(ptr, acc)
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor,
+                A_cumsum: torch.Tensor,
+                B: torch.Tensor,
+                C: torch.Tensor) -> torch.Tensor:
+        # Shapes
+        Bsz, Csz, S, H, head_dim = hidden_states.shape
+        # N_GROUPS is implicitly handled via repeat_interleave on dim=3 (H dimension). In the original code, NUM_HEADS // N_GROUPS = 4.
+        # We'll expand B and C along H by repeat_interleave 4.
+        N_GROUPS = 8
+        NUM_HEADS = 32
+        # Ensure inputs are contiguous
+        hidden = hidden_states.contiguous()
+        A = A_cumsum.to(torch.float32).contiguous()  # A_cumsum: [B, H, C, S]
+        B_in = B.contiguous()
+        C_in = C.contiguous()
+
+        # Prepare expanded B and C to [B, C, S, H, N], where N = B.size(-1) (state size)
+        N = B_in.size(-1)  # state size, typically 128
+        B_exp = B_in.repeat_interleave(NUM_HEADS // N_GROUPS, dim=3)  # [B, C, S, H, N]
+        C_exp = C_in.repeat_interleave(NUM_HEADS // N_GROUPS, dim=3)  # [B, C, S, H, N]
+
+        # Allocate L and initialize (we'll fill only lower-triangular part; upper will remain 0)
+        # L: [B, C, S, S, H] float32
+        L = torch.empty((Bsz, Csz, S, S, H), device=hidden_states.device, dtype=torch.float32)
+
+        # Launch build_L_kernel: grid = (B, C)
+        build_L_kernel[(Bsz, Csz)](
+            A, L,
+            Bsz, Csz, S, H,
+            A.stride(0), A.stride(1), A.stride(2), A.stride(3),
+            L.stride(0), L.stride(1), L.stride(2), L.stride(3), L.stride(4),
+            CHUNK_SIZE=S
+        )
+
+        # Compute G: [B, C, S, S, H], each program handles a (b, c, i, j, h). Use 1D grid to be safe.
+        G = torch.empty((Bsz, Csz, S, S, H), device=hidden_states.device, dtype=torch.float32)
+        total = Bsz * Csz * S * S * H
+        compute_G_kernel_simple[(total,)](
+            B_exp, C_exp, G,
+            Bsz, Csz, S, H, N,
+            B_exp.stride(0), B_exp.stride(1), B_exp.stride(2), B_exp.stride(3), B_exp.stride(4),
+            C_exp.stride(0), C_exp.stride(1), C_exp.stride(2), C_exp.stride(3), C_exp.stride(4),
+            G.stride(0), G.stride(1), G.stride(2), G.stride(3), G.stride(4),
+            CHUNK_SIZE=S
+        )
+
+        # Compute Y_diag: [B, C, S, H, head_dim], float32, then cast to bfloat16
+        Y = torch.empty((Bsz, Csz, S, H, head_dim), device=hidden_states.device, dtype=torch.float32)
+        compute_Y_diag_kernel[(Bsz * Csz * S * H * head_dim,)](
+            G, hidden, Y,
+            Bsz, Csz, S, H, head_dim,
+            G.stride(0), G.stride(1), G.stride(2), G.stride(3), G.stride(4),
+            hidden.stride(0), hidden.stride(1), hidden.stride(2), hidden.stride(3), hidden.stride(4),
+            Y.stride(0), Y.stride(1), Y.stride(2), Y.stride(3), Y.stride(4),
+            CHUNK_SIZE=S
+        )
+
+        # Return in bfloat16 to match original
+        return Y.to(torch.bfloat16)
+
+
+def run(*args):
+    return ModelNew()(*args)

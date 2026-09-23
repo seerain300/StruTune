@@ -1,0 +1,218 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv3x3_nchw_4d(x_ptr, w_ptr, y_ptr,
+                    N, C_in, H, W,
+                    x_sN, x_sC, x_sH, x_sW,
+                    w_sCo, w_sCi, w_sKh, w_sKw,
+                    y_sN, y_sC, y_sH, y_sW,
+                    C_out: tl.constexpr,
+                    NUM_CI: tl.constexpr):
+    # Grid: (N, C_out, H, W)
+    pid_n = tl.program_id(0)
+    pid_co = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    pid_w = tl.program_id(3)
+
+    acc = tl.zeros((), dtype=tl.float32)
+
+    # Loop over input channels and 3x3 neighborhood
+    for ci in range(NUM_CI):
+        for kh in range(3):
+            for kw in range(3):
+                h_in = pid_h + kh
+                w_in = pid_w + kw
+                in_bounds = (h_in >= 0) & (h_in < H) & (w_in >= 0) & (w_in < W)
+                x_offset = pid_n * x_sN + ci * x_sC + h_in * x_sH + w_in * x_sW
+                x_val = tl.load(x_ptr + x_offset, mask=in_bounds, other=0.0)
+                w_offset = pid_co * w_sCo + ci * w_sCi + kh * w_sKh + kw * w_sKw
+                w_val = tl.load(w_ptr + w_offset)
+                acc += x_val * w_val
+
+    y_offset = pid_n * y_sN + pid_co * y_sC + pid_h * y_sH + pid_w * y_sW
+    tl.store(y_ptr + y_offset, acc)
+
+
+@triton.jit
+def groupnorm_reduce_sums(y_ptr, sums_ptr,
+                           N, C, H, W, groups,
+                           y_sN, y_sC, y_sH, y_sW):
+    # Grid: (N, groups)
+    pid_n = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    group_size_c = C // groups
+    start_c = pid_g * group_size_c
+
+    sum_val = tl.zeros((), dtype=tl.float32)
+    sumsq_val = tl.zeros((), dtype=tl.float32)
+
+    for ci in range(start_c, start_c + group_size_c):
+        for h in range(0, H):
+            for w in range(0, W):
+                y_offset = pid_n * y_sN + ci * y_sC + h * y_sH + w * y_sW
+                val = tl.load(y_ptr + y_offset)
+                sum_val += val
+                sumsq_val += val * val
+
+    base = pid_n * groups + pid_g
+    tl.store(sums_ptr + base * 2 + 0, sum_val)
+    tl.store(sums_ptr + base * 2 + 1, sumsq_val)
+
+
+@triton.jit
+def groupnorm_apply_affine_silu(y_ptr, out_ptr, sums_ptr,
+                                N, C, H, W, groups,
+                                y_sN, y_sC, y_sH, y_sW,
+                                norm_weight_ptr, norm_bias_ptr):
+    # Grid: (N, C)
+    pid_n = tl.program_id(0)
+    pid_c = tl.program_id(1)
+
+    group_size_c = C // groups
+    g = pid_c // group_size_c
+
+    # Load precomputed sum and sumsq for (n, g)
+    base = pid_n * groups + g
+    sum_val = tl.load(sums_ptr + base * 2 + 0)
+    sumsq_val = tl.load(sums_ptr + base * 2 + 1)
+
+    num = H * W
+    mean = sum_val / num
+    var = sumsq_val / num - mean * mean
+    rstd = 1.0 / tl.sqrt(var + 1e-5)  # epsilon from PyTorch (use small value)
+
+    # Per-channel affine parameters
+    scale = tl.load(norm_weight_ptr + pid_c)
+    bias = tl.load(norm_bias_ptr + pid_c)
+
+    for h in range(0, H):
+        for w in range(0, W):
+            y_offset = pid_n * y_sN + pid_c * y_sC + h * y_sH + w * y_sW
+            y_val = tl.load(y_ptr + y_offset)
+            norm = (y_val - mean) * rstd
+            # SiLU: x * sigmoid(x) = x / (1 + exp(-x))
+            sig = 1.0 / (1.0 + tl.exp(-norm))
+            silu = norm * sig
+            out_val = silu * scale + bias
+            out_offset = pid_n * y_sN + pid_c * y_sC + h * y_sH + w * y_sW
+            tl.store(out_ptr + out_offset, out_val)
+
+
+@triton.jit
+def add_residual(y_ptr, x_ptr, out_ptr,
+                 total_elems):
+    # 1D grid over all elements
+    pid = tl.program_id(0)
+    val = tl.load(y_ptr + pid) + tl.load(x_ptr + pid)
+    tl.store(out_ptr + pid, val)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(
+        self,
+        x: torch.Tensor,
+        conv1_weight: torch.Tensor,
+        norm1_weight: torch.Tensor,
+        norm1_bias: torch.Tensor,
+        conv2_weight: torch.Tensor,
+        norm2_weight: torch.Tensor,
+        norm2_bias: torch.Tensor,
+        eps: float,
+    ):
+        # Ensure float32 and contiguous
+        x32 = x.contiguous().to(torch.float32)
+        conv1_w = conv1_weight.contiguous().to(torch.float32)
+        conv2_w = conv2_weight.contiguous().to(torch.float32)
+        n1_scale = norm1_weight.contiguous().to(torch.float32)
+        n1_bias = norm1_bias.contiguous().to(torch.float32)
+        n2_scale = norm2_weight.contiguous().to(torch.float32)
+        n2_bias = norm2_bias.contiguous().to(torch.float32)
+
+        N, C_in, H, W = x32.shape
+        C_out_conv = conv1_w.shape[0]  # C for conv1 is C_in, conv2 is C_out_conv
+        # First conv: x -> y1_out
+        y1_out = torch.empty((N, C_out_conv, H, W), device=x32.device, dtype=torch.float32)
+        grid_conv = (N, C_out_conv, H, W)
+        conv3x3_nchw_4d[grid_conv](
+            x32, conv1_w, y1_out,
+            N, C_in, H, W,
+            x32.stride(0), x32.stride(1), x32.stride(2), x32.stride(3),
+            conv1_w.stride(0), conv1_w.stride(1), conv1_w.stride(2), conv1_w.stride(3),
+            y1_out.stride(0), y1_out.stride(1), y1_out.stride(2), y1_out.stride(3),
+            C_out=C_out_conv,
+            NUM_CI=C_in,
+            num_warps=1
+        )
+
+        # GroupNorm + SiLU for y1_out
+        num_groups = 32
+        group_size_c = C_out_conv // num_groups
+        sums1 = torch.empty((N, num_groups, 2), device=x32.device, dtype=torch.float32)
+        grid_reduce1 = (N, num_groups)
+        groupnorm_reduce_sums[grid_reduce1](
+            y1_out, sums1,
+            N, C_out_conv, H, W, num_groups,
+            y1_out.stride(0), y1_out.stride(1), y1_out.stride(2), y1_out.stride(3),
+            num_warps=1
+        )
+        y1_norm = torch.empty_like(y1_out)
+        grid_apply1 = (N, C_out_conv)
+        groupnorm_apply_affine_silu[grid_apply1](
+            y1_out, y1_norm, sums1,
+            N, C_out_conv, H, W, num_groups,
+            y1_out.stride(0), y1_out.stride(1), y1_out.stride(2), y1_out.stride(3),
+            n1_scale, n1_bias,
+            num_warps=1
+        )
+
+        # Second conv: y1_norm -> y2_out
+        y2_out = torch.empty((N, C_out_conv, H, W), device=x32.device, dtype=torch.float32)
+        conv3x3_nchw_4d[grid_conv](
+            y1_norm, conv2_w, y2_out,
+            N, C_out_conv, H, W,
+            y1_norm.stride(0), y1_norm.stride(1), y1_norm.stride(2), y1_norm.stride(3),
+            conv2_w.stride(0), conv2_w.stride(1), conv2_w.stride(2), conv2_w.stride(3),
+            y2_out.stride(0), y2_out.stride(1), y2_out.stride(2), y2_out.stride(3),
+            C_out=C_out_conv,
+            NUM_CI=C_out_conv,
+            num_warps=1
+        )
+
+        # GroupNorm + SiLU for y2_out
+        sums2 = torch.empty((N, num_groups, 2), device=x32.device, dtype=torch.float32)
+        grid_reduce2 = (N, num_groups)
+        groupnorm_reduce_sums[grid_reduce2](
+            y2_out, sums2,
+            N, C_out_conv, H, W, num_groups,
+            y2_out.stride(0), y2_out.stride(1), y2_out.stride(2), y2_out.stride(3),
+            num_warps=1
+        )
+        y2_norm = torch.empty_like(y2_out)
+        grid_apply2 = (N, C_out_conv)
+        groupnorm_apply_affine_silu[grid_apply2](
+            y2_out, y2_norm, sums2,
+            N, C_out_conv, H, W, num_groups,
+            y2_out.stride(0), y2_out.stride(1), y2_out.stride(2), y2_out.stride(3),
+            n2_scale, n2_bias,
+            num_warps=1
+        )
+
+        # Residual add: y2_norm = y2_norm + x (original input)
+        total_elems = N * C_out_conv * H * W
+        out = torch.empty_like(y2_norm)
+        add_residual[(total_elems,)](
+            y2_norm, x32, out,
+            total_elems,
+            num_warps=1
+        )
+
+        # Return result (float32); cast back to input dtype if desired (here keep float32 for stability)
+        return out
+
+
+def run(*args):
+    return ModelNew()(*args)

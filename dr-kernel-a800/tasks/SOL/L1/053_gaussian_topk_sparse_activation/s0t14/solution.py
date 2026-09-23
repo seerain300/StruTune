@@ -1,0 +1,187 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def mean_lastdim_kernel(
+    inputs_ptr,       # *fp32, 2D view of shape [NROWS, F]
+    mean_out_ptr,     # *fp32, 1D of shape [NROWS]
+    F,                # int32, feature dimension
+    BLOCK_F: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    # Accumulator for sum of the row
+    sum_val = tl.zeros((), dtype=tl.float32)
+    # Loop over feature dimension in chunks
+    for offset in range(0, F, BLOCK_F):
+        idx = offset + tl.arange(0, BLOCK_F)
+        mask = idx < F
+        # Row pointer: base = pid * F; indices: base + idx
+        row_ptr = inputs_ptr + pid * F + idx
+        vals = tl.load(row_ptr, mask=mask, other=0.0)
+        sum_val += tl.sum(vals, axis=0)
+    mean = sum_val / F
+    tl.store(mean_out_ptr + pid, mean)
+
+
+@triton.jit
+def std_lastdim_kernel(
+    inputs_ptr,       # *fp32, 2D view of shape [NROWS, F]
+    std_out_ptr,      # *fp32, 1D of shape [NROWS]
+    mean_vec_ptr,     # *fp32, 1D of shape [NROWS]
+    F,                # int32, feature dimension
+    BLOCK_F: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    mean = tl.load(mean_vec_ptr + pid)
+    sum_sq = tl.zeros((), dtype=tl.float32)
+    for offset in range(0, F, BLOCK_F):
+        idx = offset + tl.arange(0, BLOCK_F)
+        mask = idx < F
+        row_ptr = inputs_ptr + pid * F + idx
+        vals = tl.load(row_ptr, mask=mask, other=0.0)
+        diff = vals - mean
+        sum_sq += tl.sum(diff * diff, axis=0)
+    # population std (unbiased=False): sqrt(sum_sq / F)
+    std = tl.sqrt(sum_sq / F)
+    tl.store(std_out_ptr + pid, std)
+
+
+@triton.jit
+def ndtri_approx_kernel(
+    z_ptr,            # *fp32, 1-element tensor to store result
+    p,                # float32 scalar probability (0, 1)
+    p_low: tl.constexpr,  # float32
+    p_high: tl.constexpr, # float32
+    a1, a2, a3, a4, a5, a6,
+    b1, b2, b3, b4, b5,
+    c1, c2, c3, c4, c5, c6,
+    d1, d2, d3, d4,
+):
+    # Compute inverse normal CDF via Abramowitz & Stegun 5.2.23
+    # lower region
+    q_low = tl.sqrt(-2.0 * tl.log(p_low))
+    z_low = (((((c1 * q_low + c2) * q_low + c3) * q_low + c4) * q_low + c5) * q_low + c6) / \
+            ((((d1 * q_low + d2) * q_low + d3) * q_low + d4) * q_low + 1.0)
+    # upper region
+    q_up = tl.sqrt(-2.0 * tl.log(1.0 - p_high))
+    z_up = -(((((c1 * q_up + c2) * q_up + c3) * q_up + c4) * q_up + c5) * q_up + c6) / \
+           ((((d1 * q_up + d2) * q_up + d3) * q_up + d4) * q_up + 1.0)
+    # central region
+    # since p is passed as scalar, compute directly
+    if p < p_low:
+        z = z_low
+    elif p > p_high:
+        z = z_up
+    else:
+        q = p - 0.5
+        r = q * q
+        z = (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q / \
+            (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0)
+    tl.store(z_ptr, z)
+
+
+@triton.jit
+def apply_cutoff_relu_kernel(
+    inputs_ptr,        # *fp32, 2D view [NROWS, F]
+    mean_ptr,          # *fp32, 1D [NROWS]
+    std_ptr,           # *fp32, 1D [NROWS]
+    z_ptr,             # *fp32, 1-element tensor (scalar)
+    out_ptr,           # *fp32, 2D [NROWS, F] output
+    F,                 # int32
+    BLOCK_F: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    mean = tl.load(mean_ptr + pid)
+    std = tl.load(std_ptr + pid)
+    z = tl.load(z_ptr)
+    cutoff = mean + std * z
+    for offset in range(0, F, BLOCK_F):
+        idx = offset + tl.arange(0, BLOCK_F)
+        mask = idx < F
+        row_in_ptr = inputs_ptr + pid * F + idx
+        vals = tl.load(row_in_ptr, mask=mask, other=0.0)
+        # output = max(0, vals - cutoff)
+        out_vals = tl.maximum(vals - cutoff, 0.0)
+        row_out_ptr = out_ptr + pid * F + idx
+        tl.store(row_out_ptr, out_vals, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, inputs: torch.Tensor, target_sparsity: float):
+        # Ensure CUDA and contiguous
+        assert inputs.is_cuda, "inputs must be on CUDA for Triton kernels"
+        inputs = inputs.contiguous()
+        B, S, F = inputs.shape
+        NROWS = B * S
+
+        # Compute in float32
+        inputs_2d = inputs.view(NROWS, F).to(torch.float32)
+
+        # Allocate outputs for mean and std
+        mean_out = torch.empty(NROWS, dtype=torch.float32, device=inputs.device)
+        std_out = torch.empty(NROWS, dtype=torch.float32, device=inputs.device)
+
+        # Launch mean kernel
+        mean_lastdim_kernel[(NROWS,)](
+            inputs_2d, mean_out, F, BLOCK_F=2048, num_warps=4
+        )
+
+        # Launch std kernel
+        std_lastdim_kernel[(NROWS,)](
+            inputs_2d, std_out, mean_out, F, BLOCK_F=2048, num_warps=4
+        )
+
+        # Compute ndtri(target_sparsity) in Triton
+        # Note: we pass p_low and p_high as compile-time constants (tl.constexpr) to ndtri_kernel.
+        p_low = 0.02425
+        p_high = 1.0 - p_low
+        z_buf = torch.empty(1, dtype=torch.float32, device=inputs.device)
+
+        a1 = -3.969683028665376e+01
+        a2 = 2.209460984245205e+02
+        a3 = -2.759285104469687e+02
+        a4 = 1.383577518672690e+02
+        a5 = -3.066479806614716e+01
+        a6 = 2.506628277459239e+00
+
+        b1 = -5.447609879822406e+01
+        b2 = 1.615858368580409e+02
+        b3 = -1.556989798598866e+02
+        b4 = 6.680131188771972e+01
+        b5 = -1.328068155288572e+01
+
+        c1 = -7.784894002430293e-03
+        c2 = -3.223964580411365e-01
+        c3 = -2.400758277161838e+00
+        c4 = -2.549732539343734e+00
+        c5 = 4.374664141464968e+00
+        c6 = 2.938163982698783e+00
+
+        d1 = 7.784695709041462e-03
+        d2 = 3.224671290700398e-01
+        d3 = 2.445134137142996e+00
+        d4 = 3.754408661907416e+00
+
+        ndtri_approx_kernel[(1,)](
+            z_buf, float(target_sparsity), p_low, p_high, a1, a2, a3, a4, a5, a6,
+            b1, b2, b3, b4, b5, c1, c2, c3, c4, c5, c6, d1, d2, d3, d4
+        )
+
+        # Apply cutoff and ReLU in Triton
+        out_fp32 = torch.empty((NROWS, F), dtype=torch.float32, device=inputs.device)
+        apply_cutoff_relu_kernel[(NROWS,)](
+            inputs_2d, mean_out, std_out, z_buf, out_fp32, F, BLOCK_F=2048, num_warps=4
+        )
+
+        # Reshape and cast to bfloat16 to match original behavior
+        out_3d = out_fp32.view(B, S, F)
+        return out_3d.to(torch.bfloat16)
+
+
+def run(*args):
+    return ModelNew()(*args)

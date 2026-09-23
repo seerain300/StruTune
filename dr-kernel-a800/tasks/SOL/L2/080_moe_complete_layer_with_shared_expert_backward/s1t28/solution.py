@@ -1,0 +1,207 @@
+import torch
+import triton
+import triton.language as tl
+
+
+# GEMV: y[b, e] = sum_h hidden[b, h] * W[e, h]
+# hidden: [B, H] (bf16 or other), W: [N, H] (bf16), y: [B, N] (f32)
+@triton.jit
+def gemv_linear_kernel(
+    hidden_ptr,   # *bf16, [B, H]
+    W_ptr,        # *bf16, [N, H]
+    y_ptr,        # *f32,  [B, N]
+    B: tl.constexpr,
+    H: tl.constexpr,
+    N: tl.constexpr,
+    stride_h_b, stride_h_h,
+    stride_W_e, stride_W_h,
+    stride_y_b, stride_y_e,
+    BLOCK_H: tl.constexpr,
+):
+    pid_b = tl.program_id(0)  # batch row
+    pid_e = tl.program_id(1)  # expert index in W (gate or up)
+    acc = 0.0
+    for h_start in range(0, H, BLOCK_H):
+        offs_h = h_start + tl.arange(0, BLOCK_H)
+        mask_h = offs_h < H
+        h_vals = tl.load(hidden_ptr + pid_b * stride_h_b + offs_h * stride_h_h, mask=mask_h, other=0.0).to(tl.float32)
+        W_vals = tl.load(W_ptr + pid_e * stride_W_e + offs_h * stride_W_h, mask=mask_h, other=0.0).to(tl.float32)
+        acc += tl.sum(h_vals * W_vals, axis=0)
+    tl.store(y_ptr + pid_b * stride_y_b + pid_e * stride_y_e, acc)
+
+
+# Triton elementwise SiLU: y = x * sigmoid(x), operate on flat vectors (f32)
+@triton.jit
+def silu_elemwise_kernel(x_ptr, y_ptr, N_elements: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N_elements
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    x_f32 = x.to(tl.float32)
+    sig = 1.0 / (1.0 + tl.exp(-x_f32))
+    y = x_f32 * sig
+    tl.store(y_ptr + offs, y, mask=mask)
+
+
+# Triton elementwise multiply: y = a * b on flat vectors, both f32
+@triton.jit
+def mul_elemwise_kernel(a_ptr, b_ptr, y_ptr, N_elements: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N_elements
+    a = tl.load(a_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(b_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    y = a * b
+    tl.store(y_ptr + offs, y, mask=mask)
+
+
+# GEMV: y[b, h] = sum_t activated_pre[b, t] * down[t, h]
+# activated_pre: [B, N] (f32), down: [N, H] (bf16), y: [B, H] (f32)
+@triton.jit
+def down_gemv_kernel(
+    activated_ptr,   # *f32, [B, N]
+    down_ptr,        # *bf16,[N, H]
+    y_ptr,           # *f32, [B, H]
+    B: tl.constexpr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    stride_a_b, stride_a_n,
+    stride_d_n, stride_d_h,
+    stride_y_b, stride_y_h,
+    BLOCK_H: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    acc = 0.0
+    for n_start in range(0, N, 1):  # activated is 1D per row, but we still iterate as structured
+        # For each t, load activated[b, t] and down[t, h]
+        # We need a vector of h for this t, we can't vectorize over h here directly,
+        # so loop over h in blocks. This is a robust fallback.
+        for h_start in range(0, H, BLOCK_H):
+            offs_h = h_start + tl.arange(0, BLOCK_H)
+            mask_h = offs_h < H
+            a_val = tl.load(activated_ptr + pid_b * stride_a_b + n_start * stride_a_n).to(tl.float32)
+            down_vals = tl.load(down_ptr + n_start * stride_d_n + offs_h * stride_d_h, mask=mask_h, other=0.0).to(tl.float32)
+            acc += tl.sum(a_val * down_vals, axis=0)
+    tl.store(y_ptr + pid_b * stride_y_b + pid_h * stride_y_h, acc)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        grad_output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        router_weight: torch.Tensor,
+        e_score_correction_bias: torch.Tensor,
+        router_logits: torch.Tensor,
+        scores: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_weights: torch.Tensor,
+        score_mask: torch.Tensor,
+        shared_expert_gate_weight: torch.Tensor,   # [H, N_gate] = [4096, 1408], bf16
+        shared_expert_up_weight: torch.Tensor,     # [H, N_up]   = [4096, 1408], bf16
+        shared_expert_down_weight: torch.Tensor,   # [H, N_down] = [4096, 1408], bf16
+        shared_gate_output: torch.Tensor,          # not used
+        shared_up_output: torch.Tensor,            # not used
+        shared_activated: torch.Tensor,            # not used
+    ):
+        """
+        Returns:
+          shared_gate_output: [B, 1408] bf16
+          shared_up_output:   [B, 1408] bf16
+          shared_activated:   [B, 4096] bf16
+        """
+        B = hidden_states.shape[0]
+        H = shared_expert_gate_weight.shape[0]  # 4096
+        N_gate = shared_expert_gate_weight.shape[1]  # 1408
+        N_up = shared_expert_up_weight.shape[1]  # 1408
+        N_down = shared_expert_down_weight.shape[1]  # 1408
+
+        # Ensure contiguous for Triton (we'll use explicit strides)
+        hidden = hidden_states.contiguous()
+
+        # 1) Gate GEMV: y_gate[b, t] = sum_h hidden[b,h] * gate[t,h]
+        y_gate_f32 = torch.empty((B, N_gate), dtype=torch.float32, device=hidden.device)
+        grid_gate = (B, N_gate)
+        gemv_linear_kernel[grid_gate](
+            hidden, shared_expert_gate_weight, y_gate_f32,
+            B, H, N_gate,
+            hidden.stride(0), hidden.stride(1),
+            shared_expert_gate_weight.stride(0), shared_expert_gate_weight.stride(1),
+            y_gate_f32.stride(0), y_gate_f32.stride(1),
+            BLOCK_H=256,
+            num_warps=4,
+        )
+
+        # 2) Up GEMV: y_up[b, t] = sum_h hidden[b,h] * up[t,h]
+        y_up_f32 = torch.empty((B, N_up), dtype=torch.float32, device=hidden.device)
+        grid_up = (B, N_up)
+        gemv_linear_kernel[grid_up](
+            hidden, shared_expert_up_weight, y_up_f32,
+            B, H, N_up,
+            hidden.stride(0), hidden.stride(1),
+            shared_expert_up_weight.stride(0), shared_expert_up_weight.stride(1),
+            y_up_f32.stride(0), y_up_f32.stride(1),
+            BLOCK_H=256,
+            num_warps=4,
+        )
+
+        # 3) SiLU on gate: gate_f32 = y_gate_f32 * sigmoid(y_gate_f32)
+        gate_silu_f32 = torch.empty_like(y_gate_f32)
+        N_gate_flat = B * N_gate
+        silu_elemwise_kernel[(N_gate_flat + 1023) // 1024](  # grid over elements
+            y_gate_f32, gate_silu_f32, N_gate_flat, BLOCK=1024, num_warps=4
+        )
+
+        # 4) Multiply: activated_pre[b, t] = silu_gate[b, t] * up[b, t]
+        activated_pre_f32 = torch.empty((B, N_up), dtype=torch.float32, device=hidden.device)
+        mul_elemwise_kernel[(B * N_up + 1023) // 1024](
+            gate_silu_f32, y_up_f32, activated_pre_f32, B * N_up, BLOCK=1024, num_warps=4
+        )
+
+        # 5) Down GEMV: y_activated[b, h] = sum_t activated_pre[b, t] * down[t, h]
+        # We'll implement this as a row-wise accumulation across N blocks. Triton matmul is overkill here.
+        y_activated_f32 = torch.empty((B, H), dtype=torch.float32, device=hidden.device)
+        grid_down = (B, H)
+        # Loop over t in blocks and accumulate; Triton cannot vectorize across N here, so use nested for-loops.
+        # Note: This implementation runs one program per (b, h) and iterates t in blocks, which is fine for H=4096, B up to ~8k.
+        for b in range(B):  # we can't vectorize over b in Triton launch, but we can use strides
+            for h_start in range(0, H, 256):
+                offs_h = h_start + tl.arange(0, 256)
+                mask_h = offs_h < H
+                acc_bh = 0.0
+                for t_start in range(0, N_down, 128):
+                    t_offsets = t_start + tl.arange(0, 128)
+                    mask_t = t_offsets < N_down
+                    a_vals = tl.load(activated_pre_f32 + b * (N_down) + t_offsets).to(tl.float32)  # need to vectorize properly
+                    # Instead of manual nested loops, we can restructure using Triton launch: use a 2D grid over (b, h) and loop over N in the kernel.
+                    # To keep correctness, we implement down GEMV via a separate kernel below.
+
+                    # Define a proper Triton kernel that handles 2D grid and loops over N. Redefine to use 2D and loop N:
+
+                    # We'll implement down_gemv_kernel using 2D grid (B, H) and loop over N in the kernel body. This is done above, but incomplete in Python. Let's provide the proper kernel and call it.
+
+        # Proper Triton kernel call for down projection (GEMV):
+        down_gemv_kernel[grid_down](
+            activated_pre_f32, shared_expert_down_weight, y_activated_f32,
+            B, N_down, H,
+            activated_pre_f32.stride(0), activated_pre_f32.stride(1),
+            shared_expert_down_weight.stride(0), shared_expert_down_weight.stride(1),
+            y_activated_f32.stride(0), y_activated_f32.stride(1),
+            BLOCK_H=256,
+            num_warps=4,
+        )
+
+        # Return casted to bf16 to match original outputs
+        shared_gate_output = y_gate_f32.to(torch.bfloat16)
+        shared_up_output = y_up_f32.to(torch.bfloat16)
+        shared_activated = y_activated_f32.to(torch.bfloat16)
+
+        return shared_gate_output, shared_up_output, shared_activated
+
+
+def run(*args):
+    return ModelNew()(*args)

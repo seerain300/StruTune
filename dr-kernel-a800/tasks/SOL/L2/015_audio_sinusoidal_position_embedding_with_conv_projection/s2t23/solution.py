@@ -1,0 +1,262 @@
+import math
+import torch
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+# Conv2D stride=2, padding=1, 3x3, bias
+# Input:  X: [B, C_in, IH, IW], W: [OC, C_in, 3, 3], b: [OC], Output: Y: [B, OC, OH, OW]
+@triton.jit
+def conv2d_stride2_kernel(
+    X_ptr, W_ptr, BIAS_ptr, Y_ptr,
+    B, C_in, IH, IW, OC, OH, OW,
+    # strides
+    x_b_stride, x_c_stride, x_h_stride, x_w_stride,
+    w_oc_stride, w_ic_stride, w_kh_stride, w_kw_stride,
+    y_b_stride, y_oc_stride, y_h_stride, y_w_stride,
+):
+    b = tl.program_id(0)
+    oc = tl.program_id(1)
+    oh = tl.program_id(2)
+    ow = tl.program_id(3)
+
+    acc = tl.zeros((), dtype=tl.float32)
+
+    # iterate over input channels and 3x3 taps
+    for ic in range(0, C_in):
+        for kh in range(0, 3):
+            for kw in range(0, 3):
+                # compute input indices with padding
+                ih = 2 * oh + kh - 1
+                iw = 2 * ow + kw - 1
+
+                # mask for in-bounds
+                in_bounds = (ih >= 0) & (ih < IH) & (iw >= 0) & (iw < IW)
+
+                x_ptr = X_ptr + b * x_b_stride + ic * x_c_stride + ih * x_h_stride + iw * x_w_stride
+                x_val = tl.load(x_ptr, mask=in_bounds, other=0.0)
+
+                w_ptr = W_ptr + oc * w_oc_stride + ic * w_ic_stride + kh * w_kh_stride + kw * w_kw_stride
+                w_val = tl.load(w_ptr)
+                acc += x_val * w_val
+
+    # add bias
+    bias_val = tl.load(BIAS_ptr + oc)
+    acc = acc + bias_val
+
+    # store
+    y_ptr = Y_ptr + b * y_b_stride + oc * y_oc_stride + oh * y_h_stride + ow * y_w_stride
+    tl.store(y_ptr, acc)
+
+
+# GELU (tanh approximation) over a 1D pointer; in-place on OUT
+@triton.jit
+def gelu_tanh_kernel(OUT_ptr, size, alpha: tl.float32, beta: tl.float32):
+    idx = tl.program_id(0)
+    val = tl.load(OUT_ptr + idx)
+    # tanh approximation: y = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    x3 = val * val * val
+    inner = alpha * (val + beta * x3)
+    act = tl.tanh(inner)
+    y = 0.5 * val * (1.0 + act)
+    tl.store(OUT_ptr + idx, y)
+
+
+# Final linear projection (X[b, t, :], W[m, :] shape (M, N)), add positional embedding
+# X: [B, T, N], W: [M, N], pos: [T, M], Y: [B, T, M]
+@triton.jit
+def linear_project_pos_kernel(
+    X_ptr, W_ptr, POS_ptr, Y_ptr,
+    B, T, N, M, scale: tl.float32,
+):
+    b = tl.program_id(0)
+    t = tl.program_id(1)
+    for m0 in range(0, M, 64):
+        m_offsets = m0 + tl.arange(0, 64)
+        mask_m = m_offsets < M
+        acc = tl.zeros([64], dtype=tl.float32)
+        for n0 in range(0, N, 256):
+            n_offsets = n0 + tl.arange(0, 256)
+            mask_n = n_offsets < N
+            x_vals = tl.load(X_ptr + b * (T * N) + t * N + n_offsets, mask=mask_n, other=0.0)
+            w_ptrs = W_ptr + m_offsets[:, None] * N + n_offsets[None, :]
+            w_vals = tl.load(w_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0)
+            acc += tl.sum(w_vals * x_vals[None, :], axis=1)
+        acc = acc * scale
+        pos_vec = tl.load(POS_ptr + t * M + m_offsets, mask=mask_m, other=0.0)
+        acc = acc + pos_vec
+        tl.store(Y_ptr + b * (T * M) + t * M + m_offsets, acc, mask=mask_m)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, input_features, conv2d1_weight, conv2d1_bias,
+                conv2d2_weight, conv2d2_bias,
+                conv2d3_weight, conv2d3_bias,
+                conv_out_weight, positional_embedding, embed_scale):
+        """
+        input_features: (B, 1, 80, T), bfloat16
+        conv weights/bias: bfloat16, shape as provided
+        conv_out_weight: (1024, 384*10), bfloat16
+        positional_embedding: (1500, 1024), bfloat16
+        embed_scale: float, e.g., sqrt(1024)=32.0
+        """
+        # Ensure CUDA tensors
+        dev = torch.device("cuda")
+        B = input_features.shape[0]
+        T = input_features.shape[-1]
+        IH = 80
+        IW = T
+        # Stage 1 conv: (1, 80, T) -> (B, 384, 40, OW1), OW1 = (T + 1) // 2
+        C_in1 = 1
+        OC1 = 384
+        OH1 = (IH - 1) // 2 + 1  # 40
+        OW1 = (IW + 1) // 2
+
+        X1 = input_features.contiguous().to(dev, dtype=torch.float32)
+        W1 = conv2d1_weight.contiguous().to(dev, dtype=torch.float32)
+        B1 = conv2d1_bias.contiguous().to(dev, dtype=torch.float32)
+
+        Y1 = torch.empty((B, OC1, OH1, OW1), device=dev, dtype=torch.float32)
+
+        # Strides
+        x_b_stride = C_in1 * IH * IW
+        x_c_stride = IH * IW
+        x_h_stride = IW
+        x_w_stride = 1
+        w_oc_stride = C_in1 * 3 * 3
+        w_ic_stride = 3 * 3
+        w_kh_stride = 3
+        w_kw_stride = 1
+        y_b_stride = OC1 * OH1 * OW1
+        y_oc_stride = OH1 * OW1
+        y_h_stride = OW1
+        y_w_stride = 1
+
+        grid1 = (B, OC1, OH1, OW1)
+        conv2d_stride2_kernel[grid1](
+            X1, W1, B1, Y1,
+            B, C_in1, IH, IW, OC1, OH1, OW1,
+            x_b_stride, x_c_stride, x_h_stride, x_w_stride,
+            w_oc_stride, w_ic_stride, w_kh_stride, w_kw_stride,
+            y_b_stride, y_oc_stride, y_h_stride, y_w_stride,
+        )
+
+        # GELU after conv1
+        Y1_flat = Y1.reshape(-1).contiguous()
+        gelu_tanh_kernel[(Y1_flat.numel(),)](
+            Y1_flat, Y1_flat.numel(), 0.7978845608028654, 0.044715
+        )
+        Y1 = Y1_flat.reshape(B, OC1, OH1, OW1)
+
+        # Stage 2 conv: (384, 40, OW1) -> (B, 384, 20, OW2), OW2 = (OW1 + 1) // 2
+        C_in2 = OC1
+        OC2 = 384
+        OH2 = (OH1 - 1) // 2 + 1  # 20
+        OW2 = (OW1 + 1) // 2
+
+        X2 = Y1.contiguous().to(dev, dtype=torch.float32)
+        W2 = conv2d2_weight.contiguous().to(dev, dtype=torch.float32)
+        B2 = conv2d2_bias.contiguous().to(dev, dtype=torch.float32)
+        Y2 = torch.empty((B, OC2, OH2, OW2), device=dev, dtype=torch.float32)
+
+        x_b_stride2 = C_in2 * OH2 * OW2
+        x_c_stride2 = OH2 * OW2
+        x_h_stride2 = OW2
+        x_w_stride2 = 1
+        w_oc_stride2 = C_in2 * 3 * 3
+        w_ic_stride2 = 3 * 3
+        w_kh_stride2 = 3
+        w_kw_stride2 = 1
+        y_b_stride2 = OC2 * OH2 * OW2
+        y_oc_stride2 = OH2 * OW2
+        y_h_stride2 = OW2
+        y_w_stride2 = 1
+
+        grid2 = (B, OC2, OH2, OW2)
+        conv2d_stride2_kernel[grid2](
+            X2, W2, B2, Y2,
+            B, C_in2, OH1, OW1, OC2, OH2, OW2,
+            x_b_stride2, x_c_stride2, x_h_stride2, x_w_stride2,
+            w_oc_stride2, w_ic_stride2, w_kh_stride2, w_kw_stride2,
+            y_b_stride2, y_oc_stride2, y_h_stride2, y_w_stride2,
+        )
+
+        # GELU after conv2
+        Y2_flat = Y2.reshape(-1).contiguous()
+        gelu_tanh_kernel[(Y2_flat.numel(),)](
+            Y2_flat, Y2_flat.numel(), 0.7978845608028654, 0.044715
+        )
+        Y2 = Y2_flat.reshape(B, OC2, OH2, OW2)
+
+        # Stage 3 conv: (384, 20, OW2) -> (B, 384, 10, OW3), OW3 = (OW2 + 1) // 2
+        C_in3 = OC2
+        OC3 = 384
+        OH3 = (OH2 - 1) // 2 + 1  # 10
+        OW3 = (OW2 + 1) // 2
+
+        X3 = Y2.contiguous().to(dev, dtype=torch.float32)
+        W3 = conv2d3_weight.contiguous().to(dev, dtype=torch.float32)
+        B3 = conv2d3_bias.contiguous().to(dev, dtype=torch.float32)
+        Y3 = torch.empty((B, OC3, OH3, OW3), device=dev, dtype=torch.float32)
+
+        x_b_stride3 = C_in3 * OH3 * OW3
+        x_c_stride3 = OH3 * OW3
+        x_h_stride3 = OW3
+        x_w_stride3 = 1
+        w_oc_stride3 = C_in3 * 3 * 3
+        w_ic_stride3 = 3 * 3
+        w_kh_stride3 = 3
+        w_kw_stride3 = 1
+        y_b_stride3 = OC3 * OH3 * OW3
+        y_oc_stride3 = OH3 * OW3
+        y_h_stride3 = OW3
+        y_w_stride3 = 1
+
+        grid3 = (B, OC3, OH3, OW3)
+        conv2d_stride2_kernel[grid3](
+            X3, W3, B3, Y3,
+            B, C_in3, OH2, OW2, OC3, OH3, OW3,
+            x_b_stride3, x_c_stride3, x_h_stride3, x_w_stride3,
+            w_oc_stride3, w_ic_stride3, w_kh_stride3, w_kw_stride3,
+            y_b_stride3, y_oc_stride3, y_h_stride3, y_w_stride3,
+        )
+
+        # GELU after conv3
+        Y3_flat = Y3.reshape(-1).contiguous()
+        gelu_tanh_kernel[(Y3_flat.numel(),)](
+            Y3_flat, Y3_flat.numel(), 0.7978845608028654, 0.044715
+        )
+        Y3 = Y3_flat.reshape(B, OC3, OH3, OW3)
+
+        # Final step: permute to (B, T_final, 384*10), linear project to 1024, scale, add pos emb
+        T_final = OW3  # time_after_conv from axes
+        N = OC3 * 10  # 3840
+        M = 1024
+
+        # Reshape Y3 to (B, T_final, N)
+        Y_perm = Y3.permute(0, 3, 1, 2).contiguous().view(B, T_final, N)
+
+        # conv_out_weight shape is (M=1024, N=3840)
+        W_lin = conv_out_weight.contiguous().to(dev, dtype=torch.float32)  # (1024, 3840)
+        POS = positional_embedding.contiguous().to(dev, dtype=torch.float32)  # (1500, 1024)
+        Y_out = torch.empty((B, T_final, M), device=dev, dtype=torch.float32)
+
+        # Launch linear projection + pos
+        linear_project_pos_kernel[(B, T_final)](
+            Y_perm, W_lin, POS, Y_out,
+            B, T_final, N, M, embed_scale
+        )
+
+        return Y_out
+
+
+def run(*args):
+    return ModelNew()(*args)

@@ -1,0 +1,268 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def in_proj_linear_kernel(
+    X_ptr,         # *const float, input x: (B, S, H)
+    W_ptr,         # *const float, in_proj_weight: (I, H), I=3*H
+    Bias_ptr,      # *const float, in_proj_bias: (I)
+    Out_ptr,       # *float, output BCx: (B, S, I)
+    B: tl.int32,
+    S: tl.int32,
+    H: tl.int32,
+    I: tl.int32,
+    # strides
+    x_b_stride: tl.int32, x_s_stride: tl.int32, x_h_stride: tl.int32,
+    w_i_stride: tl.int32, w_h_stride: tl.int32,
+    out_b_stride: tl.int32, out_s_stride: tl.int32, out_i_stride: tl.int32,
+    BLOCK_H: tl.constexpr,
+):
+    # grid: axis=0 over B*S (one program per (b, s))
+    pid = tl.program_id(axis=0)
+    b = pid // S
+    s = pid % S
+
+    x_base = X_ptr + b * x_b_stride + s * x_s_stride
+    out_base = Out_ptr + b * out_b_stride + s * out_s_stride
+
+    # iterate over output channels I
+    for i in range(0, I):
+        acc = 0.0
+        # reduce over H dimension in tiles
+        for h in range(0, H, BLOCK_H):
+            h_offsets = h + tl.arange(0, BLOCK_H)
+            h_mask = h_offsets < H
+            x_vals = tl.load(
+                x_base + h_offsets * x_h_stride,
+                mask=h_mask,
+                other=0.0
+            )
+            w_vals = tl.load(
+                W_ptr + i * w_i_stride + h_offsets * w_h_stride,
+                mask=h_mask,
+                other=0.0
+            )
+            # accumulate in fp32
+            acc += tl.sum((x_vals.to(tl.float32)) * (w_vals.to(tl.float32)), axis=0)
+        # add bias
+        bval = tl.load(Bias_ptr + i)
+        acc = acc + bval.to(tl.float32)
+        # store to output; Triton will cast acc to Out_ptr element type on store
+        tl.store(out_base + i * out_i_stride, acc)
+
+
+@triton.jit
+def grouped_causal_conv1d_kernel(
+    Bx_ptr,         # *const float, input after gating: (B, H, S+pad), here pad=3
+    W_ptr,          # *const float, conv_weight: (H, 1, 4)
+    Bias_ptr,       # *const float, conv_bias: (H)
+    Out_ptr,        # *float, output conv_out: (B, H, S)
+    B: tl.int32,
+    H: tl.int32,
+    S: tl.int32,                # input sequence length after padding
+    P: tl.int32,                # pad = 3
+    # strides
+    bx_b_stride: tl.int32, bx_h_stride: tl.int32, bx_t_stride: tl.int32,  # for Bx_padded (B, H, S+P)
+    w_g_stride: tl.int32, w_k_stride: tl.int32,                             # W is (H, 1, 4): g maps to H, k=0..3
+    out_b_stride: tl.int32, out_h_stride: tl.int32, out_t_stride: tl.int32,
+    BLOCK_T: tl.constexpr,
+):
+    # grid: axis=0 over B*H (one program per (b, g))
+    pid = tl.program_id(axis=0)
+    b = pid // H
+    g = pid % H
+
+    # vector of output positions
+    t_offsets = tl.arange(0, BLOCK_T)
+    # we compute up to S outputs; masks handle bounds
+    # Accumulator per output position
+    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+
+    # loop over kernel taps
+    for k in range(0, 4):
+        # source index in padded input: t_in = t + k - 1
+        t_in = t_offsets + k - 1
+        in_bounds = (t_in >= 0) & (t_in < S) & (t_offsets < S)
+
+        # load from padded input with mask
+        # ptr = Bx_ptr + b*bx_b_stride + g*bx_h_stride + t_in*bx_t_stride
+        ptr_in = Bx_ptr + b * bx_b_stride + g * bx_h_stride + t_in * bx_t_stride
+        vals = tl.load(ptr_in, mask=in_bounds, other=0.0)  # load as fp32
+
+        # load conv weight for group g, tap k
+        w_val = tl.load(W_ptr + g * w_g_stride + k * w_k_stride).to(tl.float32)
+
+        # accumulate
+        acc += vals * w_val
+
+    # add bias
+    bval = tl.load(Bias_ptr + g).to(tl.float32)
+    acc = acc + bval
+
+    # store to output at positions t_offsets (masked for t < S)
+    out_ptrs = Out_ptr + b * out_b_stride + g * out_h_stride + t_offsets * out_t_stride
+    tl.store(out_ptrs, acc, mask=(t_offsets < S))
+
+
+@triton.jit
+def out_proj_linear_kernel(
+    Y_ptr,         # *const float, input y: (B, S, H)
+    W_ptr,         # *const float, out_proj_weight: (H, H)
+    Bias_ptr,      # *const float, out_proj_bias: (H)
+    Out_ptr,       # *float, output: (B, S, H)
+    B: tl.int32,
+    S: tl.int32,
+    H: tl.int32,
+    # strides
+    y_b_stride: tl.int32, y_s_stride: tl.int32, y_h_stride: tl.int32,
+    w_h_out_stride: tl.int32, w_h_in_stride: tl.int32,
+    out_b_stride: tl.int32, out_s_stride: tl.int32, out_h_stride: tl.int32,
+    BLOCK_H: tl.constexpr,
+):
+    # grid: axis=0 over B*S (one program per (b, s))
+    pid = tl.program_id(axis=0)
+    b = pid // S
+    s = pid % S
+
+    y_base = Y_ptr + b * y_b_stride + s * y_s_stride
+    out_base = Out_ptr + b * out_b_stride + s * out_s_stride
+
+    for h_out in range(0, H):
+        acc = 0.0
+        for h_in in range(0, H, BLOCK_H):
+            h_in_offsets = h_in + tl.arange(0, BLOCK_H)
+            mask_h_in = h_in_offsets < H
+            y_vals = tl.load(y_base + h_in_offsets * y_h_stride, mask=mask_h_in, other=0.0).to(tl.float32)
+            w_vals = tl.load(W_ptr + h_out * w_h_out_stride + h_in_offsets * w_h_in_stride, mask=mask_h_in, other=0.0).to(tl.float32)
+            acc += tl.sum(y_vals * w_vals, axis=0)
+        # add bias
+        bval = tl.load(Bias_ptr + h_out).to(tl.float32)
+        acc = acc + bval
+        tl.store(out_base + h_out * out_h_stride, acc)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        # We'll create example parameters to match the original structure. In evaluation,
+        # these will be provided as inputs.
+        B, S, H = 2, 4096, 128  # example sizes; forward will use actual inputs
+        I = 3 * H
+        # in_proj: (I, H), bias (I)
+        self.in_proj_weight = torch.empty(I, H, device='cuda', dtype=torch.float32)
+        self.in_proj_bias = torch.empty(I, device='cuda', dtype=torch.float32)
+        # conv: groups=H, (H, 1, 4), bias (H)
+        self.conv_weight = torch.empty(H, 1, 4, device='cuda', dtype=torch.float32)
+        self.conv_bias = torch.empty(H, device='cuda', dtype=torch.float32)
+        # out_proj: (H, H), bias (H)
+        self.out_proj_weight = torch.empty(H, H, device='cuda', dtype=torch.float32)
+        self.out_proj_bias = torch.empty(H, device='cuda', dtype=torch.float32)
+
+        # Initialize weights/biases (optional; evaluator may provide its own)
+        # Simple init to avoid zeros errors in convolution
+        torch.nn.init.kaiming_uniform_(self.in_proj_weight, a=math.sqrt(5))
+        self.in_proj_bias.uniform_(-1, 1)
+        torch.nn.init.kaiming_uniform_(self.conv_weight, a=math.sqrt(5))
+        self.conv_bias.uniform_(-1, 1)
+        torch.nn.init.kaiming_uniform_(self.out_proj_weight, a=math.sqrt(5))
+        self.out_proj_bias.uniform_(-1, 1)
+
+        # Hidden batch/seq dims (not used in init, but keep for clarity)
+        self.batch_size = B
+        self.seq_len = S
+        self.hidden_size = H
+
+    def forward(self, x: torch.Tensor, in_proj_weight: torch.Tensor, in_proj_bias: torch.Tensor,
+                conv_weight: torch.Tensor, conv_bias: torch.Tensor,
+                out_proj_weight: torch.Tensor, out_proj_bias: torch.Tensor):
+        """
+        Triton-only forward:
+        1) in_proj_linear_kernel: BCx = F.linear(x, in_proj_weight, in_proj_bias)
+        2) Slice BCx -> B_tensor, C_tensor, x_proj
+        3) Bx = B_tensor * x_proj (torch)
+        4) Bx_padded = zeros((B,H,S+3))
+           Copy Bx into Bx_padded[:, :, 3:]
+        5) grouped_causal_conv1d_kernel: conv_out = grouped causal conv on Bx_padded, groups=H
+        6) y = C_tensor.transpose(-1,-2) * conv_out.transpose(-1,-2) (torch)
+        7) out_proj_linear_kernel: final output
+        """
+        # Ensure tensors are on CUDA and contiguous
+        assert x.is_cuda, "All tensors must be on CUDA for Triton kernels."
+        x = x.contiguous()
+        in_proj_weight = in_proj_weight.contiguous()
+        in_proj_bias = in_proj_bias.contiguous()
+        conv_weight = conv_weight.contiguous()
+        conv_bias = conv_bias.contiguous()
+        out_proj_weight = out_proj_weight.contiguous()
+        out_proj_bias = out_proj_bias.contiguous()
+
+        B, S, H = x.shape
+        I = 3 * H
+        pad = 3  # kernel_size=4 causal conv => left pad by 3
+
+        # 1) in_proj_linear: BCx (B,S,I)
+        BCx = torch.empty((B, S, I), device=x.device, dtype=x.dtype)
+        BLOCK_H = 64
+        grid_in = (B * S,)
+        in_proj_linear_kernel[grid_in](
+            x, in_proj_weight, in_proj_bias, BCx,
+            B, S, H, I,
+            x.stride(0), x.stride(1), x.stride(2),
+            in_proj_weight.stride(0), in_proj_weight.stride(1),
+            BCx.stride(0), BCx.stride(1), BCx.stride(2),
+            BLOCK_H=BLOCK_H,
+            num_warps=4,
+        )
+
+        # 2) Slice BCx into B_tensor, C_tensor, x_proj
+        B_tensor = BCx[:, :, :H].contiguous()
+        C_tensor = BCx[:, :, H:2 * H].contiguous()
+        x_proj = BCx[:, :, 2 * H:].contiguous()
+
+        # 3) Elementwise gating: Bx = B_tensor * x_proj (torch)
+        Bx = B_tensor * x_proj  # (B,S,H)
+
+        # 4) Prepare Bx_padded (B,H,S+pad) with zeros on left for causal
+        Bx_padded = torch.zeros((B, H, S + pad), device=x.device, dtype=x.dtype)
+        # copy original Bx into padded[:, :, 3:]
+        Bx_padded[:, :, 3:] = Bx
+
+        # 5) grouped_causal_conv1d_kernel: conv_out (B,H,S)
+        conv_out = torch.empty((B, H, S), device=x.device, dtype=x.dtype)
+        grid_conv = (B * H,)
+        grouped_causal_conv1d_kernel[grid_conv](
+            Bx_padded, conv_weight, conv_bias, conv_out,
+            B, H, S, pad,
+            Bx_padded.stride(0), Bx_padded.stride(1), Bx_padded.stride(2),
+            conv_weight.stride(0), conv_weight.stride(2),  # w_g_stride corresponds to H, w_k_stride is 1
+            conv_out.stride(0), conv_out.stride(1), conv_out.stride(2),
+            BLOCK_T=256,
+            num_warps=4,
+        )
+
+        # 6) y = C_tensor.transpose(-1,-2) * conv_out.transpose(-1,-2) (torch elementwise)
+        # Shapes: C_tensor (B,S,H) and conv_out (B,H,S)
+        # Transpose conv_out to (B,S,H) for elementwise multiply with C_tensor
+        y = C_tensor * conv_out.transpose(-1, -2)  # (B,S,H)
+
+        # 7) out_proj_linear: final output (B,S,H)
+        final_out = torch.empty((B, S, H), device=x.device, dtype=x.dtype)
+        BLOCK_H_out = 64
+        grid_out = (B * S,)
+        out_proj_linear_kernel[grid_out](
+            y, out_proj_weight, out_proj_bias, final_out,
+            B, S, H,
+            y.stride(0), y.stride(1), y.stride(2),
+            out_proj_weight.stride(0), out_proj_weight.stride(1),
+            final_out.stride(0), final_out.stride(1), final_out.stride(2),
+            BLOCK_H=BLOCK_H_out,
+            num_warps=4,
+        )
+
+        return final_out
+
+
+def run(*args):
+    return ModelNew()(*args)

@@ -1,0 +1,171 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def mean_lastdim_kernel(x_ptr, means_ptr, B, S, F, BLOCK_F: tl.constexpr):
+    # One program per row: row = pid in [0, B*S)
+    pid = tl.program_id(axis=0)
+    row = pid
+    # If grid > B*S, guard (shouldn't happen if grid == B*S, but keep safe)
+    if row >= B * S:
+        return
+    # Compute base offset for this row
+    base = row * F
+    # Accumulate sum across features in chunks of BLOCK_F
+    total_sum = 0.0
+    for offs in range(0, F, BLOCK_F):
+        idx = offs + tl.arange(0, BLOCK_F)
+        mask = idx < F
+        x = tl.load(x_ptr + base + idx, mask=mask, other=0.0)
+        total_sum += tl.sum(x, axis=0)
+    mean = total_sum / F
+    # Store mean for this row
+    tl.store(means_ptr + row, mean)
+
+
+@triton.jit
+def std_lastdim_kernel(x_ptr, stds_ptr, means_ptr, B, S, F, BLOCK_F: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    row = pid
+    if row >= B * S:
+        return
+    base = row * F
+    mean = tl.load(means_ptr + row)
+    total_var = 0.0
+    for offs in range(0, F, BLOCK_F):
+        idx = offs + tl.arange(0, BLOCK_F)
+        mask = idx < F
+        x = tl.load(x_ptr + base + idx, mask=mask, other=0.0)
+        diff = x - mean
+        total_var += tl.sum(diff * diff, axis=0)
+    var = total_var / F
+    std = tl.sqrt(var)
+    tl.store(stds_ptr + row, std)
+
+
+@triton.jit
+def ndtri_approx_kernel(p_ptr, z_ptr):
+    # Compute inverse normal CDF for scalar p using Abramowitz & Stegun 5.2.23 approximation.
+    # z_ptr is a 1-element output tensor.
+    p = tl.load(p_ptr)  # scalar float32
+    # Constants for approximation
+    a1 = -3.969683028665376e+01
+    a2 = 2.209460984245205e+02
+    a3 = -2.759285104469687e+02
+    a4 = 1.383577518672690e+02
+    a5 = -3.066479806614716e+01
+    a6 = 2.506628277459239e+00
+
+    b1 = -5.447609879822406e+01
+    b2 = 1.615858368580409e+02
+    b3 = -1.556989798598866e+02
+    b4 = 6.680131188771972e+01
+    b5 = -1.328068155288572e+01
+
+    c1 = -7.784894002430293e-03
+    c2 = -3.223964580411365e-01
+    c3 = -2.400758277161838e+00
+    c4 = -2.549732539343734e+00
+    c5 = 4.374664141464968e+00
+    c6 = 2.938163982698783e+00
+
+    d1 = 7.784695709041462e-03
+    d2 = 3.224671290700398e-01
+    d3 = 2.445134137142996e+00
+    d4 = 3.754408661907416e+00
+
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+
+    # Lower region
+    q = tl.sqrt(-2.0 * tl.log(p))
+    result = (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / \
+             ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+
+    # Central region
+    q2 = p - 0.5
+    r = q2 * q2
+    result2 = (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q2 / \
+              (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0)
+
+    # Upper region
+    q3 = tl.sqrt(-2.0 * tl.log(1.0 - p))
+    result3 = -(((((c1 * q3 + c2) * q3 + c3) * q3 + c4) * q3 + c5) * q3 + c6) / \
+              ((((d1 * q3 + d2) * q3 + d3) * q3 + d4) * q3 + 1.0)
+
+    # Select region and compute
+    mask_low = p < p_low
+    mask_mid = (p >= p_low) & (p <= p_high)
+    mask_high = p > p_high
+
+    # Piecewise selection: result for lower/mid, result3 for upper
+    # Use tl.where for safe scalar selection
+    z_val = tl.where(mask_low, result, 0.0)
+    z_val = tl.where(mask_mid, result2, z_val)
+    z_val = tl.where(mask_high, result3, z_val)
+
+    tl.store(z_ptr, z_val)
+
+
+@triton.jit
+def apply_cutoff_relu_kernel(x_ptr, out_ptr, means_ptr, stds_ptr, z_ptr, B, S, F, BLOCK_F: tl.constexpr):
+    # One program per row
+    pid = tl.program_id(axis=0)
+    row = pid
+    if row >= B * S:
+        return
+    base = row * F
+    mean = tl.load(means_ptr + row)
+    std = tl.load(stds_ptr + row)
+    z = tl.load(z_ptr)  # scalar float32
+    cutoff = mean + std * z
+
+    # Loop over features in chunks, compute out = max(0, x - cutoff)
+    for offs in range(0, F, BLOCK_F):
+        idx = offs + tl.arange(0, BLOCK_F)
+        mask = idx < F
+        x = tl.load(x_ptr + base + idx, mask=mask, other=0.0)
+        y = x - cutoff
+        y = tl.where(y > 0.0, y, 0.0)  # ReLU
+        tl.store(out_ptr + base + idx, y, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, inputs: torch.Tensor, target_sparsity: float) -> torch.Tensor:
+        # Ensure CUDA and contiguous, compute in float32
+        assert inputs.is_cuda, "Input must be a CUDA tensor for Triton kernels."
+        x = inputs.contiguous().to(torch.float32)
+        B, S, F = x.shape
+
+        # Allocate per-row means and stds (float32)
+        means = torch.empty(B * S, device=x.device, dtype=torch.float32)
+        stds = torch.empty(B * S, device=x.device, dtype=torch.float32)
+
+        # Launch mean and std kernels
+        grid = (B * S,)
+        # Tune BLOCK_F and num_warps based on F
+        BLOCK_F = 8192
+        num_warps = 8 if F >= 8192 else 4
+        mean_lastdim_kernel[grid](x, means, B, S, F, BLOCK_F=BLOCK_F, num_warps=num_warps, num_stages=2)
+        std_lastdim_kernel[grid](x, stds, means, B, S, F, BLOCK_F=BLOCK_F, num_warps=num_warps, num_stages=2)
+
+        # Compute z = ndtri(target_sparsity) in Triton (scalar)
+        p = torch.tensor(target_sparsity, device=x.device, dtype=torch.float32).reshape(1)
+        z_scalar = torch.empty(1, device=x.device, dtype=torch.float32)
+        ndtri_approx_kernel[(1,)](p, z_scalar)
+
+        # Allocate output (float32) for apply kernel
+        out_fp32 = torch.empty_like(x, dtype=torch.float32)
+
+        # Launch apply kernel
+        apply_cutoff_relu_kernel[grid](x, out_fp32, means, stds, z_scalar, B, S, F, BLOCK_F=BLOCK_F, num_warps=num_warps, num_stages=2)
+
+        # Cast to bfloat16 to match original behavior
+        out_bf16 = out_fp32.to(torch.bfloat16)
+        return out_bf16
+
+
+def run(*args):
+    return ModelNew()(*args)

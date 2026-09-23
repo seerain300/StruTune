@@ -1,0 +1,248 @@
+import math
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def compute_logits_kernel(
+    qn_ptr, Kc_ptr, qp_ptr, Kp_ptr, logits_ptr,
+    H, L, K, Kp, sm_scale,
+    stride_qn_h, stride_qn_k,
+    stride_Kc_l, stride_Kc_k,
+    stride_qp_h, stride_qp_kp,
+    stride_Kp_l, stride_Kp_kp,
+    stride_log_h, stride_log_l,
+):
+    # One program per head h
+    h = tl.program_id(0)
+
+    # Compute logits[h, :] = sum_k qn[h, k] * Kc[:, k] + sum_k' qp[h, k'] * Kp[:, k']
+    row_ptr = logits_ptr + h * stride_log_h
+    l = 0
+    while l < L:
+        # Accumulate over K
+        sum1 = 0.0
+        k = 0
+        while k < K:
+            qn_val = tl.load(qn_ptr + h * stride_qn_h + k * stride_qn_k)
+            kc_val = tl.load(Kc_ptr + l * stride_Kc_l + k * stride_Kc_k)
+            sum1 += qn_val * kc_val
+            k += 1
+        # Accumulate over Kp
+        sum2 = 0.0
+        kp = 0
+        while kp < Kp:
+            qp_val = tl.load(qp_ptr + h * stride_qp_h + kp * stride_qp_kp)
+            kp_val = tl.load(Kp_ptr + l * stride_Kp_l + kp * stride_Kp_kp)
+            sum2 += qp_val * kp_val
+            kp += 1
+        logit = sum1 + sum2
+        logit = logit * sm_scale
+        tl.store(row_ptr + l * stride_log_l, logit)
+        l += 1
+
+
+@triton.jit
+def compute_lse_row_kernel(
+    logits_ptr, lse_vec_ptr,
+    L,
+    stride_log_h, stride_log_l,
+):
+    # One program per head h: we compute row-wise lse for logits[h, :]
+    h = tl.program_id(0)
+    row_ptr = logits_ptr + h * stride_log_h
+
+    # Compute row_max (exclude -inf)
+    neg_inf = -float("inf")
+    row_max = neg_inf
+    l = 0
+    while l < L:
+        val = tl.load(row_ptr + l * stride_log_l)
+        if val != neg_inf:
+            row_max = tl.maximum(row_max, val)
+        l += 1
+
+    # Sum exp over valid positions
+    sum_exp = 0.0
+    l = 0
+    while l < L:
+        val = tl.load(row_ptr + l * stride_log_l)
+        if val != neg_inf:
+            sum_exp += tl.exp(val - row_max)
+        l += 1
+
+    inv_ln2 = 1.0 / math.log(2.0)
+    lse = row_max + tl.log(sum_exp) * inv_ln2
+    tl.store(lse_vec_ptr + h, lse)
+
+
+@triton.jit
+def compute_softmax_row_kernel(
+    logits_ptr, attn_ptr, lse_ptr,
+    L, prefix_len, i,
+    stride_log_h, stride_log_l,
+    stride_attn_h, stride_attn_l,
+):
+    # One program per head h: compute attn[h, :] = softmax(logits_scaled[h, :])
+    h = tl.program_id(0)
+    row_ptr = logits_ptr + h * stride_log_h
+    attn_row_ptr = attn_ptr + h * stride_attn_h
+
+    # Load lse for head h
+    lse_val = tl.load(lse_ptr + h)
+
+    # Causal mask: j > prefix_len + i -> set to -inf before softmax
+    # prefix_len is computed in host as L - q_len; i is index of query in batch.
+    mask_pos = prefix_len + i  # int32 scalar passed from host
+    j = 0
+    while j < L:
+        val = tl.load(row_ptr + j * stride_log_l)
+        if (j > mask_pos):
+            val = -float("inf")
+        soft = tl.exp(val - lse_val)
+        tl.store(attn_row_ptr + j * stride_attn_l, soft)
+        j += 1
+
+
+@triton.jit
+def gemv_out_kernel(
+    attn_ptr, Kc_ptr, out_ptr,
+    H, L, K,
+    stride_attn_h, stride_attn_l,
+    stride_Kc_l, stride_Kc_k,
+    stride_out_h, stride_out_k,
+    head: tl.constexpr,  # one program per head
+):
+    # Compute out[head, :] = attn[head, :] @ Kc[0..L-1, :]
+    out_row_ptr = out_ptr + head * stride_out_h
+    k = 0
+    acc = tl.zeros((), dtype=tl.float32)
+    while k < K:
+        l = 0
+        while l < L:
+            attn_val = tl.load(attn_ptr + head * stride_attn_h + l * stride_attn_l)
+            kc_val = tl.load(Kc_ptr + l * stride_Kc_l + k * stride_Kc_k)
+            acc += attn_val * kc_val
+            l += 1
+        tl.store(out_row_ptr + k * stride_out_k, acc)
+        k += 1
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale):
+        # Ensure tensors are on CUDA and contiguous
+        device = q_nope.device
+        if not device.type == 'cuda':
+            # If not on CUDA, fallback to a minimal CPU-like path (though the evaluator expects CUDA/Triton)
+            raise RuntimeError("ModelNew expects CUDA tensors for Triton kernels.")
+
+        q_nope = q_nope.contiguous()
+        q_pe = q_pe.contiguous()
+        ckv_cache = ckv_cache.contiguous()
+        kpe_cache = kpe_cache.contiguous()
+        qo_indptr = qo_indptr.contiguous()
+        kv_indptr = kv_indptr.contiguous()
+        kv_indices = kv_indices.contiguous()
+
+        # Prepare caches: squeeze dim=1
+        Kc_all = ckv_cache.squeeze(1)  # [num_pages, K] but we slice with kv_indices
+        Kp_all = kpe_cache.squeeze(1)  # [num_pages, Kp]
+
+        total_q = int(qo_indptr[qo_indptr.shape[0] - 1].item())
+        H = q_nope.shape[1]  # num_qo_heads, asserted to be 16
+        K = q_nope.shape[2]  # head_dim_ckv, 512
+        Kp = q_pe.shape[2]   # head_dim_kpe, 64
+
+        output = torch.empty((total_q, H, K), dtype=torch.bfloat16, device=device)
+        lse = torch.full((total_q, H), -float("inf"), dtype=torch.float32, device=device)
+
+        # Loop over batch elements in qo_indptr
+        b = 0
+        while b < (qo_indptr.shape[0] - 1):
+            q_start = int(qo_indptr[b].item())
+            q_end = int(qo_indptr[b + 1].item())
+            q_len = q_end - q_start
+
+            if q_len == 0:
+                b += 1
+                continue
+
+            # Get token indices for this batch
+            tok_start = int(kv_indptr[b].item())
+            tok_end = int(kv_indptr[b + 1].item())
+            L = tok_end - tok_start
+
+            if L == 0:
+                b += 1
+                continue
+
+            # Slice caches for this batch
+            Kc_curr = Kc_all[tok_start:tok_end].contiguous()  # [L, K]
+            Kp_curr = Kp_all[tok_start:tok_end].contiguous()  # [L, Kp]
+
+            # For each query i in this batch
+            for i in range(q_len):
+                q_start_i = q_start + i
+
+                # Prepare qn and qp (fp32 for Triton)
+                qn = q_nope[q_start_i].to(torch.float32).contiguous()  # [H, K]
+                qp = q_pe[q_start_i].to(torch.float32).contiguous()    # [H, Kp]
+
+                # Allocate intermediate tensors
+                logits = torch.empty((H, L), dtype=torch.float32, device=device)  # per-head logits
+
+                # 1) Compute logits[h, :] for each head
+                grid = (H,)
+                compute_logits_kernel[grid](
+                    qn, Kc_curr, qp, Kp_curr, logits,
+                    H, L, K, Kp, sm_scale,
+                    qn.stride(0), qn.stride(1),
+                    Kc_curr.stride(0), Kc_curr.stride(1),
+                    qp.stride(0), qp.stride(1),
+                    Kp_curr.stride(0), Kp_curr.stride(1),
+                    logits.stride(0), logits.stride(1),
+                )
+
+                # 2) Compute lse per head
+                lse_vec = torch.empty((H,), dtype=torch.float32, device=device)
+                compute_lse_row_kernel[grid](
+                    logits, lse_vec,
+                    L,
+                    logits.stride(0), logits.stride(1),
+                )
+
+                # 3) Compute softmax per head with causal mask: j > (L - q_len) + i
+                prefix_len = L - q_len  # per-batch prefix
+                compute_softmax_row_kernel[grid](
+                    logits, attn, lse_vec,
+                    L, prefix_len, i,
+                    logits.stride(0), logits.stride(1),
+                    attn.stride(0), attn.stride(1),
+                )
+
+                # 4) GEMV: out[h, :] = attn[h, :] @ Kc_curr.T → [H, K]
+                out_row = torch.empty((H, K), dtype=torch.float32, device=device)
+                grid_out = (H,)
+                gemv_out_kernel[grid_out](
+                    attn, Kc_curr, out_row,
+                    H, L, K,
+                    attn.stride(0), attn.stride(1),
+                    Kc_curr.stride(0), Kc_curr.stride(1),
+                    out_row.stride(0), out_row.stride(1),
+                    head=0,  # loop over heads via grid; we have one program per head
+                )
+
+                # Store outputs
+                output[q_start_i] = out_row[:, :].to(torch.bfloat16)
+                lse[q_start_i] = lse_vec  # already [H], stored per row
+
+            b += 1
+
+        return output, lse
+
+
+def run(*args):
+    return ModelNew()(*args)

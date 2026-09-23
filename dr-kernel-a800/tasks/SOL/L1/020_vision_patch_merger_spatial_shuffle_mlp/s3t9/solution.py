@@ -1,0 +1,303 @@
+import torch
+import math
+import triton
+import triton.language as tl
+
+# Triton kernel: LayerNorm per row (reduce then apply). One program per row.
+@triton.jit
+def _layer_norm_kernel(x_ptr, y_ptr, ln_weight_ptr, ln_bias_ptr,
+                        N, C, eps,
+                        BLOCK_SIZE: tl.constexpr):
+    """
+    x_ptr: *bf16, shape [N, C], row-major
+    y_ptr: *bf16, shape [N, C], output
+    ln_weight_ptr, ln_bias_ptr: *bf16, shape [C]
+    eps: float32
+    """
+    row = tl.program_id(0)
+    if row >= N:
+        return
+
+    x_row_ptr = x_ptr + row * C
+    y_row_ptr = y_ptr + row * C
+
+    # Pass 1: compute mean and variance (fp32)
+    sum_val = 0.0
+    sum_sq = 0.0
+    col = 0
+    while col < C:
+        offs = col + tl.arange(0, BLOCK_SIZE)
+        mask = offs < C
+        x = tl.load(x_row_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        sum_val += tl.sum(x, axis=0)
+        sum_sq += tl.sum(x * x, axis=0)
+        col += BLOCK_SIZE
+
+    mean = sum_val / C
+    var = sum_sq / C
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    # Pass 2: normalize and apply affine, then store
+    col = 0
+    while col < C:
+        offs = col + tl.arange(0, BLOCK_SIZE)
+        mask = offs < C
+        x = tl.load(x_row_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(ln_weight_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+        b = tl.load(ln_bias_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        y = (x - mean) * inv_std
+        y = y * w + b
+        tl.store(y_row_ptr + offs, y.to(tl.bfloat16), mask=mask)
+        col += BLOCK_SIZE
+
+
+# Triton kernel: Exact spatial shuffle per grid. Produces hidden_shuffled of shape
+# [total_num_merged_patches, 4*C], where total_num_merged_patches = sum_{g} t_g * (h_g//2) * (w_g//2).
+# We launch one program per grid and iterate over all original patches m in that grid.
+@triton.jit
+def _shuffle_2x2_per_grid_kernel(hidden_ptr, grid_thw_ptr, out_ptr,
+                                 total_patches, C, NUM_GRIDS, HW,
+                                 BLOCK_M: tl.constexpr):
+    """
+    hidden_ptr: *bf16, flattened [total_patches, C]
+    grid_thw_ptr: *int64, shape [NUM_GRIDS, 3], each row is [t, h, w]
+    out_ptr: *bf16, flattened [total_merged_rows, 4*C]
+    We launch one program per grid.
+    """
+    g = tl.program_id(0)
+    if g >= NUM_GRIDS:
+        return
+
+    # Load grid dimensions for this grid
+    t = tl.load(grid_thw_ptr + g * 3 + 0).to(tl.int32)
+    h = tl.load(grid_thw_ptr + g * 3 + 1).to(tl.int32)
+    w = tl.load(grid_thw_ptr + g * 3 + 2).to(tl.int32)
+
+    h_merged = h // 2
+    w_merged = w // 2
+    num_merged_rows = t * h_merged * w_merged
+
+    # For each original patch m in [0, t*h*w):
+    # Decode (t_index, h2, w2), then out_row = t_index * (h_merged * w_merged) + (h2//2) * w_merged + (w2//2)
+    # Copy four 2x2 positions into the four contiguous columns of out: [0*C, 1*C, 2*C, 3*C]
+    m = 0
+    while m < t * h * w:
+        t_index = m // (h * w)
+        rem = m % (h * w)
+        h2 = rem // w
+        w2 = rem % w
+
+        out_row = t_index * (h_merged * w_merged) + (h2 // 2) * w_merged + (w2 // 2)
+        base_out = out_row * (4 * C)
+
+        # idx=0: (r=0,c=0) -> hidden[t_index, h2, w2]
+        src_offset0 = t_index * (h * w) + h2 * w + w2
+        val0 = tl.load(hidden_ptr + src_offset0 * C + 0, mask=(h2 < h) & (w2 < w), other=0.0).to(tl.bfloat16)
+        tl.store(out_ptr + base_out + 0 * C, val0)
+
+        # idx=1: (r=0,c=1) -> hidden[t_index, h2, w2+1]
+        w2p1 = w2 + 1
+        if w2p1 < w:
+            src_offset1 = t_index * (h * w) + h2 * w + w2p1
+            val1 = tl.load(hidden_ptr + src_offset1 * C + 0, mask=(h2 < h) & (w2p1 < w), other=0.0).to(tl.bfloat16)
+            tl.store(out_ptr + base_out + 1 * C, val1)
+
+        # idx=2: (r=1,c=0) -> hidden[t_index, h2+1, w2]
+        h2p1 = h2 + 1
+        if h2p1 < h:
+            src_offset2 = t_index * (h * w) + h2p1 * w + w2
+            val2 = tl.load(hidden_ptr + src_offset2 * C + 0, mask=(h2p1 < h) & (w2 < w), other=0.0).to(tl.bfloat16)
+            tl.store(out_ptr + base_out + 2 * C, val2)
+
+        # idx=3: (r=1,c=1) -> hidden[t_index, h2+1, w2+1]
+        if h2p1 < h and w2p1 < w:
+            src_offset3 = t_index * (h * w) + h2p1 * w + w2p1
+            val3 = tl.load(hidden_ptr + src_offset3 * C + 0, mask=True, other=0.0).to(tl.bfloat16)  # mask not needed, guarded above
+            tl.store(out_ptr + base_out + 3 * C, val3)
+
+        m += BLOCK_M
+
+
+# Triton kernel: Elementwise GELU on a flattened vector [N*C]
+@triton.jit
+def _gelu_kernel(x_ptr, y_ptr, N, C, BLOCK_SIZE: tl.constexpr):
+    """
+    x_ptr: *bf16, shape [N, C], row-major
+    y_ptr: *bf16, shape [N, C]
+    GELU via tanh approximation: 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+    """
+    row = tl.program_id(0)
+    if row >= N:
+        return
+    x_row_ptr = x_ptr + row * C
+    y_row_ptr = y_ptr + row * C
+    col = 0
+    while col < C:
+        offs = col + tl.arange(0, BLOCK_SIZE)
+        mask = offs < C
+        x = tl.load(x_row_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        x3 = x * x * x
+        k = 0.7978845608028654  # sqrt(2/pi)
+        y = 0.5 * x * (1.0 + tl.tanh(k * (x + 0.044715 * x3)))
+        tl.store(y_row_ptr + offs, y.to(tl.bfloat16), mask=mask)
+        col += BLOCK_SIZE
+
+
+# Triton kernel: Row-wise Linear y = x @ W.T + b, one program per output row, iterating over K blocks
+@triton.jit
+def _linear_rowwise_kernel(x_row_ptr, w_ptr, b_ptr, y_row_ptr,
+                            K_in, K_out, BLOCK_K: tl.constexpr):
+    """
+    x_row_ptr: *bf16, shape [1, K_in], i.e., a single row (we pass whole row as linearized)
+    w_ptr: *bf16, shape [K_out, K_in], row-major (K_out rows of length K_in)
+    b_ptr: *bf16, shape [K_out]
+    y_row_ptr: *bf16, shape [1, K_out]
+    """
+    # We process one output row per program. Pass N as 1 and flatten.
+    acc = tl.zeros([K_out], dtype=tl.float32)
+
+    k = 0
+    while k < K_in:
+        offs_k = k + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K_in
+        # Load x[k] as vector
+        x_k = tl.load(x_row_ptr + offs_k, mask=mask_k, other=0.0).to(tl.float32)  # [BLOCK_K]
+        # Update acc[j] += sum(x[k] * W[j, k]) over k block
+        for kk in range(BLOCK_K):
+            k_curr = k + kk
+            mkk = k_curr < K_in
+            xk_val = tl.load(x_row_ptr + k_curr, mask=mkk, other=0.0).to(tl.float32)
+            # Load W[:, k_curr] as vector over j
+            wj = tl.load(w_ptr + k_curr * K_out + tl.arange(0, K_out), mask=(tl.arange(0, K_out) < K_out) & mkk, other=0.0).to(tl.float32)
+            acc += xk_val * wj
+        k += BLOCK_K
+
+    # Add bias
+    j = 0
+    while j < K_out:
+        offs_j = j + tl.arange(0, BLOCK_K)
+        mask_j = offs_j < K_out
+        bj = tl.load(b_ptr + offs_j, mask=mask_j, other=0.0).to(tl.float32)
+        acc += bj
+        j += BLOCK_K
+
+    # Store result y[0, :]
+    j = 0
+    while j < K_out:
+        offs_j = j + tl.arange(0, BLOCK_K)
+        mask_j = offs_j < K_out
+        tl.store(y_row_ptr + offs_j, acc[offs_j].to(tl.bfloat16), mask=mask_j)
+        j += BLOCK_K
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, hidden: torch.Tensor,
+                grid_thw: torch.Tensor,
+                ln_weight: torch.Tensor,
+                ln_bias: torch.Tensor,
+                fc1_weight: torch.Tensor,
+                fc1_bias: torch.Tensor,
+                fc2_weight: torch.Tensor,
+                fc2_bias: torch.Tensor,
+                eps: float):
+        """
+        hidden: [num_patches, hidden_size] bfloat16
+        grid_thw: [num_grids, 3] int64, each row [t, h, w]
+        ln_weight, ln_bias: [hidden_size] bfloat16
+        fc1_weight, fc1_bias: [6144, 6144] and [6144] bfloat16
+        fc2_weight, fc2_bias: [3584, 6144] and [3584] bfloat16
+        """
+        device = hidden.device
+
+        # 1) LayerNorm (per-row), output y1
+        N, C = hidden.shape
+        y1 = torch.empty_like(hidden)
+        # Choose BLOCK_SIZE for reduction; 1024 works well for C=1536
+        BLOCK_SIZE = 1024
+        grid_ln = (N,)
+        _layer_norm_kernel[grid_ln](hidden, y1, ln_weight, ln_bias, N, C, eps, BLOCK_SIZE=BLOCK_SIZE)
+
+        # 2) Spatial shuffle (exact 2x2 merge) -> y2 of shape [total_merged_patches, 4*C]
+        # Compute total_num_merged_patches on host: sum over grids of t*(h//2)*(w//2)
+        NUM_GRIDS = grid_thw.shape[0]
+        HW = C  # hidden_size
+        total_merged = 0
+        # Precompute total merged rows to allocate output
+        for g in range(NUM_GRIDS):
+            t = int(grid_thw[g, 0].item())
+            h = int(grid_thw[g, 1].item())
+            w = int(grid_thw[g, 2].item())
+            total_merged += t * (h // 2) * (w // 2)
+
+        # Allocate output
+        C_expanded = 4 * C  # hidden_size_expanded
+        y2 = torch.empty((total_merged, C_expanded), dtype=torch.bfloat16, device=device)
+
+        # Launch one program per grid, iterate over patches
+        # We need to pass a dummy HW for the kernel signature; it’s not used by the kernel here.
+        # Choose BLOCK_M to cover t*h*w for typical grids; Triton handles dynamic loop internally per grid.
+        BLOCK_M = 1  # per-iteration loop in kernel
+        grid_shuffle = (NUM_GRIDS,)
+        _shuffle_2x2_per_grid_kernel[grid_shuffle](
+            y1, grid_thw, y2, N, C, NUM_GRIDS, HW,
+            BLOCK_M=BLOCK_M
+        )
+
+        # 3) GELU activation
+        N2 = y2.shape[0]
+        y3 = torch.empty_like(y2)
+        BLOCK_GELU = 256
+        grid_gelu = (N2,)
+        _gelu_kernel[grid_gelu](y2, y3, N2, C_expanded, BLOCK_SIZE=BLOCK_GELU)
+
+        # 4) Linear1: y3 @ fc1_weight.T + fc1_bias -> y4 of shape [N2, 6144]
+        # Implement row-wise Triton kernel for each row (one program per row). Since N2 varies by workload,
+        # we process one row at a time by creating a temporary flattened input for each row and launching a grid of size N2.
+        # However, Triton requires we pass tensors; we can loop in Python over rows and launch kernels. Note: This is acceptable
+        # given N2 is moderate for the provided workloads and the strict Triton-only requirement.
+        y4 = torch.empty((N2, fc1_weight.shape[0]), dtype=torch.bfloat16, device=device)
+        K_in1 = y3.shape[1]  # 6144
+        K_out1 = fc1_weight.shape[0]  # 6144
+        # We need to launch _linear_rowwise_kernel N2 times. Create a dummy grid and process rows in a loop.
+        # Triton requires a grid; we set grid=(1,) and run a loop in Python, but Triton kernels don't support loops over dynamic N2.
+        # Therefore, we compute in chunks. For simplicity and correctness, we compute one row per kernel invocation via a Python loop.
+        # While not ideal, it ensures correctness under Triton-only constraints for the given sizes.
+        for i in range(N2):
+            # Load x_row as [K_in1], flatten
+            x_row = y3[i, :].contiguous().view(1, K_in1).to(torch.bfloat16)
+            # Create y_row as 1xK_out1
+            y_row = torch.empty((1, K_out1), dtype=torch.bfloat16, device=device)
+            # Launch kernel for this row
+            # We need to flatten pointers; pass as 1D
+            _linear_rowwise_kernel[(1,)](x_row.view(-1), fc1_weight, fc1_bias, y_row.view(-1),
+                                         K_in1, K_out1, BLOCK_K=256)
+
+            # y_row is [1, K_out1]; assign to y4[i, :]
+            y4[i, :] = y_row[0, :].to(torch.bfloat16)
+
+        # 5) GELU on y4
+        N4 = y4.shape[0]
+        y5 = torch.empty_like(y4)
+        BLOCK_GELU2 = 256
+        grid_gelu2 = (N4,)
+        _gelu_kernel[grid_gelu2](y4, y5, N4, y4.shape[1], BLOCK_SIZE=BLOCK_GELU2)
+
+        # 6) Linear2: y5 @ fc2_weight.T + fc2_bias -> output of shape [N4, 3584]
+        output = torch.empty((N4, fc2_weight.shape[0]), dtype=torch.bfloat16, device=device)
+        K_in2 = y5.shape[1]  # 6144
+        K_out2 = fc2_weight.shape[0]  # 3584
+        for i in range(N4):
+            x_row2 = y5[i, :].contiguous().view(1, K_in2).to(torch.bfloat16)
+            y_row2 = torch.empty((1, K_out2), dtype=torch.bfloat16, device=device)
+            _linear_rowwise_kernel[(1,)](x_row2.view(-1), fc2_weight, fc2_bias, y_row2.view(-1),
+                                         K_in2, K_out2, BLOCK_K=256)
+            output[i, :] = y_row2[0, :].to(torch.bfloat16)
+
+        return output
+
+
+def run(*args):
+    return ModelNew()(*args)

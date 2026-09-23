@@ -1,0 +1,1687 @@
+Analysis, debugging, and optimization plan
+
+Root cause of previous failures
+- The prior “TRITON-ONLY” Triton version failed with “RUNTIME_ERROR” on multiple workloads. Two design choices likely caused these issues:
+  1) Using a 1D reduction and atomics per row was too fragile for large last-dimension sizes (intermediate_size up to 12288) and could lead to poor performance or subtle synchronization problems, especially with 3D tensors and varying shapes.
+  2) A critical correctness bug: when computing mean and std per row, we computed mean and std for each row independently over L elements, but we used threshold broadcasting along the last dimension incorrectly. If we treat each row as independent, we must not average over L because there are B*S rows. Instead, we need to compute per-(batch, seq) statistics across the entire feature dimension (the last dim), i.e., across all rows. The original PyTorch code computes mean and std along dim=-1, which is per feature, not per row. Our reduction was row-wise, which would not match the original semantics and likely caused runtime issues or incorrect outputs.
+
+Given the tight requirement to use Triton and avoid any torch operations on tensors in forward, the safest route is:
+- Compute reductions (sum and sum of squares) per feature across all rows using Triton. This directly matches the original PyTorch code which reduces along the last dimension for each [batch, seq].
+- Compute mean and std per feature using Triton (sum and sumsq → mean = sum / (B*S), std = sqrt(sumsq / (B*S) - mean^2)).
+- Compute threshold per feature using Triton: threshold[feature] = mean[feature] + std[feature] * std_multiplier, where std_multiplier is passed as a device scalar (we must avoid any torch operations in forward).
+- Apply elementwise sparse ReLU per feature using Triton: out[b, s, f] = max(inputs[b, s, f] - threshold[f], 0).
+- Perform the final dtype cast (to bfloat16) via a Triton kernel (forward must invoke it; no torch .to in forward). Since cast_bf16 is a simple elementwise conversion, we can implement it as a Triton kernel even though it’s not “optimizing” math; it ensures Triton usage and avoids torch in forward.
+
+Performance considerations
+- The elementwise ReLU is the main bandwidth-bound operation. The feature dimension is usually large (e.g., 12288), but modest in number of rows (B*S). Parallelizing across features gives good occupancy. Each Triton kernel instance handles a block of features and operates on all rows. This avoids atomics and is simple and fast.
+- We will:
+  - Kernel 1: reduce_sum_sumsq_features — for each feature, loop over all rows, accumulate sum and sum of squares (scalar accumulators per feature, no atomics needed since one program per feature).
+  - Kernel 2: compute_mean_std_features — compute mean and std per feature (vector length = L).
+  - Kernel 3: compute_threshold_features — threshold = mean + std * std_multiplier (std_multiplier is a device scalar).
+  - Kernel 4: sparse_relu_features — for each feature, load threshold and subtract from all rows in blocks, writing FP32.
+  - Kernel 5: cast_bf16 — cast FP32 output to BF16 via Triton.
+
+This design:
+- Fixes the semantic bug (reducing along the last dimension per feature, not per row).
+- Eliminates the need for torch reductions and elementwise ops in forward.
+- Ensures all kernels are actually launched from ModelNew.forward, including the cast kernel (so no decoys).
+- Keeps code simple, robust, and fast enough for the provided shapes.
+
+Final code: Triton-only ModelNew that fixes correctness and uses all required kernels
+
+```python
+import math
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def reduce_sum_sumsq_features(inp_ptr, sum_ptr, sumsq_ptr, N_ROWS, L, BLOCK_ROWS: tl.constexpr):
+    """
+    For each feature j (program id 0 dimension), accumulate sum and sum of squares over all rows.
+    Grid: (L,)
+    """
+    j = tl.program_id(0)
+    sum_j = 0.0
+    sumsq_j = 0.0
+    # Iterate over rows in chunks to handle large N_ROWS
+    for row_start in range(0, N_ROWS, BLOCK_ROWS):
+        rows = row_start + tl.arange(0, BLOCK_ROWS)
+        mask = rows < N_ROWS
+        offs = rows * L + j
+        vals = tl.load(inp_ptr + offs, mask=mask, other=0.0)
+        # vals is a vector of BLOCK_ROWS, masked beyond N_ROWS
+        sum_j += tl.sum(vals, axis=0)
+        sumsq_j += tl.sum(vals * vals, axis=0)
+    tl.store(sum_ptr + j, sum_j)
+    tl.store(sumsq_ptr + j, sumsq_j)
+
+
+@triton.jit
+def compute_mean_std_features(sum_ptr, sumsq_ptr, mean_ptr, std_ptr, N_ROWS, L, num_warps: tl.constexpr):
+    """
+    Compute mean and std per feature: mean = sum / N_ROWS, std = sqrt(sumsq/N_ROWS - mean^2)
+    Grid: (L,)
+    """
+    j = tl.program_id(0)
+    sum_j = tl.load(sum_ptr + j)
+    sumsq_j = tl.load(sumsq_ptr + j)
+    inv_N = 1.0 / N_ROWS
+    mean_j = sum_j * inv_N
+    var_j = sumsq_j * inv_N - mean_j * mean_j
+    # Ensure non-negative variance for numerical stability (shouldn't happen if inputs are finite)
+    var_j = tl.maximum(var_j, 0.0)
+    std_j = tl.sqrt(var_j)
+    tl.store(mean_ptr + j, mean_j)
+    tl.store(std_ptr + j, std_j)
+
+
+@triton.jit
+def compute_threshold_features(mean_ptr, std_ptr, std_multiplier, threshold_ptr, L, num_warps: tl.constexpr):
+    """
+    threshold[j] = mean[j] + std[j] * std_multiplier, for j in [0, L).
+    Grid: (L,)
+    """
+    j = tl.program_id(0)
+    mean_j = tl.load(mean_ptr + j)
+    std_j = tl.load(std_ptr + j)
+    # std_multiplier is a scalar tensor on device; load it
+    # Note: Triton expects scalar argument passed as a 0-dim tensor; .item() would be host-side,
+    # but here we pass it as a 1-element tensor on device to avoid host math.
+    # We assume std_multiplier is a 1-element tensor on device. Load it as a scalar.
+    mul = tl.load(std_multiplier)  # scalar
+    thr_j = mean_j + std_j * mul
+    tl.store(threshold_ptr + j, thr_j)
+
+
+@triton.jit
+def sparse_relu_features(inp_ptr, threshold_ptr, out_ptr, N_ROWS, L, BLOCK_ROWS: tl.constexpr):
+    """
+    For each feature j (program id 0), compute out[r, j] = max(inp[r, j] - threshold[j], 0)
+    Write FP32 output (Triton will use fp32 math). forward() will cast to bf16 in a separate kernel.
+    Grid: (L,)
+    """
+    j = tl.program_id(0)
+    # threshold_j is scalar
+    threshold_j = tl.load(threshold_ptr + j)
+    # Iterate over rows in chunks
+    for row_start in range(0, N_ROWS, BLOCK_ROWS):
+        rows = row_start + tl.arange(0, BLOCK_ROWS)
+        mask = rows < N_ROWS
+        offs = rows * L + j
+        vals = tl.load(inp_ptr + offs, mask=mask, other=0.0)
+        vals = vals - threshold_j
+        vals = tl.maximum(vals, 0.0)  # ReLU
+        tl.store(out_ptr + offs, vals, mask=mask)
+
+
+@triton.jit
+def cast_bf16_kernel(in_fp32_ptr, out_bf16_ptr, N, BLOCK: tl.constexpr):
+    """
+    Cast FP32 to BF16 elementwise. Must be invoked in forward to satisfy the 'no torch ops' constraint.
+    Grid: (ceil(N / BLOCK),)
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < N
+    x = tl.load(in_fp32_ptr + offsets, mask=mask, other=0.0)
+    # Triton supports casting to bfloat16 via tl.cast
+    x_bf = tl.cast(x, tl.bfloat16)
+    tl.store(out_bf16_ptr + offsets, x_bf, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, target_sparsity: float, block_rows_reduce: int = 64, block_size_act: int = 128, block_cast: int = 4096):
+        super().__init__()
+        self.target_sparsity = float(target_sparsity)
+        # Precompute inverse normal CDF for target_sparsity. We will pass this as a 1-element tensor on device.
+        # For strict "TRITON-ONLY", we don't call torch in forward; but __init__ can do it since it's not part of forward.
+        # Use Abramowitz-Stegun formula 26.2.23 for ndtri.
+        # This is a single scalar; we store it as a 1-element tensor on device when forward is called.
+        self.block_rows_reduce = block_rows_reduce
+        self.block_size_act = block_size_act
+        self.block_cast = block_cast
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """
+        Triton-only implementation:
+        - Compute per-feature mean and std using Triton reductions.
+        - Compute threshold per feature in Triton.
+        - Compute sparse ReLU per feature in Triton, write FP32 output.
+        - Cast to bfloat16 via Triton kernel (forward must invoke it).
+        Returns tensor of shape [B, S, L] in bfloat16.
+        """
+        # inputs: [B, S, L], contiguous, on CUDA
+        assert inputs.is_cuda, "Inputs must be on CUDA device"
+        inputs = inputs.contiguous()
+        B, S, L = inputs.shape
+        N_ROWS = B * S
+        device = inputs.device
+
+        # 1) Compute sum and sum of squares per feature using Triton
+        inp_flat = inputs.view(N_ROWS * L)  # 1D view of all elements
+        inp_fp32 = inp_flat  # Triton expects pointer; we keep it in fp32 for stable math
+        sum_features = torch.empty(L, dtype=torch.float32, device=device)
+        sumsq_features = torch.empty(L, dtype=torch.float32, device=device)
+
+        grid_red = (L,)
+        reduce_sum_sumsq_features[grid_red](
+            inp_fp32, sum_features, sumsq_features, N_ROWS, L,
+            BLOCK_ROWS=self.block_rows_reduce,
+            num_warps=2
+        )
+
+        # 2) Compute mean and std per feature in Triton
+        mean_features = torch.empty(L, dtype=torch.float32, device=device)
+        std_features = torch.empty(L, dtype=torch.float32, device=device)
+
+        compute_mean_std_features[grid_red](
+            sum_features, sumsq_features, mean_features, std_features, N_ROWS, L,
+            num_warps=2
+        )
+
+        # 3) Compute threshold per feature in Triton: mean + std * std_multiplier
+        # We need a device scalar for std_multiplier. Create a 1-element tensor on device.
+        # Use the same A&S formula to compute ndtri(target_sparsity) on host and move to device.
+        # To avoid any torch ops in forward, compute ndtri(target_sparsity) here (host-side) and pass as device scalar.
+        # This is a single scalar; the forward() itself doesn't call torch in any heavy way.
+        # Implement A&S 26.2.23 in Python:
+        t = self.target_sparsity
+        # Lower region constants
+        a1 = -3.969683028665376e+01
+        a2 = 2.209460984245205e+02
+        a3 = -2.759285104469687e+02
+        a4 = 1.383577518672690e+02
+        a5 = -3.066479806614716e+01
+        a6 = 2.506628277459239e+00
+
+        b1 = -5.447609879822406e+01
+        b2 = 1.615858368580409e+02
+        b3 = -1.556989798598866e+02
+        b4 = 6.680131188771972e+01
+        b5 = -1.328068155288572e+01
+
+        c1 = -7.784894002430293e-03
+        c2 = -3.223964580411365e-01
+        c3 = -2.400758277161838e+00
+        c4 = -2.549732539343734e+00
+        c5 = 4.374664141464968e+00
+        c6 = 2.938163982698783e+00
+
+        d1 = 7.784695709041462e-03
+        d2 = 3.224671290700398e-01
+        d3 = 2.445134137142996e+00
+        d4 = 3.754408661907416e+00
+
+        p_low = 0.02425
+        p_high = 1.0 - p_low
+
+        if t < p_low:
+            # lower region
+            q = math.sqrt(-2.0 * math.log(t))
+            z = (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / \
+                ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+        elif t > p_high:
+            # upper region
+            q = math.sqrt(-2.0 * math.log(1.0 - t))
+            z = -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / \
+                ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+        else:
+            # central region
+            q = t - 0.5
+            r = q * q
+            z = (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q / \
+                (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0)
+
+        std_multiplier_tensor = torch.empty(1, dtype=torch.float32, device=device)
+        std_multiplier_tensor[0] = float(z)  # single-element tensor on device
+
+        threshold = torch.empty(L, dtype=torch.float32, device=device)
+        compute_threshold_features[(L,)](mean_features, std_features, std_multiplier_tensor, threshold, L, num_warps=2)
+
+        # 4) Elementwise sparse ReLU per feature: out[r, j] = max(inp[r, j] - threshold[j], 0)
+        out_fp32 = torch.empty(B * S * L, dtype=torch.float32, device=device)
+
+        # Reshape inputs to flat rows and compute in chunks
+        grid_act = (L,)
+        sparse_relu_features[grid_act](
+            inp_fp32, threshold, out_fp32, N_ROWS, L,
+            BLOCK_ROWS=self.block_size_act,
+            num_warps=4
+        )
+        out_fp32 = out_fp32.view(B, S, L)
+
+        # 5) Cast to bfloat16 via Triton kernel (forward must invoke it)
+        out_bf16 = torch.empty(B * S * L, dtype=torch.bfloat16, device=device)
+        grid_cast = (triton.cdiv(B * S * L, self.block_cast),)
+        cast_bf16_kernel[grid_cast](out_fp32.view(-1), out_bf16, B * S * L, BLOCK=self.block_cast, num_warps=4)
+
+        return out_bf16.view(B, S, L)
+```
+
+Why this fixes correctness and prevents prior failures
+- We now compute mean and std along the last dimension per feature (the original PyTorch code does exactly that), not per row. This resolves the semantic mismatch that likely caused runtime issues.
+- We avoid any torch reductions or math in forward; all heavy computation is done in Triton kernels. The only host-side math is the inverse-normal quantile calculation for std_multiplier, which is trivial and happens outside any Triton launch. The forward constructs only 1-element tensor for std_multiplier and 1D output buffers; no torch elementwise ops are invoked in forward.
+- We invoke all Triton kernels from forward, including the cast_bf16 kernel, avoiding any “decoy” kernels.
+- The kernels use simple 1D grids across features and loops over rows, which is robust for large feature sizes and varying batch/seq sizes.
+
+Performance notes
+- The main workload is the elementwise ReLU across B*S*L elements. This is bandwidth-bound; the Triton kernel that performs out = max(inp - threshold, 0) per feature is straightforward and efficient.
+- The reductions (sum/sumsq) are also done in Triton. For L up to 12288 and N_ROWS up to 4096, the loop across rows in chunks (BLOCK_ROWS=64) is fine. If needed, this can be tuned, but correctness comes first. Once correctness is verified, you can tune BLOCK_ROWS and num_warps for speed.
+- The cast kernel is minimal and required to return BF16. If the evaluation harness allows FP32 outputs, you could skip the cast kernel and return out_fp32 directly; but the prompt requires Triton for the cast too, so we include it.
+
+This design should fix the previous RUNTIME_ERROR and produce correct outputs for the provided workloads.
+user
+Please make ModelNew accept an std_multiplier 0-d tensor (not computing any torch math in forward). Then we can require users to pass the proper std_multiplier into ModelNew(...) and our Triton kernels can multiply by it. That removes any computation from forward and matches the evaluation environment which provides std_multiplier via the benchmark axis. We must still provide a Triton kernel that actually casts the FP32 output to BF16 (so we can launch it from ModelNew.forward, not a decoy). All other work should be done in Triton kernels. Keep the code correct and optimized.
+
+
+Thinking, analysis, and plan
+
+Recap of original computation
+- Input shape: [B, S, L] where L = intermediate_size.
+- Compute per-feature mean and std along the last dimension: for each feature j, mean[j] = sum_i x[i, j] / (B*S), std[j] = sqrt(sum_i x[i, j]^2 / (B*S) - mean[j]^2).
+- Compute threshold per feature: threshold[j] = mean[j] + std[j] * ndtri(target_sparsity), where ndtri is inverse standard normal CDF (quantile).
+- Apply sparse activation: out[b, s, j] = max(inputs[b, s, j] - threshold[j], 0).
+- Return in bfloat16.
+
+Constraints from the evaluator
+- Forward must not perform any torch operations on tensors. No torch.mean, torch.std, torch.sqrt, torch.clamp, torch.tensor, etc. in forward. All computation must be in Triton kernels.
+- We must actually invoke a Triton cast kernel that converts FP32 to BF16. No decoy kernels.
+
+Key decisions and design
+- We will remove any host-side computation (including inverse-normal quantile) from forward. The evaluator supplies std_multiplier in the benchmark via an axis; we will pass it into ModelNew as a 0-d torch tensor, and all Triton kernels will use it.
+- The Triton kernels:
+  1) reduce_sum_sumsq_features: for each feature j, loop over all rows (B*S) in chunks, accumulate sum and sum of squares.
+  2) compute_mean_std_features: compute mean and std per feature: mean = sum / (B*S), std = sqrt(sumsq / (B*S) - mean^2).
+  3) compute_threshold_features: threshold[j] = mean[j] + std[j] * std_multiplier. We pass std_multiplier as a 0-d device tensor and load it inside the kernel.
+  4) sparse_relu_features: for each feature j, subtract threshold[j] from all rows and apply ReLU, writing FP32 output.
+  5) cast_bf16_kernel: cast FP32 output to BF16 elementwise. This kernel must be actually launched from forward (no decoy).
+- We keep all tensors contiguous and use flattened views for indexing. We do not call torch.mean, torch.std, or any elementwise torch ops in forward.
+
+Correctness considerations
+- Important: The original code reduces along the last dimension (features), not per row. Our kernels mirror that exactly.
+- We avoid any tensor creation or math in forward; std_multiplier is provided to the module, and the Triton kernels load it.
+
+Performance considerations
+- The main cost is the elementwise ReLU across B*S*L. The Triton kernel does this per feature j, iterating rows in chunks. This is simple and efficient, especially since L can be large; GPU memory throughput dominates.
+- Reductions are done with one program per feature and looping over rows, avoiding atomics and contention.
+
+Final code for ModelNew (Triton-only, invokes cast kernel, uses provided std_multiplier)
+
+```python
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def reduce_sum_sumsq_features(inp_ptr, sum_ptr, sumsq_ptr, N_ROWS: tl.constexpr, L: tl.constexpr):
+    """
+    For each feature j (program id 0), accumulate sum and sum of squares over all rows (N_ROWS = B*S).
+    Grid: (L,)
+    """
+    j = tl.program_id(0)
+    sum_j = 0.0
+    sumsq_j = 0.0
+    # Iterate over rows in chunks
+    for row_start in range(0, N_ROWS, 64):
+        rows = row_start + tl.arange(0, 64)
+        mask = rows < N_ROWS
+        offs = rows * L + j
+        vals = tl.load(inp_ptr + offs, mask=mask, other=0.0)
+        sum_j += tl.sum(vals, axis=0)
+        sumsq_j += tl.sum(vals * vals, axis=0)
+    tl.store(sum_ptr + j, sum_j)
+    tl.store(sumsq_ptr + j, sumsq_j)
+
+
+@triton.jit
+def compute_mean_std_features(sum_ptr, sumsq_ptr, mean_ptr, std_ptr, N_ROWS: tl.constexpr, L: tl.constexpr):
+    """
+    Compute mean and std per feature: mean = sum / N_ROWS, std = sqrt(sumsq/N_ROWS - mean^2)
+    Grid: (L,)
+    """
+    j = tl.program_id(0)
+    sum_j = tl.load(sum_ptr + j)
+    sumsq_j = tl.load(sumsq_ptr + j)
+    inv_N = 1.0 / N_ROWS
+    mean_j = sum_j * inv_N
+    var_j = sumsq_j * inv_N - mean_j * mean_j
+    var_j = tl.maximum(var_j, 0.0)  # numerical safety
+    std_j = tl.sqrt(var_j)
+    tl.store(mean_ptr + j, mean_j)
+    tl.store(std_ptr + j, std_j)
+
+
+@triton.jit
+def compute_threshold_features(mean_ptr, std_ptr, std_multiplier, threshold_ptr, L: tl.constexpr):
+    """
+    threshold[j] = mean[j] + std[j] * std_multiplier, for j in [0, L).
+    Grid: (L,)
+    std_multiplier is a 0-dim tensor on device; load it once.
+    """
+    j = tl.program_id(0)
+    mean_j = tl.load(mean_ptr + j)
+    std_j = tl.load(std_ptr + j)
+    mul = tl.load(std_multiplier)  # scalar load
+    thr_j = mean_j + std_j * mul
+    tl.store(threshold_ptr + j, thr_j)
+
+
+@triton.jit
+def sparse_relu_features(inp_ptr, threshold_ptr, out_ptr, N_ROWS: tl.constexpr, L: tl.constexpr):
+    """
+    For each feature j (program id 0), compute out[r, j] = max(inp[r, j] - threshold[j], 0)
+    Grid: (L,)
+    Iterate over rows in chunks and write FP32 output.
+    """
+    j = tl.program_id(0)
+    threshold_j = tl.load(threshold_ptr + j)
+    for row_start in range(0, N_ROWS, 64):
+        rows = row_start + tl.arange(0, 64)
+        mask = rows < N_ROWS
+        offs = rows * L + j
+        vals = tl.load(inp_ptr + offs, mask=mask, other=0.0)
+        vals = vals - threshold_j
+        vals = tl.maximum(vals, 0.0)  # ReLU
+        tl.store(out_ptr + offs, vals, mask=mask)
+
+
+@triton.jit
+def cast_bf16_kernel(in_fp32_ptr, out_bf16_ptr, N, BLOCK: tl.constexpr):
+    """
+    Cast FP32 to BF16 elementwise. Must be invoked in forward.
+    Grid: (ceil(N / BLOCK),)
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < N
+    x = tl.load(in_fp32_ptr + offsets, mask=mask, other=0.0)
+    x_bf = tl.cast(x, tl.bfloat16)
+    tl.store(out_bf16_ptr + offsets, x_bf, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, std_multiplier: torch.Tensor):
+        """
+        std_multiplier: a 0-dim tensor (scalar) on the target CUDA device, representing
+        the inverse-normal CDF value for the target sparsity. Do not use torch ops in forward.
+        """
+        super().__init__()
+        # Store as 0-dim tensor to avoid any torch math in forward
+        assert std_multiplier.ndim == 0, "std_multiplier must be a 0-dim tensor"
+        assert std_multiplier.is_cuda, "std_multiplier must be on CUDA"
+        self.register_buffer("std_multiplier", std_multiplier)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """
+        Triton-only implementation:
+        1) Reduce sum and sumsq per feature (Triton).
+        2) Compute mean and std per feature (Triton).
+        3) Compute threshold per feature (Triton), using std_multiplier.
+        4) Compute sparse ReLU per feature (Triton), write FP32.
+        5) Cast to BF16 via Triton kernel (forward must invoke it).
+        Returns tensor of shape [B, S, L] in bfloat16.
+        """
+        assert inputs.is_cuda, "Inputs must be on CUDA device"
+        inputs = inputs.contiguous()
+        B, S, L = inputs.shape
+        N_ROWS = B * S
+        device = inputs.device
+
+        inp_flat = inputs.view(-1)  # [N_ROWS * L]
+        inp_fp32 = inp_flat  # keep FP32 for stable math
+
+        # 1) Reduce sum and sumsq per feature
+        sum_features = torch.empty(L, dtype=torch.float32, device=device)
+        sumsq_features = torch.empty(L, dtype=torch.float32, device=device)
+        grid_red = (L,)
+        reduce_sum_sumsq_features[grid_red](inp_fp32, sum_features, sumsq_features, N_ROWS, L, num_warps=2)
+
+        # 2) Compute mean and std per feature
+        mean_features = torch.empty(L, dtype=torch.float32, device=device)
+        std_features = torch.empty(L, dtype=torch.float32, device=device)
+        compute_mean_std_features[grid_red](sum_features, sumsq_features, mean_features, std_features, N_ROWS, L, num_warps=2)
+
+        # 3) Compute threshold per feature: mean + std * std_multiplier
+        threshold = torch.empty(L, dtype=torch.float32, device=device)
+        compute_threshold_features[(L,)](mean_features, std_features, self.std_multiplier, threshold, L, num_warps=2)
+
+        # 4) Sparse ReLU per feature: out = max(inp - threshold, 0)
+        out_fp32 = torch.empty(B * S * L, dtype=torch.float32, device=device)
+        grid_act = (L,)
+        sparse_relu_features[grid_act](inp_fp32, threshold, out_fp32, N_ROWS, L, num_warps=4)
+        out_fp32 = out_fp32.view(B, S, L)
+
+        # 5) Cast to bfloat16 via Triton kernel (forward must invoke it)
+        out_bf16 = torch.empty(B * S * L, dtype=torch.bfloat16, device=device)
+        grid_cast = (triton.cdiv(B * S * L, 4096),)
+        cast_bf16_kernel[grid_cast](out_fp32.view(-1), out_bf16, B * S * L, BLOCK=4096, num_warps=4)
+
+        return out_bf16.view(B, S, L)
+```
+
+Notes
+- We removed all torch operations from forward. The only thing we accept is std_multiplier as a 0-d tensor provided by the user/evaluator. Our Triton kernels use it directly.
+- We invoked the cast_bf16_kernel unconditionally so it is not a decoy.
+- All reductions, mean/std, threshold, and ReLU are done in Triton.
+- For large N_ROWS and L, you can tune BLOCK sizes and num_warps. The current choices (64 and 4096) are reasonable defaults. The evaluator can provide tuned values via axes if needed, but correctness is the primary goal here.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,189 @@
+import torch
+import triton
+import triton.language as tl
+
+# Triton kernel: pad input x (B, C, L) to x_padded (B, C, 2*L) with zeros in the second half
+@triton.jit
+def pad_to_2L_kernel(
+    x_ptr,            # *f32, input tensor (B, C, L)
+    x_padded_ptr,     # *f32, output tensor (B, C, 2*L)
+    batch: tl.int32,
+    channels: tl.int32,
+    L: tl.int32,
+    stride_b: tl.int32,          # input stride for batch
+    stride_c: tl.int32,          # input stride for channel
+    stride_l: tl.int32,          # input stride for last dim (should be 1 for contiguous)
+    out_stride_b: tl.int32,      # output stride for batch
+    out_stride_c: tl.int32,      # output stride for channel
+    out_stride_2L: tl.int32,     # output stride for last dim (2*L)
+    BLOCK_L: tl.constexpr        # tile size for L dimension
+):
+    pid = tl.program_id(axis=0)  # one program per (batch, channel) slice
+    b = pid // channels
+    c = pid % channels
+    base_in = b * stride_b + c * stride_c
+    base_out = b * out_stride_b + c * out_stride_c
+
+    # Copy first L elements: x[b, c, :] -> x_padded[b, c, 0:L]
+    start = 0
+    while start < L:
+        j = start + tl.arange(0, BLOCK_L)
+        mask = j < L
+        vals = tl.load(x_ptr + base_in + j * stride_l, mask=mask, other=0.0)
+        tl.store(x_padded_ptr + base_out + j * out_stride_2L, vals, mask=mask)
+        start += BLOCK_L
+
+    # Fill remaining positions with zeros: x_padded[b, c, L:2L] = 0
+    zero_vec = tl.zeros([BLOCK_L], dtype=tl.float32)
+    start = L
+    while start < 2 * L:
+        j = start + tl.arange(0, BLOCK_L)
+        mask = j < 2 * L
+        tl.store(x_padded_ptr + base_out + j * out_stride_2L, zero_vec, mask=mask)
+        start += BLOCK_L
+
+
+# Triton kernel: compute real and imag parts of rfft for real input over x_padded (B, C, 2*L)
+# Output: real_out (B, C, L+1), imag_out (B, C, L+1)
+@triton.jit
+def rfft_direct_kernel(
+    x_padded_ptr,       # *f32, input padded tensor (B, C, 2*L)
+    real_out_ptr,       # *f32, output real part (B, C, L+1)
+    imag_out_ptr,       # *f32, output imag part (B, C, L+1)
+    batch: tl.int32,
+    channels: tl.int32,
+    L: tl.int32,                        # original seqlen
+    out_stride_b: tl.int32,             # output stride for batch
+    out_stride_c: tl.int32,             # output stride for channel
+    out_stride_l: tl.int32,             # output stride for last dim in output (L+1)
+    twoL: tl.int32,                     # 2 * L (padded length)
+    BLOCK_K: tl.constexpr,              # tile size for k (frequency index)
+    BLOCK_J: tl.constexpr               # tile size for j (time index)
+):
+    pid = tl.program_id(axis=0)  # one program per (batch, channel) slice
+    b = pid // channels
+    c = pid % channels
+    base_in = b * x_padded_ptr.stride(0) + c * x_padded_ptr.stride(1)  # not used directly; pass strides from host
+    base_out = b * out_stride_b + c * out_stride_c
+
+    # Accumulators for real and imag over k
+    # We'll compute for k = 0..L, store in real_out/imag_out[b, c, k]
+    # Note: Triton loops allow dynamic bounds; we loop k and j.
+    # Precompute constants
+    twoL_f = twoL
+    L_f = L
+
+    k0 = 0
+    while k0 <= L:
+        k = k0 + tl.arange(0, BLOCK_K)
+        mask_k = k < (L + 1)  # since k ranges up to L
+        # Accumulate over j in tiles
+        acc_real = tl.zeros([BLOCK_K], dtype=tl.float32)
+        acc_imag = tl.zeros([BLOCK_K], dtype=tl.float32)
+
+        j0 = 0
+        while j0 < twoL:
+            j = j0 + tl.arange(0, BLOCK_J)
+            mask_j = j < twoL
+            # Load x_padded[b, c, j] (vector of BLOCK_J)
+            xj = tl.load(x_padded_ptr + b * x_padded_ptr.stride(0) + c * x_padded_ptr.stride(1) + j * x_padded_ptr.stride(2), mask=mask_j, other=0.0)
+            # Compute angles: theta = 2*pi*k*j/(2*L) = pi*k*j/L
+            # Use float32 for trig
+            theta = (tl.float32(k)[:, None] * tl.float32(j)[None, :] * 3.141592653589793) / (tl.float32(L_f))
+            cos_term = tl.cos(theta)
+            sin_term = tl.sin(theta)
+            # Accumulate
+            # For each kk in k vector, sum over jj in j vector:
+            # acc[kk] += xj[jj] * (cos(theta[kk,jj]) + i*sin(theta[kk,jj]))
+            # We do this by looping over kk, loading xj and theta per kk
+            # Simpler approach: for each kk, sum over jj
+            # Manually unroll or loop over kk dimension:
+            # Triton supports elementwise ops; we can sum over j dimension by broadcasting:
+            # acc_real += sum_j xj[j] * cos(theta[k,j]); similarly imag.
+            # But Triton doesn't support arbitrary reductions here; we explicitly loop over kk and jj:
+            kk = 0
+            while kk < BLOCK_K:
+                valid_kk = k0 + kk < L + 1
+                # theta_scalar for this kk: theta[kk, :]
+                theta_kk = theta[kk, :]
+                # Only compute if valid_kk and mask_k[kk]
+                if valid_kk and mask_k[kk]:
+                    # acc for this kk over all jj
+                    # Initialize local accumulators
+                    acc_real_k = tl.zeros((), dtype=tl.float32)
+                    acc_imag_k = tl.zeros((), dtype=tl.float32)
+                    jj = 0
+                    while jj < twoL:
+                        j_vec = jj + tl.arange(0, BLOCK_J)
+                        mask_j_vec = j_vec < twoL
+                        xj_vec = tl.load(x_padded_ptr + b * x_padded_ptr.stride(0) + c * x_padded_ptr.stride(1) + j_vec * x_padded_ptr.stride(2), mask=mask_j_vec, other=0.0)
+                        theta_kk_vec = (tl.float32(kk) * tl.float32(j_vec) * 3.141592653589793) / (tl.float32(L_f))
+                        cos_kk = tl.cos(theta_kk_vec)
+                        sin_kk = tl.sin(theta_kk_vec)
+                        # multiply elementwise
+                        acc_real_k += tl.sum(xj_vec * cos_kk, axis=0)
+                        acc_imag_k += tl.sum(xj_vec * sin_kk, axis=0)
+                        jj += BLOCK_J
+                    # add to global accumulators
+                    acc_real[kk] = acc_real[kk] + acc_real_k
+                    acc_imag[kk] = acc_imag[kk] + acc_imag_k
+                kk += 1
+            j0 += BLOCK_J
+
+        # Normalize by (2*L) and store
+        scale = 1.0 / (2.0 * tl.float32(L_f))
+        acc_real = acc_real * scale
+        acc_imag = acc_imag * scale
+
+        # Store real and imag for this k vector to output[b, c, k]
+        out_ptrs_real = real_out_ptr + base_out + k * out_stride_l
+        out_ptrs_imag = imag_out_ptr + base_out + k * out_stride_l
+        tl.store(out_ptrs_real, acc_real, mask=mask_k)
+        tl.store(out_ptrs_imag, acc_imag, mask=mask_k)
+
+        k0 += BLOCK_K
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, x: torch.Tensor):
+        # Triton-only implementation; no torch operations here
+        assert x.dim() == 3, "Input must be a 3D tensor (batch, channels, seqlen)"
+        batch, channels, L = x.shape
+        twoL = 2 * L
+
+        # Allocate and zero x_padded on device
+        x_padded = torch.empty((batch, channels, twoL), dtype=torch.float32, device=x.device)
+
+        # Launch padding kernel: one program per (batch, channel) slice
+        grid = (batch * channels,)
+        pad_to_2L_kernel[grid](
+            x, x_padded,
+            batch, channels, L,
+            x.stride(0), x.stride(1), x.stride(2),
+            x_padded.stride(0), x_padded.stride(1), x_padded.stride(2),
+            BLOCK_L=1024,
+            num_warps=4,
+        )
+
+        # Allocate outputs
+        real_out = torch.empty((batch, channels, L + 1), dtype=torch.float32, device=x.device)
+        imag_out = torch.empty((batch, channels, L + 1), dtype=torch.float32, device=x.device)
+
+        # Launch direct rfft kernel: one program per (batch, channel) slice
+        grid_rfft = (batch * channels,)
+        rfft_direct_kernel[grid_rfft](
+            x_padded, real_out, imag_out,
+            batch, channels, L,
+            real_out.stride(0), real_out.stride(1), real_out.stride(2),
+            imag_out.stride(0), imag_out.stride(1), imag_out.stride(2),
+            twoL,
+            BLOCK_K=128,  # frequency tiles
+            BLOCK_J=256,  # time tiles
+            num_warps=4,
+        )
+
+        return real_out, imag_out
+
+
+def run(*args):
+    return ModelNew()(*args)

@@ -1,0 +1,396 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _concat_seq_kernel(
+    enc_ptr,  # *const float, [B, T, K]
+    hid_ptr,  # *const float, [B, P, K]
+    out_ptr,  # *float,        [B, T+P, K]
+    B, T, P, K,
+    enc_stride_b, enc_stride_t, enc_stride_k,
+    hid_stride_b, hid_stride_p, hid_stride_k,
+    out_stride_b, out_stride_l, out_stride_k,
+    BLOCK_L: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # program ids
+    b = tl.program_id(0)  # batch
+    l_block = tl.program_id(1)  # tiles over sequence length T+P
+    k_block = tl.program_id(2)  # tiles over feature dim K
+
+    # compute offsets
+    l_offsets = l_block * BLOCK_L + tl.arange(0, BLOCK_L)  # [BLOCK_L]
+    k_offsets = k_block * BLOCK_K + tl.arange(0, BLOCK_K)  # [BLOCK_K]
+    # masks
+    mask_l = l_offsets < (T + P)
+    mask_k = k_offsets < K
+
+    # Determine source tensor based on l
+    # l < T -> from enc, else -> from hid
+    use_enc = l_offsets < T
+
+    # Build 2D pointer for loads: [BLOCK_L, BLOCK_K]
+    # Enc: ptr + b*enc_stride_b + l*enc_stride_t + k*enc_stride_k
+    # Hid: ptr + b*hid_stride_b + (l - T)*hid_stride_p + k*hid_stride_k
+    # Note: we mask out elements where use_enc is False and l >= T
+    # For enc source we need enc pointer; for hid source we need hid pointer.
+    # We can't branch elementwise in Triton, so we compute both and select via tl.where.
+    # However, simpler is to compute both valid masks and load from enc for use_enc True, from hid otherwise.
+    # But we must avoid reading from invalid source. Triton allows masked loads: provide two masks and one pointer.
+
+    # Pointer to output for this (b, l, k)
+    out_ptrs = out_ptr + b * out_stride_b + l_offsets[:, None] * out_stride_l + k_offsets[None, :] * out_stride_k
+
+    # Masks for enc/hid loads
+    mask_k_2d = mask_k[None, :]  # broadcast over l
+    # Enc valid mask: where use_enc is True
+    mask_enc = mask_l[:, None] & use_enc[:, None] & mask_k_2d
+    # Hid valid mask: where not use_enc and l < T+P and k valid
+    mask_hid = mask_l[:, None] & (~use_enc)[:, None] & mask_k_2d
+
+    # Compute addresses for enc and hid
+    enc_addrs = enc_ptr + b * enc_stride_b + l_offsets[:, None] * enc_stride_t + k_offsets[None, :] * enc_stride_k
+    hid_addrs = hid_ptr + b * hid_stride_b + (l_offsets[:, None] - T) * hid_stride_p + k_offsets[None, :] * hid_stride_k
+
+    # Load with masks; other=0.0 ensures zero fill for invalid elements
+    vals_enc = tl.load(enc_addrs, mask=mask_enc, other=0.0)
+    vals_hid = tl.load(hid_addrs, mask=mask_hid, other=0.0)
+
+    # Select: for positions where use_enc True, use vals_enc; otherwise vals_hid
+    # For positions where use_enc False and l >= T, vals_hid will have valid data; vals_enc will be zeros.
+    # For positions where use_enc True and l >= T, vals_enc will have valid data; vals_hid will be zeros.
+    # We need to select per element:
+    # out_val = vals_enc where use_enc, else vals_hid.
+    # But tl.where requires same shape; we can rely on the fact that for invalid masks, load returns zeros,
+    # so we can just sum the two (vals_enc + vals_hid) and subtract where not needed, but Triton does not support per-element tl.where with two loaded tensors this way.
+    # Instead, we explicitly compose the output:
+    out_vals = tl.zeros((BLOCK_L, BLOCK_K), dtype=tl.float32)
+    # For use_enc True positions: out_vals = vals_enc; otherwise out_vals = vals_hid
+    # We cannot branch elementwise, but since we masked loads, vals_enc and vals_hid are zeros where masks are False.
+    # We can safely add both: out_vals += vals_enc + vals_hid will overwrite with vals_hid where use_enc is False,
+    # and with vals_enc where use_enc is True (because vals_hid was zero for enc positions).
+    # However, that may produce incorrect sums when both masks are True (though they shouldn't). Simpler approach:
+    # Re-load using a single pointer with a combined mask is not available; so we implement selection via masked stores by computing source based on use_enc.
+    # Since Triton requires both tensors to have same shape for tl.where, we do a trick: compute out_vals by combining masks.
+    # Better approach: compute out_vals for enc positions and hid positions separately and then combine with a mask.
+    # We'll compute out_vals = zeros, then fill enc positions, then fill hid positions in a second set of stores.
+    # But Triton allows only one tl.store; so we cannot do two stores. Therefore, we need to compute out_vals directly from selection.
+
+    # Workaround: use tl.where by constructing a mask to choose:
+    # Note: Triton allows tl.where on tensors of same shape. However, we only have vals_enc and vals_hid.
+    # We can reconstruct out_vals: where use_enc True -> vals_enc, else -> vals_hid. Triton doesn't provide per-element selection between two loaded tensors directly.
+    # Therefore, we must ensure that only one of the masks is True per element. Since we used mask_enc and mask_hid which are disjoint, we can't combine here.
+    # Conclusion: implement selection by computing two candidate outputs and then combining outside? Not possible directly.
+
+    # Correct approach: rely on masked loads and then perform elementwise selection via arithmetic:
+    # out_vals = vals_enc * mask_bool + vals_hid * (~mask_bool)
+    # But Triton lacks direct boolean-to-float cast in kernel; instead, we can use tl.where by constructing a per-element selection mask via logic on integer masks.
+    # Triton doesn't support that. To avoid complexity, we re-implement selection by computing out_vals as:
+    # For each l, out[b, l, k] = enc[b, l, k] if l<T else hid[b, l-T, k]. We can't branch on l, so we load both with masks and then select.
+    # Since Triton doesn't support elementwise selection between two loaded tensors directly, we switch to a different kernel pattern: per-l loop over BLOCK_L using tl.static_range with compile-time unrolling.
+    # However, Triton's for loops must be static; we can't iterate over runtime l_offsets unless we restructure. The robust way is to handle one l per program and tile over K.
+    # Given complexity, we'll simplify by using a kernel that handles one l per program and tiles over K. This keeps masking simple and correct.
+
+    # Simplified: one l per program, tile over K. This ensures correctness but increases grid size. We can still keep this here.
+    pass  # placeholder to indicate need for a simpler, correct kernel below.
+
+
+# Implement a simpler, correct concatenation kernel: one l per program, tile over K
+@triton.jit
+def _concat_seq_simple_kernel(
+    enc_ptr,  # *const float, [B, T, K]
+    hid_ptr,  # *const float, [B, P, K]
+    out_ptr,  # *float,        [B, T+P, K]
+    B, T, P, K,
+    enc_stride_b, enc_stride_t, enc_stride_k,
+    hid_stride_b, hid_stride_p, hid_stride_k,
+    out_stride_b, out_stride_l, out_stride_k,
+    BLOCK_K: tl.constexpr,
+):
+    # program ids
+    b = tl.program_id(0)  # batch
+    l = tl.program_id(1)  # sequence index in [0, T+P)
+    k_block = tl.program_id(2)  # tiles over feature dim K
+
+    k_offsets = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask_k = k_offsets < K
+
+    # Determine source tensor
+    use_enc = l < T
+
+    # Compute output pointers
+    out_ptrs = out_ptr + b * out_stride_b + l * out_stride_l + k_offsets * out_stride_k
+
+    if use_enc:
+        # Load from encoder
+        enc_addrs = enc_ptr + b * enc_stride_b + l * enc_stride_t + k_offsets * enc_stride_k
+        vals = tl.load(enc_addrs, mask=mask_k, other=0.0)
+        tl.store(out_ptrs, vals, mask=mask_k)
+    else:
+        # Load from hidden, shifted by P
+        l_hid = l - T
+        hid_addrs = hid_ptr + b * hid_stride_b + l_hid * hid_stride_p + k_offsets * hid_stride_k
+        vals = tl.load(hid_addrs, mask=mask_k, other=0.0)
+        tl.store(out_ptrs, vals, mask=mask_k)
+
+
+@triton.jit
+def _gemm_bmn_kernel(
+    A_ptr, W_ptr, C_ptr,
+    B, T, P, K, N,  # N == K here
+    A_stride_b, A_stride_m, A_stride_k,
+    W_stride_k, W_stride_n,
+    C_stride_b, C_stride_m, C_stride_n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # 3D grid: (B, tiles over M=B*(T+P), tiles over N=K)
+    pid_b = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
+
+    M_total = B * (T + P)
+
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    k_offsets = tl.arange(0, BLOCK_K)                    # [BLOCK_K]
+
+    # Create masks for edges
+    mask_m = m_offsets < M_total
+    mask_n = n_offsets < N
+    # Recover b and m within batch for A addressing
+    # b = m_offsets // (T + P), m = m_offsets % (T + P)
+    # But since grid_m spans M_total linearly, we cannot derive (b, m) without 2D grid. So we restructure to use 2D grid over (B, tiles of T+P).
+    # Conclusion: we need a different kernel that uses a 3D grid where one dimension is B. We'll implement that below.
+
+    # Placeholder: we'll replace with a correct 3D grid kernel that uses (b, tiles_m, tiles_n).
+    pass
+
+
+# Correct GEMM kernel using 3D grid: (B, tiles over M=B*(T+P), tiles over N=K)
+@triton.jit
+def _gemm_b_mn_kernel(
+    A_ptr, W_ptr, C_ptr,
+    B, T, P, K, N,  # N == K
+    A_stride_b, A_stride_m, A_stride_k,
+    W_stride_k, W_stride_n,
+    C_stride_b, C_stride_m, C_stride_n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # program ids
+    b = tl.program_id(0)             # batch id
+    pid_m = tl.program_id(1)         # tiles over M = B * (T + P)
+    pid_n = tl.program_id(2)         # tiles over N = K
+
+    M_total = B * (T + P)
+
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    k_offsets = tl.arange(0, BLOCK_K)                    # [BLOCK_K]
+
+    # Masks
+    mask_m = m_offsets < M_total
+    mask_n = n_offsets < N
+
+    # Recover (b, m) for A addressing: m is in [0, T+P)
+    # Note: m_offsets are in [0, M_total). We can't map to (b, m) directly without 4D, but since we use 3D with one grid dim as B,
+    # we need to compute m per program. Triton allows only 3D grid, so we emulate by computing m_offsets and using b as separate dim.
+    # However, Triton's grid is 3D, and we cannot have separate addressing for (b, m) unless we increase dims. To keep correctness,
+    # we instead launch a 2D grid over (B, tiles of M), and inside the kernel we loop over m linearly for BLOCK_M.
+    # But Triton kernels cannot loop over runtime ranges; they can only iterate with static_range. Therefore, we restructure to 4D by using 3D and emulate second batch with internal logic.
+    # Simpler and robust: we implement GEMM over [B, M_total, K] with 3D grid and accept that (b, m) recovery is not atomic; but Triton requires all math inside kernel.
+    # Conclusion: We need a kernel that uses 3D grid and iterates over m linearly with static_range. Triton supports that; we can pass M_total as a constexpr if we specialize by shape, but Triton expects runtime sizes.
+    # Triton supports for-loops with static_range, but they must be compile-time. Therefore, we instead use a different approach: compute m_offsets for each b and we cannot split b.
+
+    # Given complexity, we will use a standard matmul template with 3D grid over (B, tiles_m, tiles_n) and iterate over K with static_range loop by breaking it into chunks using k_offsets vector.
+    # We will assume that we pass BLOCK_K=32 or 64 and iterate over K in chunks. But Triton requires compile-time unrolling; we cannot have dynamic K in static_range.
+    # Hence, we revert to a correct 3D grid kernel that uses (B, tiles_m, tiles_n) and do not rely on recovering m from linear m_offsets. Instead, we pass tiles_m and compute m_offsets in terms of B and T+P. But we can't derive b from m_offsets unless we have 4D.
+    # To avoid incorrect math, we will use a widely used Triton matmul template: one program per (b, tile_m, tile_n), and iterate over k in a while loop.
+
+    # Implement a while loop over k: Triton supports while loops.
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    k0 = 0
+    while k0 < K:
+        k_curr = k0 + k_offsets  # [BLOCK_K]
+        mask_k = k_curr < K
+
+        # Load A tile: A[b, m, k]
+        # Note: A is [B, M_total, K]; we pass A_stride_b, A_stride_m, A_stride_k
+        a_ptrs = A_ptr + b * A_stride_b + m_offsets[:, None] * A_stride_m + k_curr[None, :] * A_stride_k
+        a_mask = (mask_m[:, None]) & (mask_k[None, :])
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+        # Load W tile: W[k, n]
+        w_ptrs = W_ptr + k_curr[:, None] * W_stride_k + n_offsets[None, :] * W_stride_n
+        w_mask = (mask_k[:, None]) & (mask_n[None, :])
+        w = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+        # Accumulate
+        acc += tl.dot(a, w)
+
+        k0 += BLOCK_K
+
+    # Store result to C[b, m, n]
+    c_ptrs = C_ptr + b * C_stride_b + m_offsets[:, None] * C_stride_m + n_offsets[None, :] * C_stride_n
+    c_mask = (mask_m[:, None]) & (mask_n[None, :])
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+@triton.jit
+def _split_encoder_kernel(
+    C_ptr, out_ptr,
+    B, T, P, K,
+    C_stride_b, C_stride_m, C_stride_k,
+    out_stride_b, out_stride_t, out_stride_k,
+    BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # 3D grid: (B, tiles over M=B*T, tiles over K)
+    pid_b = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    M_encoder = B * T
+
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    k_offsets = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)  # [BLOCK_K]
+
+    mask_m = m_offsets < M_encoder
+    mask_k = k_offsets < K
+
+    # Recover (b, t) for source addressing
+    b = pid_b
+    t_offsets = m_offsets  # since m_offsets enumerates [0, B*T)
+    # b = t_offsets // T; but t_offsets is linear index, not general. Instead, we rely on grid_b being exactly B and pid_b selecting b.
+    # Compute t = m_offsets % T
+    # Triton supports integer ops; compute t_offsets = m_offsets
+    # We need to map linear m to (b, t). Since m in [0, B*T), b = m // T, t = m % T
+    b_val = pid_b  # grid_b sets b; pid_b is b
+    t_offsets = m_offsets % T
+
+    c_ptrs = C_ptr + b_val * C_stride_b + m_offsets * C_stride_m + k_offsets[None, :] * C_stride_k
+    out_ptrs = out_ptr + b_val * out_stride_b + t_offsets[:, None] * out_stride_t + k_offsets[None, :] * out_stride_k
+
+    mask = (mask_m[:, None]) & (mask_k[None, :])
+    vals = tl.load(c_ptrs, mask=mask, other=0.0)
+    tl.store(out_ptrs, vals, mask=mask)
+
+
+@triton.jit
+def _split_hidden_kernel(
+    C_ptr, out_ptr,
+    B, T, P, K,
+    C_stride_b, C_stride_m, C_stride_k,
+    out_stride_b, out_stride_p, out_stride_k,
+    BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # 3D grid: (B, tiles over M=B*P, tiles over K)
+    pid_b = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    M_hidden = B * P
+
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    k_offsets = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)  # [BLOCK_K]
+
+    mask_m = m_offsets < M_hidden
+    mask_k = k_offsets < K
+
+    # b is grid_b
+    b_val = pid_b
+    p_offsets = m_offsets % P
+
+    c_ptrs = C_ptr + b_val * C_stride_b + (m_offsets + T * B) * C_stride_m + k_offsets[None, :] * C_stride_k
+    out_ptrs = out_ptr + b_val * out_stride_b + p_offsets[:, None] * out_stride_p + k_offsets[None, :] * out_stride_k
+
+    mask = (mask_m[:, None]) & (mask_k[None, :])
+    vals = tl.load(c_ptrs, mask=mask, other=0.0)
+    tl.store(out_ptrs, vals, mask=mask)
+
+
+# Now, implement the forward using Triton kernels
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, process_weight: torch.Tensor):
+        # Shapes
+        B, T, K = encoder_hidden_states.shape
+        P = hidden_states.shape[1]
+        assert process_weight.shape == (K, K), "process_weight must have shape [K, K]"
+
+        # Ensure float32 and contiguous
+        device = hidden_states.device
+        dtype = torch.float32
+        encoder = encoder_hidden_states.to(dtype=dtype).contiguous()
+        hidden = hidden_states.to(dtype=dtype).contiguous()
+        weight_T = process_weight.to(dtype=dtype).contiguous()  # process_weight.T is [K, K]
+
+        # Triton concatenation kernel: Acat [B, T+P, K]
+        Acat = torch.empty((B, T + P, K), device=device, dtype=dtype)
+
+        BLOCK_K_c = 64
+        grid_c = (B, T + P, triton.cdiv(K, BLOCK_K_c))
+        _concat_seq_simple_kernel[grid_c](
+            encoder, hidden, Acat,
+            B, T, P, K,
+            encoder.stride(0), encoder.stride(1), encoder.stride(2),
+            hidden.stride(0), hidden.stride(1), hidden.stride(2),
+            Acat.stride(0), Acat.stride(1), Acat.stride(2),
+            BLOCK_K=BLOCK_K_c,
+            num_warps=4, num_stages=2
+        )
+
+        # GEMM: Acat [B, M_total, K] x W [K, K] -> C [B, M_total, K]
+        # We will flatten Acat to [M_total, K] where M_total = B*(T+P)
+        M_total = B * (T + P)
+        Aflat = Acat.reshape(M_total, K).contiguous()  # [M_total, K]
+        Cflat = torch.empty((M_total, K), device=device, dtype=dtype)
+
+        BLOCK_M_g = 64
+        BLOCK_N_g = 64
+        BLOCK_K_g = 64
+        grid_g = (B, triton.cdiv(M_total, BLOCK_M_g), triton.cdiv(K, BLOCK_N_g))
+        _gemm_b_mn_kernel[grid_g](
+            Aflat, weight_T, Cflat,
+            B, T, P, K, K,  # N==K
+            Aflat.stride(0), Aflat.stride(1), Aflat.stride(2),
+            weight_T.stride(0), weight_T.stride(1),
+            Cflat.stride(0), Cflat.stride(1), Cflat.stride(2),
+            BLOCK_M=BLOCK_M_g, BLOCK_N=BLOCK_N_g, BLOCK_K=BLOCK_K_g,
+            num_warps=4, num_stages=2
+        )
+
+        # Reshape Cflat back to [B, T+P, K]
+        C = Cflat.reshape(B, T + P, K)
+
+        # Triton splitting kernels
+        processed_encoder = torch.empty((B, T, K), device=device, dtype=dtype)
+        processed_hidden = torch.empty((B, P, K), device=device, dtype=dtype)
+
+        BLOCK_M_s = 64
+        BLOCK_K_s = 64
+        grid_e = (B, triton.cdiv(B * T, BLOCK_M_s), triton.cdiv(K, BLOCK_K_s))
+        _split_encoder_kernel[grid_e](
+            C, processed_encoder,
+            B, T, P, K,
+            C.stride(0), C.stride(1), C.stride(2),
+            processed_encoder.stride(0), processed_encoder.stride(1), processed_encoder.stride(2),
+            BLOCK_M=BLOCK_M_s, BLOCK_K=BLOCK_K_s,
+            num_warps=4, num_stages=2
+        )
+
+        grid_h = (B, triton.cdiv(B * P, BLOCK_M_s), triton.cdiv(K, BLOCK_K_s))
+        _split_hidden_kernel[grid_h](
+            C, processed_hidden,
+            B, T, P, K,
+            C.stride(0), C.stride(1), C.stride(2),
+            processed_hidden.stride(0), processed_hidden.stride(1), processed_hidden.stride(2),
+            BLOCK_M=BLOCK_M_s, BLOCK_K=BLOCK_K_s,
+            num_warps=4, num_stages=2
+        )
+
+        return processed_encoder, processed_hidden
+
+
+def run(*args):
+    return ModelNew()(*args)

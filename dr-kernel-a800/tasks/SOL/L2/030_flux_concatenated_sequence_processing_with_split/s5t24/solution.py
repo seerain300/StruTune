@@ -1,0 +1,171 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def concat_seq_kernel(
+    encoder_ptr,      # *f32, [B, Stext, H]
+    hidden_ptr,       # *f32, [B, Simg, H]
+    out_ptr,          # *f32, [B, T, H], T = Stext + Simg
+    B: tl.constexpr,
+    Stext: tl.constexpr,
+    Simg: tl.constexpr,
+    H: tl.constexpr,
+    stride_e_b: tl.constexpr, stride_e_t: tl.constexpr, stride_e_h: tl.constexpr,
+    stride_h_b: tl.constexpr, stride_h_t: tl.constexpr, stride_h_h: tl.constexpr,
+    stride_o_b: tl.constexpr, stride_o_t: tl.constexpr, stride_o_h: tl.constexpr,
+):
+    # Each program handles one (b, t). Write the hidden vector to out[b, t, :] at appropriate offset.
+    b = tl.program_id(0)
+    t = tl.program_id(1)
+    if (b >= B) or (t >= (Stext + Simg)):
+        return
+
+    # Determine source: first Stext rows from encoder, remaining from hidden
+    if t < Stext:
+        src_t = t
+        e = encoder_ptr + b * stride_e_b + src_t * stride_e_t
+        o = out_ptr + b * stride_o_b + t * stride_o_t
+        for i in range(0, H):
+            val = tl.load(e + i * stride_e_h)
+            tl.store(o + i * stride_o_h, val)
+    else:
+        src_t = t - Stext
+        h = hidden_ptr + b * stride_h_b + src_t * stride_h_t
+        o = out_ptr + b * stride_o_b + t * stride_o_t
+        for i in range(0, H):
+            val = tl.load(h + i * stride_h_h)
+            tl.store(o + i * stride_o_h, val)
+
+
+@triton.jit
+def batched_gemv_tiled_kernel(
+    in_cat_ptr,       # *f32, [B, T, H_in] (concatenated)
+    weightT_ptr,      # *f32, [H_in, H_out] (process_weight.T)
+    out_ptr,          # *f32, [B, T, H_out]
+    B: tl.constexpr,
+    T: tl.constexpr,
+    H_in: tl.constexpr,
+    H_out: tl.constexpr,
+    stride_ic_b: tl.constexpr, stride_ic_t: tl.constexpr, stride_ic_h: tl.constexpr,
+    stride_wk: tl.constexpr, stride_wn: tl.constexpr,  # weight_T strides: dim-0 is k, dim-1 is n
+    stride_o_b: tl.constexpr, stride_o_t: tl.constexpr, stride_o_h: tl.constexpr,
+    BLOCK_N: tl.constexpr,   # tile along output hidden dimension
+    BLOCK_K: tl.constexpr,   # tile along input hidden dimension
+):
+    # Each program computes a tile of outputs for a single (b, t).
+    b = tl.program_id(0)
+    t = tl.program_id(1)
+    n_block = tl.program_id(2)
+    if (b >= B) or (t >= T):
+        return
+
+    n_start = n_block * BLOCK_N
+    n_offsets = n_start + tl.arange(0, BLOCK_N)
+    mask_n = n_offsets < H_out
+
+    # Accumulator for this (b, t) over BLOCK_N outputs
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+
+    # Loop over input hidden dimension in chunks
+    k0 = 0
+    while k0 < H_in:
+        k_offsets = k0 + tl.arange(0, BLOCK_K)
+        mask_k = k_offsets < H_in
+
+        # Load input vector chunk: in_cat[b, t, k_offsets] -> shape [BLOCK_K]
+        in_ptrs = in_cat_ptr + b * stride_ic_b + t * stride_ic_t + k_offsets * stride_ic_h
+        in_chunk = tl.load(in_ptrs, mask=mask_k, other=0.0)  # [BLOCK_K]
+
+        # Load corresponding weight block: weightT[k_offsets, n_offsets] -> shape [BLOCK_K, BLOCK_N]
+        w_ptrs = weightT_ptr + k_offsets[:, None] * stride_wk + n_offsets[None, :] * stride_wn
+        mask_block = mask_k[:, None] & mask_n[None, :]
+        w_block = tl.load(w_ptrs, mask=mask_block, other=0.0)  # [BLOCK_K, BLOCK_N]
+
+        # Accumulate: acc += sum_k in_chunk[k] * w_block[k, :]
+        # Equivalent to matmul of [1, BLOCK_K] x [BLOCK_K, BLOCK_N] -> [1, BLOCK_N]
+        acc += tl.sum(w_block * in_chunk[:, None], axis=0)
+
+        k0 += BLOCK_K
+
+    # Store the accumulated results to out[b, t, n_offsets]
+    out_ptrs = out_ptr + b * stride_o_b + t * stride_o_t + n_offsets * stride_o_h
+    tl.store(out_ptrs, acc, mask=mask_n)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        process_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Triton-only implementation of:
+          concatenated = cat([encoder_hidden_states, hidden_states], dim=1)
+          processed = concatenated @ process_weight.T
+          processed_encoder = processed[:, :text_seq_len, :]
+          processed_hidden = processed[:, text_seq_len:, :]
+        """
+        assert hidden_states.is_cuda and encoder_hidden_states.is_cuda and process_weight.is_cuda, \
+            "All tensors must be CUDA tensors."
+        assert hidden_states.dtype == torch.float32 and encoder_hidden_states.dtype == torch.float32 and \
+            process_weight.dtype == torch.float32, "Use float32 tensors."
+        hidden_states = hidden_states.contiguous()
+        encoder_hidden_states = encoder_hidden_states.contiguous()
+        process_weight = process_weight.contiguous()
+
+        B = hidden_states.shape[0]
+        Stext = encoder_hidden_states.shape[1]
+        Simg = hidden_states.shape[1]
+        T = Stext + Simg
+        H = hidden_states.shape[2]
+
+        # 1) Triton concatenation along the sequence dimension: out_cat [B, T, H]
+        out_cat = torch.empty((B, T, H), dtype=torch.float32, device=hidden_states.device)
+        grid_concat = (B, T)
+        concat_seq_kernel[grid_concat](
+            encoder_hidden_states, hidden_states, out_cat,
+            B, Stext, Simg, H,
+            encoder_hidden_states.stride(0), encoder_hidden_states.stride(1), encoder_hidden_states.stride(2),
+            hidden_states.stride(0), hidden_states.stride(1), hidden_states.stride(2),
+            out_cat.stride(0), out_cat.stride(1), out_cat.stride(2),
+            num_warps=1, num_stages=1,
+        )
+
+        # 2) Triton batched GEMV: out_cat [B, T, H_in] @ process_weight.T [H_in, H_out] -> out [B, T, H_out]
+        H_in = H
+        H_out = H
+        out = torch.empty((B, T, H_out), dtype=torch.float32, device=hidden_states.device)
+
+        weight_T = process_weight.transpose(0, 1).contiguous()  # [H_in, H_out]
+
+        # 3D grid: (B, T, blocks along output dimension)
+        # Choose conservative block sizes to reduce risk of errors while being performant.
+        BLOCK_N = 128
+        BLOCK_K = 64
+
+        def grid(meta):
+            blocks_n = triton.cdiv(H_out, meta['BLOCK_N'])
+            return (B, T, blocks_n)
+
+        batched_gemv_tiled_kernel[grid](
+            out_cat, weight_T, out,
+            B, T, H_in, H_out,
+            out_cat.stride(0), out_cat.stride(1), out_cat.stride(2),
+            weight_T.stride(0), weight_T.stride(1),
+            out.stride(0), out.stride(1), out.stride(2),
+            BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            num_warps=4, num_stages=2,
+        )
+
+        # 3) Split back into encoder and image streams
+        processed_encoder = out[:, :Stext, :]
+        processed_hidden = out[:, Stext:, :]
+
+        return processed_encoder, processed_hidden
+
+
+def run(*args):
+    return ModelNew()(*args)

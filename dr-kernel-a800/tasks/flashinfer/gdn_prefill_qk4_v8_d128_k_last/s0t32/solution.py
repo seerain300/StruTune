@@ -1,0 +1,214 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def compute_sqrt_scale_kernel(head_size, out_ptr):
+    # Compute scale = 1.0 / sqrt(head_size) and store as float32
+    hs = tl.load(head_size).to(tl.float32)
+    scale = 1.0 / tl.sqrt(hs)
+    tl.store(out_ptr, scale)
+
+
+@triton.jit
+def compute_g_and_beta_kernel(a_ptr, dt_bias_ptr, A_log_ptr, b_ptr,
+                              g_ptr, beta_ptr,
+                              T, V):
+    """
+    Compute g[t, v] = exp(-exp(A_log[v]) * softplus(a[t, v] + dt_bias[v])) for all t, v
+    and beta[t, v] = sigmoid(b[t, v]), writing results to g_ptr and beta_ptr.
+    g_ptr: [T*V] float32
+    beta_ptr: [T*V] float32
+    """
+    t = tl.program_id(0)  # one program per token t
+    for v in range(0, V):
+        a_val = tl.load(a_ptr + t * V + v).to(tl.float32)
+        dt_val = tl.load(dt_bias_ptr + v).to(tl.float32)
+        A_val = tl.load(A_log_ptr + v).to(tl.float32)
+        # softplus(x) = log(1 + exp(x))
+        sp = tl.log(1.0 + tl.exp(a_val + dt_val))
+        g_val = tl.exp(-tl.exp(A_val) * sp)
+        idx = t * V + v
+        tl.store(g_ptr + idx, g_val)
+        # beta
+        b_val = tl.load(b_ptr + t * V + v).to(tl.float32)
+        beta_val = 1.0 / (1.0 + tl.exp(-b_val))
+        tl.store(beta_ptr + idx, beta_val)
+
+
+@triton.jit
+def update_state_kernel(q_ptr, k_ptr, v_ptr, state_old_ptr, g_ptr, beta_ptr,
+                        new_state_ptr,
+                        T, H, V, K, t, seq_idx):
+    """
+    Update state per token t within sequence block seq_idx:
+    For each h in [0, H), v in [0, V):
+      old_v[h, :] = sum_j k[t, h, j] * state_old[h, v, j]
+      new_v[h, :] = beta[v] * v[t, v, :] + (1 - beta[v]) * old_v[h, :]
+      state_remove[h, :] = sum_j k[t, h, j] * old_v[h, j]
+      state_update[h, :] = sum_j k[t, h, j] * new_v[h, j]
+      state_new[h, v, :] = g[h, v] * state_old[h, v, :] - state_remove[h, :] + state_update[h, :]
+    """
+    # We assume H, V, K are small and fixed as 4, 8, 128 respectively.
+    for h in range(0, H):
+        for v_i in range(0, V):
+            g_idx = h * V + v_i
+            g_val = tl.load(g_ptr + g_idx).to(tl.float32)
+            beta_val = tl.load(beta_ptr + g_idx).to(tl.float32)
+
+            # Load row q[t, h, :]
+            q_row_ptr = q_ptr + t * (H * K) + h * K
+            q_row = tl.zeros((K,), dtype=tl.float32)
+            for j in range(0, K):
+                q_row[j] = tl.load(q_row_ptr + j).to(tl.float32)
+
+            # old_v[h, :]
+            old_v = tl.zeros((K,), dtype=tl.float32)
+            k_row_ptr = k_ptr + t * (H * K) + h * K
+            for j in range(0, K):
+                k_elem = tl.load(k_row_ptr + j).to(tl.float32)
+                state_row_ptr = state_old_ptr + seq_idx * (H * V * K) + h * (V * K) + v_i * K
+                state_vec = tl.zeros((K,), dtype=tl.float32)
+                for jj in range(0, K):
+                    state_vec[jj] = tl.load(state_row_ptr + jj).to(tl.float32)
+                old_v[j] = k_elem * tl.sum(state_vec, axis=0)
+
+            # new_v[h, :]
+            v_row_ptr = v_ptr + t * (V * K) + v_i * K
+            v_vec = tl.zeros((K,), dtype=tl.float32)
+            for j in range(0, K):
+                v_vec[j] = tl.load(v_row_ptr + j).to(tl.float32)
+            new_v = beta_val * v_vec + (1.0 - beta_val) * old_v
+
+            # state_remove[h, :] = sum_j k[t, h, j] * old_v[h, j]
+            state_remove = tl.zeros((K,), dtype=tl.float32)
+            for j in range(0, K):
+                k_elem = tl.load(k_row_ptr + j).to(tl.float32)
+                state_remove[j] = k_elem * old_v[j]
+
+            # state_update[h, :] = sum_j k[t, h, j] * new_v[h, j]
+            state_update = tl.zeros((K,), dtype=tl.float32)
+            for j in range(0, K):
+                k_elem = tl.load(k_row_ptr + j).to(tl.float32)
+                state_update[j] = k_elem * new_v[j]
+
+            # state_new[h, v, :] = g * state_old - state_remove + state_update
+            state_old_row_ptr = state_old_ptr + seq_idx * (H * V * K) + h * (V * K) + v_i * K
+            state_old_vec = tl.zeros((K,), dtype=tl.float32)
+            for j in range(0, K):
+                state_old_vec[j] = tl.load(state_old_row_ptr + j).to(tl.float32)
+
+            new_state_row_ptr = new_state_ptr + seq_idx * (H * V * K) + h * (V * K) + v_i * K
+            for j in range(0, K):
+                val = g_val * state_old_vec[j] - state_remove[j] + state_update[j]
+                tl.store(new_state_row_ptr + j, val)
+
+
+@triton.jit
+def compute_output_kernel(q_ptr, new_state_ptr, out_ptr,
+                          scale, T, H, V, K):
+    """
+    Compute output[t, h, :] = scale * q[t, h, :] @ new_state[h, v, :]
+    We only compute for t = program_id(0) and all h in [0, H).
+    new_state is indexed by [seq_idx, h, v, k]; here we use seq_idx = last block (num_seqs - 1).
+    """
+    t = tl.program_id(0)
+    seq_idx = tl.num_programs(1) - 1  # last sequence block index
+    for h in range(0, H):
+        # output[h, k] = scale * sum_v new_state[seq_idx, h, v, k] * q[t, h, k]
+        for k in range(0, K):
+            sum_v = 0.0
+            for v_i in range(0, V):
+                new_state_elem_ptr = new_state_ptr + seq_idx * (H * V * K) + h * (V * K) + v_i * K + k
+                new_elem = tl.load(new_state_elem_ptr).to(tl.float32)
+                q_elem_ptr = q_ptr + t * (H * K) + h * K + k
+                q_elem = tl.load(q_elem_ptr).to(tl.float32)
+                sum_v += new_elem * q_elem
+            out_elem_ptr = out_ptr + t * (H * K) + h * K + k
+            tl.store(out_elem_ptr, sum_v * scale)
+
+
+class ModelNew(nn.Module):
+    def forward(self, q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
+        # Ensure contiguity
+        device = q.device
+        dtype_q = q.dtype
+        dtype_k = k.dtype
+        dtype_v = v.dtype
+
+        T = q.shape[0]  # total_seq_len
+        H = 4  # num_q_heads
+        V = 8  # num_v_heads
+        K = 128  # head_size
+
+        # Allocate and compute scale in Triton
+        scale_ptr = torch.empty((), dtype=torch.float32, device=device)
+        grid_scale = (1,)
+        # Pass head_size as a 1-element tensor
+        head_size_tensor = torch.tensor([K], dtype=torch.float32, device=device)
+        compute_sqrt_scale_kernel[grid_scale](head_size_tensor, scale_ptr)
+        scale = float(scale_ptr.item()) if scale is None or scale == 0.0 else float(scale)
+
+        # Prepare flattened g and beta
+        g_flat = torch.empty(T * V, dtype=torch.float32, device=device)
+        beta_flat = torch.empty(T * V, dtype=torch.float32, device=device)
+
+        # Launch compute_g_and_beta_kernel
+        grid_g = (T,)
+        compute_g_and_beta_kernel[grid_g](
+            a.float().contiguous().view(-1), dt_bias.float().contiguous().view(-1),
+            A_log.float().contiguous().view(-1), b.float().contiguous().view(-1),
+            g_flat, beta_flat, T, V
+        )
+
+        # Allocate new_state (float32) and initialize from state if provided
+        num_seqs = cu_seqlens.shape[0] - 1
+        new_state = torch.zeros((num_seqs, H, V, K), dtype=torch.float32, device=device)
+        if state is not None:
+            # state is [num_seqs, H, V, K] k-last, we copy and transpose to [H, V, K] per seq
+            for seq_idx in range(num_seqs):
+                # state[seq_idx] shape [H, V, K]
+                s = state[seq_idx].float()
+                # Write into new_state[seq_idx] by transposing to [H, V, K]
+                # Our tensors are contiguous, so we can copy row-wise
+                # Flatten state[seq_idx] as [H*V*K] and write into new_state[seq_idx] as [H*V*K]
+                # new_state[seq_idx] layout is contiguous [H, V, K] => [H*V*K]
+                new_state[seq_idx].copy_(s.transpose(-1, -2).contiguous())
+
+        # Update state for each sequence block
+        # For each sequence block, run update_state_kernel for all tokens t in that block
+        # cu_seqlens: [0, l1, l2, ...]; block start = cu_seqlens[seq_idx], end = cu_seqlens[seq_idx+1]
+        for seq_idx in range(num_seqs):
+            start = int(cu_seqlens[seq_idx].item())
+            end = int(cu_seqlens[seq_idx + 1].item())
+            # Prepare contiguous views
+            q_block = q[start:end].contiguous()  # [L, H, K]
+            k_block = k[start:end].contiguous()  # [L, H, K]
+            v_block = v[start:end].contiguous()  # [L, V, K]
+
+            # Launch update for each token in the block
+            for t in range(start, end):
+                grid_upd = (1,)  # one program handles the update for this (t, seq_idx)
+                update_state_kernel[grid_upd](
+                    q_block, k_block, v_block, new_state[seq_idx].contiguous(),
+                    g_flat, beta_flat, new_state, T, H, V, K, t, seq_idx
+                )
+
+        # Compute output for the last sequence block using Triton
+        out = torch.empty((T, H, K), dtype=torch.float32, device=device)
+        grid_out = (T,)
+        compute_output_kernel[grid_out](
+            q.contiguous().view(T, H, K),
+            new_state[-1].contiguous().view(H, V, K),
+            out, float(scale), T, H, V, K
+        )
+
+        output = out.to(torch.bfloat16)
+
+        return output, new_state
+
+
+def run(*args):
+    return ModelNew()(*args)

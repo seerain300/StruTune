@@ -1,0 +1,315 @@
+import math
+import torch
+import torch.nn as nn
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+# Triton Conv2d: 3x3, stride=2, padding=1, for IC=1 input channel
+@triton.jit
+def conv2d_k3_s2_p1_ic1(
+    X_ptr, W_ptr, BIAS_ptr, Y_ptr,
+    B, F_in, T_in, OC, F_out, T_out,
+    x_sN, x_sC, x_sF, x_sT,
+    w_sOC, w_sIC, w_sKH, w_sKW,
+    y_sN, y_sOC, y_sF, y_sT,
+    BLOCK_F: tl.constexpr, BLOCK_T: tl.constexpr,
+):
+    # Grid dims: (B * T_out, ceil(F_out/BLOCK_F), ceil(T_out/BLOCK_T))
+    pid0 = tl.program_id(0)  # over B * T_out
+    pid_f = tl.program_id(1)
+    pid_t = tl.program_id(2)
+
+    b = pid0 // T_out
+    t_out = pid0 % T_out
+
+    f_out_start = pid_f * BLOCK_F
+    t_out_start = pid_t * BLOCK_T
+
+    f_out_idx = f_out_start + tl.arange(0, BLOCK_F)
+    t_out_idx = t_out_start + tl.arange(0, BLOCK_T)
+
+    f_out = f_out_idx[:, None]  # [BLOCK_F, 1]
+    t_out_vec = t_out_idx[None, :]  # [1, BLOCK_T]
+
+    mask_f = f_out < F_out
+    mask_t = t_out_vec < T_out
+    out_mask = mask_f & mask_t
+
+    acc = tl.zeros((BLOCK_F, BLOCK_T), dtype=tl.float32)
+
+    # Sum over 3x3 kernel
+    for kh in range(3):
+        for kw in range(3):
+            f_in = f_out + 1 - kh  # [BLOCK_F, 1]
+            t_in = t_out_vec + 1 - kw  # [1, BLOCK_T]
+
+            in_bounds = (f_in >= 0) & (f_in < F_in) & (t_in >= 0) & (t_in < T_in) & out_mask
+
+            # X[b, 0, f_in, t_in] since IC=1
+            x_ptr = X_ptr + b * x_sN + 0 * x_sC + f_in * x_sF + t_in * x_sT
+            x_val = tl.load(x_ptr, mask=in_bounds, other=0.0)  # [BLOCK_F, BLOCK_T]
+
+            # Weight vector for (kh, kw) across all OC
+            w_vec = tl.load(W_ptr + tl.arange(0, OC) * w_sOC + 0 * w_sIC + kh * w_sKH + kw * w_sKW)  # [OC]
+
+            # Accumulate outer product for each oc
+            for oc in range(0, OC):
+                acc += x_val * tl.load(W_ptr + oc * w_sOC + 0 * w_sIC + kh * w_sKH + kw * w_sKW)
+
+    # Add bias
+    for oc in range(0, OC):
+        bias_val = tl.load(BIAS_ptr + oc)
+        acc += bias_val
+
+    # GELU: erf-based
+    inv_sqrt2 = 0.7071067811865476  # 1 / sqrt(2)
+    gelu = 0.5 * acc * (1.0 + tl.math.erf(acc * inv_sqrt2))
+
+    # Store to output
+    y_ptr = Y_ptr + b * y_sN + 0 * y_sC + f_out * y_sF + t_out_vec * y_sT
+    tl.store(y_ptr, gelu, mask=out_mask)
+
+
+# Triton Conv2d: 3x3, stride=2, padding=1, for general IC
+@triton.jit
+def conv2d_k3_s2_p1_in(
+    X_ptr, W_ptr, BIAS_ptr, Y_ptr,
+    B, IC, F_in, T_in, OC, F_out, T_out,
+    x_sN, x_sC, x_sF, x_sT,
+    w_sOC, w_sIC, w_sKH, w_sKW,
+    y_sN, y_sOC, y_sF, y_sT,
+    BLOCK_F: tl.constexpr, BLOCK_T: tl.constexpr,
+):
+    # Grid dims: (B * T_out, ceil(F_out/BLOCK_F), ceil(T_out/BLOCK_T))
+    pid0 = tl.program_id(0)  # over B * T_out
+    pid_f = tl.program_id(1)
+    pid_t = tl.program_id(2)
+
+    b = pid0 // T_out
+    t_out = pid0 % T_out
+
+    f_out_start = pid_f * BLOCK_F
+    t_out_start = pid_t * BLOCK_T
+
+    f_out_idx = f_out_start + tl.arange(0, BLOCK_F)
+    t_out_idx = t_out_start + tl.arange(0, BLOCK_T)
+
+    f_out = f_out_idx[:, None]  # [BLOCK_F, 1]
+    t_out_vec = t_out_idx[None, :]  # [1, BLOCK_T]
+
+    mask_f = f_out < F_out
+    mask_t = t_out_vec < T_out
+    out_mask = mask_f & mask_t
+
+    acc = tl.zeros((BLOCK_F, BLOCK_T), dtype=tl.float32)
+
+    # Sum over 3x3 kernel, loop over input channels
+    for kh in range(3):
+        for kw in range(3):
+            f_in = f_out + 1 - kh  # [BLOCK_F, 1]
+            t_in = t_out_vec + 1 - kw  # [1, BLOCK_T]
+
+            in_bounds = (f_in >= 0) & (f_in < F_in) & (t_in >= 0) & (t_in < T_in) & out_mask
+
+            for ic in range(0, IC):
+                x_ptr = X_ptr + b * x_sN + ic * x_sC + f_in * x_sF + t_in * x_sT
+                x_val = tl.load(x_ptr, mask=in_bounds, other=0.0)  # [BLOCK_F, BLOCK_T]
+
+                # Weight vector for (kh, kw, ic) across all OC
+                w_vec = tl.load(W_ptr + tl.arange(0, OC) * w_sOC + ic * w_sIC + kh * w_sKH + kw * w_sKW)  # [OC]
+
+                # Accumulate outer product for each oc
+                for oc in range(0, OC):
+                    w_val = tl.load(W_ptr + oc * w_sOC + ic * w_sIC + kh * w_sKH + kw * w_sKW)
+                    acc += x_val * w_val
+
+    # Add bias
+    for oc in range(0, OC):
+        bias_val = tl.load(BIAS_ptr + oc)
+        acc += bias_val
+
+    # GELU: erf-based
+    inv_sqrt2 = 0.7071067811865476  # 1 / sqrt(2)
+    gelu = 0.5 * acc * (1.0 + tl.math.erf(acc * inv_sqrt2))
+
+    # Store to output
+    y_ptr = Y_ptr + b * y_sN + 0 * y_sC + f_out * y_sF + t_out_vec * y_sT
+    tl.store(y_ptr, gelu, mask=out_mask)
+
+
+# Triton elementwise kernel: Y = X * SCALE
+@triton.jit
+def scale_kernel(X_ptr, Y_ptr, NUMEL: tl.int32, SCALE: tl.float32):
+    pid = tl.program_id(0)
+    offs = pid * tl.num_programs(0) + tl.arange(0, tl.num_programs(0))
+    mask = offs < NUMEL
+    x = tl.load(X_ptr + offs, mask=mask, other=0.0)
+    y = x * SCALE
+    tl.store(Y_ptr + offs, y, mask=mask)
+
+
+# Triton elementwise kernel: Y = X + POS (pos is flattened 1D)
+@triton.jit
+def add_pos_kernel(X_ptr, POS_ptr, Y_ptr, NUMEL: tl.int32):
+    pid = tl.program_id(0)
+    offs = pid * tl.num_programs(0) + tl.arange(0, tl.num_programs(0))
+    mask = offs < NUMEL
+    x = tl.load(X_ptr + offs, mask=mask, other=0.0)
+    pos = tl.load(POS_ptr + offs, mask=mask, other=0.0)
+    y = x + pos
+    tl.store(Y_ptr + offs, y, mask=mask)
+
+
+class ModelNew(nn.Module):
+    def forward(
+        self,
+        input_features: torch.Tensor,
+        conv2d1_weight: torch.Tensor,
+        conv2d1_bias: torch.Tensor,
+        conv2d2_weight: torch.Tensor,
+        conv2d2_bias: torch.Tensor,
+        conv2d3_weight: torch.Tensor,
+        conv2d3_bias: torch.Tensor,
+        conv_out_weight: torch.Tensor,
+        positional_embedding: torch.Tensor,
+        embed_scale: float,
+    ):
+        # Ensure Triton is available
+        if not TRITON_AVAILABLE:
+            # Fallback: original PyTorch path (not ideal, but safe)
+            x = F.conv2d(input_features, conv2d1_weight, conv2d1_bias, stride=2, padding=1)
+            x = F.gelu(x)
+            x = F.conv2d(x, conv2d2_weight, conv2d2_bias, stride=2, padding=1)
+            x = F.gelu(x)
+            x = F.conv2d(x, conv2d3_weight, conv2d3_bias, stride=2, padding=1)
+            x = F.gelu(x)
+            x = x.permute(0, 3, 1, 2).contiguous().view(x.shape[0], x.shape[3], x.shape[1] * x.shape[2])
+            x = F.linear(x, conv_out_weight)
+            x = x * embed_scale
+            seq_len = x.shape[1]
+            pos_embed = positional_embedding[:seq_len, :].to(x.dtype)
+            x = x + pos_embed
+            return x
+
+        # Device setup
+        device = input_features.device
+        dtype = input_features.dtype  # bfloat16
+
+        B = input_features.shape[0]
+        IC = input_features.shape[1]  # 1
+        F_in = input_features.shape[2]  # 80
+        T_in = input_features.shape[3]
+
+        # First conv: IC=1 -> OC=384
+        OC1 = conv2d1_weight.shape[0]
+        F_out1 = (F_in + 2 * 1 - 3) // 2 + 1  # 40
+        T_out1 = (T_in + 2 * 1 - 3) // 2 + 1
+        x = torch.empty((B, OC1, F_out1, T_out1), device=device, dtype=torch.float32)
+
+        grid1 = (B * T_out1, triton.cdiv(F_out1, 8), triton.cdiv(T_out1, 8))
+        conv2d_k3_s2_p1_ic1[grid1](
+            input_features, conv2d1_weight, conv2d1_bias,
+            x,
+            B, F_in, T_in, OC1, F_out1, T_out1,
+            input_features.stride(0), input_features.stride(1), input_features.stride(2), input_features.stride(3),
+            conv2d1_weight.stride(0), conv2d1_weight.stride(1), conv2d1_weight.stride(2), conv2d1_weight.stride(3),
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            BLOCK_F=8, BLOCK_T=8,
+            num_warps=4, num_stages=3,
+        )
+        # x is fp32 with GELU; cast back to bfloat16 for next conv (dtype of weight is bf16)
+        x = x.to(dtype)
+
+        # Second conv: 384 -> 384
+        OC2 = conv2d2_weight.shape[0]
+        F_out2 = (F_out1 + 2 * 1 - 3) // 2 + 1  # 20
+        T_out2 = (T_out1 + 2 * 1 - 3) // 2 + 1
+        y2 = torch.empty((B, OC2, F_out2, T_out2), device=device, dtype=torch.float32)
+
+        grid2 = (B * T_out2, triton.cdiv(F_out2, 8), triton.cdiv(T_out2, 8))
+        conv2d_k3_s2_p1_in[grid2](
+            x, conv2d2_weight, conv2d2_bias,
+            y2,
+            B, OC1, F_out1, T_out1, OC2, F_out2, T_out2,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            conv2d2_weight.stride(0), conv2d2_weight.stride(1), conv2d2_weight.stride(2), conv2d2_weight.stride(3),
+            y2.stride(0), y2.stride(1), y2.stride(2), y2.stride(3),
+            BLOCK_F=8, BLOCK_T=8,
+            num_warps=4, num_stages=3,
+        )
+        y2 = y2.to(dtype)
+
+        # Third conv: 384 -> 384
+        OC3 = conv2d3_weight.shape[0]
+        F_out3 = (F_out2 + 2 * 1 - 3) // 2 + 1  # 10
+        T_out3 = (T_out2 + 2 * 1 - 3) // 2 + 1
+        y3 = torch.empty((B, OC3, F_out3, T_out3), device=device, dtype=torch.float32)
+
+        grid3 = (B * T_out3, triton.cdiv(F_out3, 8), triton.cdiv(T_out3, 8))
+        conv2d_k3_s2_p1_in[grid3](
+            y2, conv2d3_weight, conv2d3_bias,
+            y3,
+            B, OC2, F_out2, T_out2, OC3, F_out3, T_out3,
+            y2.stride(0), y2.stride(1), y2.stride(2), y2.stride(3),
+            conv2d3_weight.stride(0), conv2d3_weight.stride(1), conv2d3_weight.stride(2), conv2d3_weight.stride(3),
+            y3.stride(0), y3.stride(1), y3.stride(2), y3.stride(3),
+            BLOCK_F=8, BLOCK_T=8,
+            num_warps=4, num_stages=3,
+        )
+        y3 = y3.to(dtype)
+
+        # Reshape: [B, 10, 384*10]
+        y3 = y3.permute(0, 3, 1, 2).contiguous().view(B, T_out3, OC3 * F_out3)  # [B, 10, 3840]
+
+        # Linear projection: [3840, 1024]
+        # A = y3.view(B*T3, 3840), B = conv_out_weight [1024, 3840], C = A @ B
+        B_t = 1  # unused in grid computation below; we use matmul over rows directly
+        M = B * T_out3
+        K = OC3 * F_out3  # 3840
+        N = conv_out_weight.shape[0]  # 1024
+        A = y3.view(M, K).to(torch.float32)
+        BT = conv_out_weight  # [N, K]
+        C = torch.empty((M, N), device=device, dtype=torch.float32)
+
+        grid_mm = (triton.cdiv(M, 128), triton.cdiv(N, 64))
+        matmul_kernel[grid_mm](
+            A, BT, C,
+            M, N, K,
+            A.stride(0), A.stride(1),
+            BT.stride(0), BT.stride(1),
+            C.stride(0), C.stride(1),
+            BLOCK_M=128, BLOCK_N=64, BLOCK_K=64,
+            num_warps=4, num_stages=3,
+        )
+
+        # Scale by embed_scale
+        Y = torch.empty_like(C)
+        numel = M * N
+        grid_scale = (triton.cdiv(numel, 1024),)
+        scale_kernel[grid_scale](
+            C, Y, NUMEL=numel, SCALE=float(embed_scale),
+            num_warps=2, num_stages=1,
+        )
+
+        # Add positional embedding: [T3, 1024]
+        pos_emb = positional_embedding[:T_out3, :].to(torch.float32)  # [T3, 1024]
+        Y_out = torch.empty_like(Y)
+        grid_add = (triton.cdiv(numel, 1024),)
+        add_pos_kernel[grid_add](
+            Y, pos_emb.reshape(-1), Y_out, NUMEL=numel,
+            num_warps=2, num_stages=1,
+        )
+
+        # Reshape to [B, T3, 1024]
+        out = Y_out.view(B, T_out3, N)
+        return out
+
+
+def run(*args):
+    return ModelNew()(*args)

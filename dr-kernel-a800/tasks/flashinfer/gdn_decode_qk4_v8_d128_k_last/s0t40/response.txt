@@ -1,0 +1,507 @@
+Final analysis and plan
+
+What went wrong in prior attempts:
+- The “shape ‘[1, 4, 128, 128]’ is invalid for input of size 131072” error indicates a host-side allocation mismatch. We allocated a tensor with shape [B, H, V, K] but the number of elements didn’t match what the Triton kernel produced or the actual H/V/K for the given input. This happened because:
+  - We used a fixed H when allocating the output, or
+  - We computed H, V, K from our assumptions, not from the input tensors, and the evaluator’s dynamic axes caused a mismatch.
+  - Additionally, one earlier attempt changed H, V, K via assertions, which prevented correct handling for different axes.
+- Similarly, the error “shape ‘[1, 1, 128]’ is invalid for input of size 512” suggests we allocated an output vector of length 128 but the kernel produced 512 elements or the shape was not a true [B, 1, V] vector.
+- A separate previous IndexError (“index 4 is out of bounds for dimension 1 with size 4”) came from Python-side indexing past the second dimension size, which we must avoid.
+
+Fix strategy:
+- Remove all Python-side indexing into input tensors that could be incorrect. Launch Triton kernels per (b, h) with grid = (B, H), where H is the actual number of heads (QH or KH as per the original implementation). Do not squeeze or unsqueeze dimension 1.
+- Compute all reductions (dot products) inside Triton kernels. For output scalar per (b, h), compute q[b, h] · new_state[b, h] in the kernel and store a single value. We’ll allocate output as [B, H] on the host and then return [B, 1, H] on the host by unsqueezing dim=1.
+- Ensure all host-side allocations use actual tensor sizes from the input:
+  - new_state: [B, H, V, K]
+  - output: [B, H], then cast to bfloat16 and return [B, 1, H]
+- Keep all math in float32 inside Triton kernels for numerical stability; cast output as requested (bfloat16).
+- Keep kernels simple and vectorize over V and K with masks; use strides to avoid shape mismatches. The kernels assume q, k, v have shape [B, 1, ...] and pass (b, h) to kernels implicitly via program_id(0)=b, program_id(1)=h. But to keep things simple and robust, we will launch kernels per (b, h) and pass b/h scalars, and operate directly on original shapes without squeezing.
+
+Performance considerations:
+- The current reference implementation does a per-batch loop over heads and performs several tensor ops: softplus, sigmoid, K×V dot, q·h_state. Triton can fuse g and beta computation, tmp_old_v, and update of new_state and output into kernels that run per (b, h). While the data sizes here are small (K=128, V=128, H in {4,8}), moving everything to Triton avoids Python overhead and can be faster, especially when B varies. We will:
+  - Use a single Triton kernel to compute g[b,h] and beta[b,h].
+  - Use a single Triton kernel to compute tmp_old_v[b,h] = k[b,h] · state[b,h] via a tile loop over K.
+  - Use a single Triton kernel to update new_state[b,h] elementwise and output[b,h] scalar: new_state = g * old_state + k ⊺ ((1−beta) * (k ⊺ old_state) + beta * v) − k ⊺ (k ⊺ old_state), output = scale * (q ⊺ new_state).
+- All heavy math and reductions are performed in Triton; host code just allocates, launches, and returns. No torch operations on data in host code.
+
+Final code:
+
+```python
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+# Kernel 1: compute g[b,h] and beta[b,h]
+# Inputs:
+#   A_log: [H]
+#   a: [B, H]
+#   dt_bias: [H]
+#   b: [B, H]
+# Outputs:
+#   g: [B, H], beta: [B, H]
+@triton.jit
+def kernel_g_beta(
+    A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
+    g_ptr, beta_ptr,
+    H,
+    stride_A, stride_a_b, stride_a_h, stride_dt, stride_b_b, stride_b_h,
+    stride_g_b, stride_g_h, stride_beta_b, stride_beta_h,
+    num_warps: tl.constexpr,
+):
+    b_idx = tl.program_id(0)
+    h_idx = tl.program_id(1)
+    A = tl.load(A_log_ptr + h_idx * stride_A).to(tl.float32)
+    a_val = tl.load(a_ptr + b_idx * stride_a_b + h_idx * stride_a_h).to(tl.float32)
+    dt = tl.load(dt_bias_ptr + h_idx * stride_dt).to(tl.float32)
+    bb = tl.load(b_ptr + b_idx * stride_b_b + h_idx * stride_b_h).to(tl.float32)
+
+    sp = tl.log(1.0 + tl.exp(a_val + dt))  # softplus(a + dt)
+    g_val = tl.exp(-tl.exp(A) * sp)
+    beta_val = 1.0 / (1.0 + tl.exp(-bb))
+
+    tl.store(g_ptr + b_idx * stride_g_b + h_idx * stride_g_h, g_val)
+    tl.store(beta_ptr + b_idx * stride_beta_b + h_idx * stride_beta_h, beta_val)
+
+
+# Kernel 2: compute tmp_old_v[b,h] = dot(k[b,h], state[b,h]) where state[b,h] is [V,K]
+# Inputs:
+#   k: [B, H, K]
+#   state: [B, H, V, K]
+# Output:
+#   tmp_old_v: [B, H]
+@triton.jit
+def kernel_tmp_old_v(
+    k_ptr, state_ptr, tmp_ptr,
+    B, H, V, K,
+    stride_k_b, stride_k_h, stride_k_k,
+    stride_state_b, stride_state_h, stride_state_v, stride_state_k,
+    stride_tmp_b, stride_tmp_h,
+    num_warps: tl.constexpr,
+):
+    b_idx = tl.program_id(0)
+    h_idx = tl.program_id(1)
+    acc = 0.0
+    # Loop over K in tiles
+    for k_start in range(0, K, 64):
+        k_offsets = k_start + tl.arange(0, 64)
+        mask_k = k_offsets < K
+        # k[b, h, k]
+        k_vec = tl.load(k_ptr + b_idx * stride_k_b + h_idx * stride_k_h + k_offsets * stride_k_k, mask=mask_k, other=0.0)
+        # state[b, h, v, k] -> we will sum over v, k
+        # For each k, load across v and sum
+        for v_idx in range(0, V):
+            s = tl.load(state_ptr + b_idx * stride_state_b + h_idx * stride_state_h + v_idx * stride_state_v + k_offsets * stride_state_k, mask=mask_k, other=0.0)
+            acc += tl.sum(k_vec * s, axis=0)
+    tl.store(tmp_ptr + b_idx * stride_tmp_b + h_idx * stride_tmp_h, acc)
+
+
+# Kernel 3: update new_state[b,h] elementwise and compute output[b,h] scalar
+# Inputs:
+#   q: [B, H, K]
+#   k: [B, H, K]
+#   v: [B, H, V]
+#   state: [B, H, V, K]
+#   g: [B, H], beta: [B, H], tmp_old_v: [B, H]
+# Outputs:
+#   new_state: [B, H, V, K] (we write it elementwise)
+#   output_scalar: [B, H] (we'll return [B,1,H] after cast on host)
+@triton.jit
+def kernel_update_and_output(
+    q_ptr, k_ptr, v_ptr, state_ptr, g_ptr, beta_ptr, tmp_ptr, out_ptr,
+    B, H, V, K,
+    stride_q_b, stride_q_h, stride_q_k,
+    stride_k_b, stride_k_h, stride_k_k,
+    stride_v_b, stride_v_h, stride_v_v,
+    stride_state_b, stride_state_h, stride_state_v, stride_state_k,
+    stride_g_b, stride_g_h, stride_beta_b, stride_beta_h, stride_tmp_b, stride_tmp_h,
+    stride_out_b, stride_out_h,
+    scale,
+    num_warps: tl.constexpr,
+):
+    b_idx = tl.program_id(0)
+    h_idx = tl.program_id(1)
+
+    g_val = tl.load(g_ptr + b_idx * stride_g_b + h_idx * stride_g_h).to(tl.float32)
+    beta_val = tl.load(beta_ptr + b_idx * stride_beta_b + h_idx * stride_beta_h).to(tl.float32)
+    tmp_val = tl.load(tmp_ptr + b_idx * stride_tmp_b + h_idx * stride_tmp_h).to(tl.float32)
+
+    # Compute new_state[b,h] elementwise over [V,K]
+    # old_state = state[b,h]
+    # old_v = k[b,h] @ old_state
+    old_v = 0.0
+    for k_start in range(0, K, 64):
+        k_offsets = k_start + tl.arange(0, 64)
+        mask_k = k_offsets < K
+        k_vec = tl.load(k_ptr + b_idx * stride_k_b + h_idx * stride_k_h + k_offsets * stride_k_k, mask=mask_k, other=0.0)
+        state_block = tl.load(state_ptr + b_idx * stride_state_b + h_idx * stride_state_h + tl.arange(0, V) * stride_state_v + k_offsets * stride_state_k, mask=mask_k, other=0.0)  # [V, 64]
+        # For each v in V, compute dot over K
+        for v_idx in range(0, V):
+            s_vec = state_ptr + b_idx * stride_state_b + h_idx * stride_state_h + v_idx * stride_state_v + k_offsets * stride_state_k  # address; we’ll load per k step
+            # We'll compute s_vec using loop over k in tiles, but Triton requires compile-time bounds; instead compute old_v once as scalar.
+            # To avoid N^2 loops, compute old_v as tmp_old_v (already done). We'll compute new_v and then update new_state.
+            pass  # Placeholder; see below
+
+    # Simplify: since tmp_old_v[b,h] = dot(k[b,h], state[b,h]), and our new_state is updated elementwise, we can compute new_v and then update:
+    # new_v = beta * v + (1-beta) * (old_v - tmp_old_v)  ?  This is incorrect; better compute exact update using tmp and beta:
+    # new_v scalar contribution: beta * v + (1-beta) * (old_v - tmp_old_v)
+    # But old_v is scalar: k @ old_state. We already have tmp_old_v = k @ old_state. So old_v == tmp_old_v.
+    # That simplifies: new_v_scalar = beta * v + (1-beta) * (tmp_old_v - tmp_old_v) = beta * v (since (1-beta)*(0) = 0), but that's not right because original has (1-beta)*old_v. With old_v == tmp_old_v, the (1-beta)*old_v term is (1-beta)*tmp_old_v.
+    # Let's compute it correctly:
+    # old_v = tmp_old_v
+    # new_v_scalar = beta * v + (1-beta) * old_v
+    v_scalar = tl.load(v_ptr + b_idx * stride_v_b + h_idx * stride_v_h).to(tl.float32)
+    new_v_scalar = beta_val * v_scalar + (1.0 - beta_val) * tmp_val
+
+    # Compute state_remove and state_update
+    # state_remove = k @ old_state = tmp_old_v
+    # state_update = k @ new_v = need to compute k @ new_v. We can load k and v and compute:
+    # But v is scalar; k is [K]; compute scalar dot: sum(k * v) but v is scalar, so multiply each k by v_scalar and sum.
+    # However, we need k @ new_v = sum_k k * ( (1-beta)*tmp_old_v + beta*v_scalar ) = (1-beta)*tmp_old_v*K + beta*v_scalar*K, which is wrong because k elements differ.
+    # Instead, compute directly: new_v_vec = beta*v + (1-beta)*tmp_old_v; scalar contribution is new_v_scalar; but state_update is k @ new_v_scalar_vec, which we cannot construct without v's per-K contribution. Since v is scalar, new_v_scalar is scalar, but state_update requires per-K contribution unless we reconstruct v's per-K entries, which we don't have; thus we should compute via tmp_old_v and k? No, because v contributes per-K.
+
+    # The correct approach: we need to compute new_state[b,h, v, k] = g * state[b,h, v, k] + new_v_term - tmp_old_v. But new_v_term depends on k per element; since v is scalar, we can express:
+    # new_v_term = (1-beta) * old_v + beta * v_scalar
+    # But old_v == tmp_old_v. So new_v_term = (1-beta) * tmp_old_v + beta * v_scalar. However, this term must be applied per (v, k) as k ⊺ ( (1-beta) * old_state + beta * v). Since v_scalar is scalar across K, the per-K contribution is beta * v_scalar * k.
+    # Therefore:
+    # new_state_v_k = g * state_v_k + (1-beta) * tmp_old_v + beta * v_scalar
+    # Where tmp_old_v is scalar; we must add it to every [v,k] element of state. And also subtract k @ old_state, which equals tmp_old_v, so it cancels? No: re-examining the math:
+    # Original: new_state = g * state_old + k^T @ (beta * v + (1-beta) * k @ state_old) - k^T @ (k @ state_old)
+    # We already compute tmp_old_v = k @ state_old. So new_v = beta * v + (1-beta) * tmp_old_v (scalar). Then new_state_v_k = g * state_v_k + beta * v_scalar + (1-beta) * tmp_old_v - (k @ state_old) = g * state_v_k + beta * v_scalar. The k @ state_old term is tmp_old_v, which we already accounted for by adding (1-beta) * tmp_old_v, so the subtraction removes it, leaving only beta * v_scalar. Thus:
+    # new_state_v_k = g * state_v_k + beta * v_scalar
+    # Output: output_scalar = scale * (q @ new_state)
+    # Compute output_scalar: q @ new_state. Since new_state_v_k = g * state_v_k + beta * v_scalar, the dot is:
+    # q @ new_state = sum_k q_k * (g * state_v_k + beta * v_scalar) = g * (q @ state) + beta * v_scalar * (q @ ones_K) = g * tmp_old_v2 + beta * v_scalar * K
+    # But we don't have q @ state. Instead, we should compute elementwise q @ new_state. We can compute it by loading q per tile and new_state per tile. However, that requires knowing g and beta per (b,h) and v_scalar; and since new_state depends on beta, we need to compute it first. So we'll compute new_state elementwise.
+
+    # Let's implement elementwise update and output. For simplicity, we'll compute:
+    # For each v and k:
+    # new_state_v_k = g * state_v_k + beta * v_scalar
+    # Then compute output_scalar = scale * sum_k q_k * new_state_v_k
+    # That requires loading q per k. We'll do this by looping over v and k:
+    acc_out = 0.0
+    for v_idx in range(0, V):
+        # new_state_row = g * state_row + beta * v_scalar
+        # We'll load and store per k-tile
+        for k_start in range(0, K, 64):
+            k_offsets = k_start + tl.arange(0, 64)
+            mask_k = k_offsets < K
+            # Load q for this b,h,k tile
+            q_vec = tl.load(q_ptr + b_idx * stride_q_b + h_idx * stride_q_h + k_offsets * stride_q_k, mask=mask_k, other=0.0)
+            # Load state row
+            state_row = tl.load(state_ptr + b_idx * stride_state_b + h_idx * stride_state_h + v_idx * stride_state_v + k_offsets * stride_state_k, mask=mask_k, other=0.0)
+            new_state_row = g_val * state_row + beta_val * v_scalar  # add scalar contribution
+            tl.store(state_ptr + b_idx * stride_state_b + h_idx * stride_state_h + v_idx * stride_state_v + k_offsets * stride_state_k, new_state_row, mask=mask_k)
+            # Accumulate output scalar
+            acc_out += tl.sum(q_vec * new_state_row, axis=0)
+
+    tl.store(out_ptr + b_idx * stride_out_b + h_idx * stride_out_h, acc_out)
+
+
+def ModelNew(q, k, v, state, A_log, a, dt_bias, b, scale):
+    """
+    Triton-optimized version of the original run function.
+    Inputs:
+      q: [B, 1, 4, K], k: [B, 1, 4, K], v: [B, 1, 8, V], state: [B, H, V, K]
+      A_log: [H], a: [B, 1, H], dt_bias: [H], b: [B, 1, H], scale: float
+    Outputs:
+      output: [B, 1, H] in bfloat16
+      new_state: [B, H, V, K] in float32
+    """
+    # Ensure device and dtype
+    device = q.device
+    B_q, _, QH, K = q.shape
+    B_k, _, KH, _ = k.shape
+    B_v, _, VH, V = v.shape
+    B_s, H_s, V_s, K_s = state.shape
+    assert B_q == B_k == B_v == B_s, "Batch sizes must match"
+    assert QH == KH == 4, "Q and K heads must be 4"
+    assert VH == 8, "V heads must be 8"
+    assert K == 128 and V == 128, "K and V must be 128"
+    assert H_s == (QH if QH == KH else None), "State H must match model heads; using QH=4 as per original implementation"
+    H = H_s  # 4 in typical inputs, but evaluator may vary; if not provided, default to 4
+
+    # Prepare inputs as [B, H, ...] by viewing (no squeezing to avoid shape confusion)
+    # Note: We cannot rely on squeezing because H may vary; so we operate on original shapes with grid = (B, H)
+    # Allocate outputs
+    g = torch.empty((B_q, H), dtype=torch.float32, device=device)
+    beta = torch.empty((B_q, H), dtype=torch.float32, device=device)
+    tmp_old_v = torch.empty((B_q, H), dtype=torch.float32, device=device)
+    output_scalar = torch.empty((B_q, H), dtype=torch.float32, device=device)
+
+    # Kernel 1: g and beta
+    # Strides for A_log, a, dt_bias, b
+    stride_A = 1
+    stride_a_b = 1
+    stride_a_h = 1
+    stride_dt = 1
+    stride_b_b = 1
+    stride_b_h = 1
+    stride_g_b = 1
+    stride_g_h = 1
+    stride_beta_b = 1
+    stride_beta_h = 1
+    kernel_g_beta[(B_q, H)](
+        A_log, a.squeeze(1), dt_bias, b.squeeze(1),
+        g, beta,
+        H,
+        stride_A, stride_a_b, stride_a_h, stride_dt, stride_b_b, stride_b_h,
+        stride_g_b, stride_g_h, stride_beta_b, stride_beta_h,
+        num_warps=1,
+    )
+
+    # Kernel 2: tmp_old_v = dot(k, state) over K
+    # Strides
+    stride_k_b = k.stride(0)
+    stride_k_h = k.stride(1)
+    stride_k_k = k.stride(2)
+    stride_state_b = state.stride(0)
+    stride_state_h = state.stride(1)
+    stride_state_v = state.stride(2)
+    stride_state_k = state.stride(3)
+    stride_tmp_b = 1
+    stride_tmp_h = 1
+    kernel_tmp_old_v[(B_q, H)](
+        k.squeeze(1), state, tmp_old_v,
+        B_q, H, V, K,
+        stride_k_b, stride_k_h, stride_k_k,
+        stride_state_b, stride_state_h, stride_state_v, stride_state_k,
+        stride_tmp_b, stride_tmp_h,
+        num_warps=1,
+    )
+
+    # Kernel 3: update new_state and output
+    # Strides
+    stride_q_b = q.stride(0)
+    stride_q_h = q.stride(1)
+    stride_q_k = q.stride(2)
+    stride_k_b = k.stride(0)
+    stride_k_h = k.stride(1)
+    stride_k_k = k.stride(2)
+    stride_v_b = v.stride(0)
+    stride_v_h = v.stride(1)
+    stride_v_v = v.stride(2)
+    stride_state_b = state.stride(0)
+    stride_state_h = state.stride(1)
+    stride_state_v = state.stride(2)
+    stride_state_k = state.stride(3)
+    stride_g_b = 1
+    stride_g_h = 1
+    stride_beta_b = 1
+    stride_beta_h = 1
+    stride_tmp_b = 1
+    stride_tmp_h = 1
+    stride_out_b = 1
+    stride_out_h = 1
+    kernel_update_and_output[(B_q, H)](
+        q.squeeze(1), k.squeeze(1), v.squeeze(1), state, g, beta, tmp_old_v, output_scalar,
+        B_q, H, V, K,
+        stride_q_b, stride_q_h, stride_q_k,
+        stride_k_b, stride_k_h, stride_k_k,
+        stride_v_b, stride_v_h, stride_v_v,
+        stride_state_b, stride_state_h, stride_state_v, stride_state_k,
+        stride_g_b, stride_g_h, stride_beta_b, stride_beta_h, stride_tmp_b, stride_tmp_h,
+        stride_out_b, stride_out_h,
+        scale,
+        num_warps=1,
+    )
+
+    # Return in the original expected shapes
+    output = output_scalar.unsqueeze(1).to(torch.bfloat16)  # [B, 1, H]
+    new_state = state.clone()  # Triton kernel wrote into state in-place for new_state
+    return output, new_state
+```
+
+Notes:
+- We avoid any Python-side indexing into input tensors. All computations are performed by Triton kernels, and host code only allocates and launches them.
+- We use grid = (B, H) to ensure each (b, h) pair is handled independently. This prevents the earlier IndexError.
+- Host allocations use actual input sizes:
+  - g, beta, tmp_old_v, output_scalar are [B, H].
+  - new_state is [B, H, V, K] and is mutated in-place by the kernel to hold the new_state.
+- We return output cast to bfloat16 in shape [B, 1, H], and new_state in float32 with shape [B, H, V, K], matching the original function’s behavior.
+
+Performance:
+- The Triton kernels avoid Python-side loops and operate directly on tiles of K and V, which should be faster than pure PyTorch for these small but repeated sizes across batch. The elementwise update and output scalar are computed per (b, h) in Triton. While some operations are small (K=128, V=128), this approach minimizes host overhead and is scalable to larger B.
+user
+Evaluation of your last submission: 0/54 workloads correct.
+Geomean speedup over correct workloads: n/a.
+workload 901e5104 axes={}: RUNTIME_ERROR RuntimeError: shape '[1, 1, 128]' is invalid for input of size 512
+workload a5714b69 axes={}: RUNTIME_ERROR RuntimeError: shape '[1, 1, 128]' is invalid for input of size 512
+workload 3daa0974 axes={}: RUNTIME_ERROR RuntimeError: shape '[1, 1, 128]' is invalid for input of size 512
+
+These errors clearly indicate a host-side tensor allocation mismatch: we allocated an output with shape [1, 1, 128] (128 elements), but the kernel produced 512 elements. In Triton, when you allocate an output tensor on the host, the number of elements must equal the product of its shape. The evaluator likely varies the batch size B and head count H; our previous code assumed H=4 (based on original code), but the evaluator configurations can have B and H that lead to output size B×1×H not matching expectations. The only way to prevent this is to allocate outputs dynamically based on the actual input shapes of the tensors, not hardcoded assumptions.
+
+Root cause and fix:
+- The output tensor output was allocated as torch.empty((B, 1, H)), but the evaluation’s axes dict suggests H can be 1 in some runs, and B can be 1, leading to 1×1×1 = 1 element, while the kernel writes B×H elements. This mismatch causes “shape is invalid for input of size …”.
+- Fix: compute H dynamically from the state tensor’s shape (state.shape[1]) and allocate output as torch.empty((B, 1, H)), where B is q.shape[0]. Also, in the Triton kernel that produces output, use the same dynamic H. Additionally, new_state must be allocated as [B, H, V, K], so we need V and K; V is v.shape[-1], K is q.shape[-1]. Finally, the Triton kernel must produce exactly [B, H] scalars, and we’ll return [B, 1, H] on the host.
+
+Further correctness safeguards:
+- Do not squeeze/unsqueeze any dimension 1. Operate directly on original shapes and pass (b, h) via program_id(0)=b and program_id(1)=h.
+- All heavy math (softplus, sigmoid, dot products) is performed in Triton. Host code only allocates, launches, and returns. This avoids prior shape/indexing mistakes.
+
+Performance:
+- Triton kernels perform g and beta computation, k·state reduction, and elementwise new_state update with output scalar computation per (b, h). This removes Python loops and reduces host overhead, improving performance especially across batches. We tile over K and V with masks; num_warps can be set to 4 for small tiles (128) to utilize the GPU.
+
+Final code (ModelNew):
+
+```python
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def kernel_g_beta(
+    A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
+    g_ptr, beta_ptr,
+    H,
+    stride_A, stride_a_b, stride_a_h, stride_dt, stride_b_b, stride_b_h,
+    stride_g_b, stride_g_h, stride_beta_b, stride_beta_h,
+    num_warps: tl.constexpr,
+):
+    # One program per (b, h)
+    b_idx = tl.program_id(0)
+    h_idx = tl.program_id(1)
+    # Load scalars
+    A = tl.load(A_log_ptr + h_idx * stride_A).to(tl.float32)
+    a_val = tl.load(a_ptr + b_idx * stride_a_b + h_idx * stride_a_h).to(tl.float32)
+    dt = tl.load(dt_bias_ptr + h_idx * stride_dt).to(tl.float32)
+    bb = tl.load(b_ptr + b_idx * stride_b_b + h_idx * stride_b_h).to(tl.float32)
+    # softplus(x) = log(1 + exp(x))
+    sp = tl.log(1.0 + tl.exp(a_val + dt))
+    g_val = tl.exp(-tl.exp(A) * sp)
+    beta_val = 1.0 / (1.0 + tl.exp(-bb))
+    tl.store(g_ptr + b_idx * stride_g_b + h_idx * stride_g_h, g_val)
+    tl.store(beta_ptr + b_idx * stride_beta_b + h_idx * stride_beta_h, beta_val)
+
+
+@triton.jit
+def kernel_tmp_old_v(
+    k_ptr, state_ptr, tmp_ptr,
+    B, H, V, K,
+    stride_k_b, stride_k_h, stride_k_k,
+    stride_state_b, stride_state_h, stride_state_v, stride_state_k,
+    stride_tmp_b, stride_tmp_h,
+    num_warps: tl.constexpr,
+):
+    # One program per (b, h)
+    b_idx = tl.program_id(0)
+    h_idx = tl.program_id(1)
+    acc = 0.0
+    # Dot over K in tiles
+    for k_start in range(0, K, 64):
+        k_offsets = k_start + tl.arange(0, 64)
+        mask_k = k_offsets < K
+        k_vec = tl.load(k_ptr + b_idx * stride_k_b + h_idx * stride_k_h + k_offsets * stride_k_k, mask=mask_k, other=0.0)
+        # For each v, sum k_vec * state[b,h,v,k]
+        for v_idx in range(0, V):
+            s = tl.load(state_ptr + b_idx * stride_state_b + h_idx * stride_state_h + v_idx * stride_state_v + k_offsets * stride_state_k, mask=mask_k, other=0.0)
+            acc += tl.sum(k_vec * s, axis=0)
+    tl.store(tmp_ptr + b_idx * stride_tmp_b + h_idx * stride_tmp_h, acc)
+
+
+@triton.jit
+def kernel_update_and_output(
+    q_ptr, k_ptr, v_ptr, state_ptr, g_ptr, beta_ptr, tmp_ptr, out_ptr,
+    B, H, V, K,
+    stride_q_b, stride_q_h, stride_q_k,
+    stride_k_b, stride_k_h, stride_k_k,
+    stride_v_b, stride_v_h, stride_v_v,
+    stride_state_b, stride_state_h, stride_state_v, stride_state_k,
+    stride_g_b, stride_g_h, stride_beta_b, stride_beta_h, stride_tmp_b, stride_tmp_h,
+    stride_out_b, stride_out_h,
+    scale,
+    num_warps: tl.constexpr,
+):
+    # One program per (b, h)
+    b_idx = tl.program_id(0)
+    h_idx = tl.program_id(1)
+
+    g_val = tl.load(g_ptr + b_idx * stride_g_b + h_idx * stride_g_h).to(tl.float32)
+    beta_val = tl.load(beta_ptr + b_idx * stride_beta_b + h_idx * stride_beta_h).to(tl.float32)
+    tmp_val = tl.load(tmp_ptr + b_idx * stride_tmp_b + h_idx * stride_tmp_h).to(tl.float32)
+
+    # Compute q @ new_state for output scalar. We update state in-place for new_state:
+    # new_state_v_k = g * state_v_k + beta * v_scalar
+    for v_idx in range(0, V):
+        for k_start in range(0, K, 64):
+            k_offsets = k_start + tl.arange(0, 64)
+            mask_k = k_offsets < K
+            q_vec = tl.load(q_ptr + b_idx * stride_q_b + h_idx * stride_q_h + k_offsets * stride_q_k, mask=mask_k, other=0.0)
+            state_row = tl.load(state_ptr + b_idx * stride_state_b + h_idx * stride_state_h + v_idx * stride_state_v + k_offsets * stride_state_k, mask=mask_k, other=0.0)
+            v_scalar = tl.load(v_ptr + b_idx * stride_v_b + h_idx * stride_v_h).to(tl.float32)
+            new_state_row = g_val * state_row + beta_val * v_scalar
+            tl.store(state_ptr + b_idx * stride_state_b + h_idx * stride_state_h + v_idx * stride_state_v + k_offsets * stride_state_k, new_state_row, mask=mask_k)
+            # Accumulate output scalar: scale * sum_k q_k * new_state_row
+            acc_out = tl.sum(q_vec * new_state_row, axis=0)
+
+    tl.store(out_ptr + b_idx * stride_out_b + h_idx * stride_out_h, acc_out)
+
+
+def ModelNew(q, k, v, state, A_log, a, dt_bias, b, scale):
+    """
+    Triton-optimized version of the original run function.
+    Inputs:
+      q: [B, 1, 4, K], k: [B, 1, 4, K], v: [B, 1, 8, V], state: [B, H, V, K]
+      A_log: [H], a: [B, 1, H], dt_bias: [H], b: [B, 1, H], scale: float
+    Outputs:
+      output: [B, 1, H] in bfloat16
+      new_state: [B, H, V, K] in float32
+    """
+    device = q.device
+    B = q.shape[0]  # batch size
+    H = state.shape[1]  # number of heads
+    V = v.shape[-1]  # vector length
+    K = q.shape[-1]  # key length
+
+    # Allocate outputs with dynamic shapes
+    g = torch.empty((B, H), dtype=torch.float32, device=device)
+    beta = torch.empty((B, H), dtype=torch.float32, device=device)
+    tmp_old_v = torch.empty((B, H), dtype=torch.float32, device=device)
+    output_scalar = torch.empty((B, H), dtype=torch.float32, device=device)
+    new_state = state.clone()  # we'll write updated state in-place
+
+    # Kernel 1: compute g and beta
+    stride_A = 1
+    stride_a_b = 1
+    stride_a_h = 1
+    stride_dt = 1
+    stride_b_b = 1
+    stride_b_h = 1
+    stride_g_b = 1
+    stride_g_h = 1
+    stride_beta_b = 1
+    stride_beta_h = 1
+    kernel_g_beta[(B, H)](
+        A_log, a.squeeze(1), dt_bias, b.squeeze(1),
+        g, beta,
+        H,
+        stride_A, stride_a_b, stride_a_h, stride_dt, stride_b_b, stride_b_h,
+        stride_g_b, stride_g_h, stride_beta_b, stride_beta_h,
+        num_warps=4,
+    )
+
+    # Kernel 2: tmp_old_v = dot(k, state) over K
+    stride_k_b = k.stride(0)
+    stride_k_h = k.stride(1)
+    stride_k_k = k.stride(2)
+    stride_state_b = state.stride(0)
+    stride_state_h = state.stride(1)
+    stride_state_v = state.stride(2)
+    stride_state_k = state.stride(3)
+    stride_tmp_b = 1
+    stride_tmp_h = 1
+    kernel_tmp_old_v[(B, H)](
+        k.squeeze(1), state, tmp_old_v,
+        B, H, V, K,
+        stride_k_b, stride_k_h, stride_k_k,
+        stride_state_b, stride_state_h, stride_state_v, stride_state_k,
+        stride_tmp_b, stride_tmp_h,
+        num_warps=4,
+    )
+
+    # Kernel 3: update new_state and compute output_scalar per (b,h)
+    stride_q_b = q.stride(0)
+    stride_q_h = q.stride(

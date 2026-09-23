@@ -1,0 +1,158 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def cat_rows_kernel(
+    e_ptr,            # *ptr to encoder_hidden_states: [B, T, H]
+    i_ptr,            # *ptr to hidden_states: [B, I, H]
+    out_ptr,          # *ptr to X_cat: [B, T+I, H]
+    B: tl.constexpr,  # batch size (not used directly, but kept for clarity)
+    T: tl.constexpr,  # text_seq_len
+    I: tl.constexpr,  # img_seq_len
+    H: tl.constexpr,  # hidden_dim
+):
+    # program ids
+    b = tl.program_id(0)  # batch
+    p = tl.program_id(1)  # row in [0, T+I)
+
+    # compute source and destination offsets
+    # destination: out[b, p, :]
+    # source row index: p < T -> encoder[b, p, :], else hidden[b, p-T, :]
+    src_idx = tl.where(p < T, p, p - T)
+
+    # loop over hidden dimension
+    for k in range(H):
+        # load from source
+        # encoder: [B, T, H] -> index (b, src_idx, k)
+        # hidden: [B, I, H] -> index (b, p - T, k)
+        enc_val = tl.load(e_ptr + b * T * H + src_idx * H + k)
+        hid_val = tl.load(i_ptr + b * I * H + (p - T) * H + k)
+        # select based on p < T
+        val = tl.where(p < T, enc_val, hid_val)
+
+        # store to output: out[b, p, k]
+        tl.store(out_ptr + b * (T + I) * H + p * H + k, val)
+
+
+@triton.jit
+def batched_matmul_kernel(
+    x_ptr,      # *ptr to X_cat[b]: [M, H]
+    w_ptr,      # *ptr to W: [H, H]
+    y_ptr,      # *ptr to Y[b]: [M, H]
+    M: tl.constexpr,  # rows = T + I
+    H: tl.constexpr,  # cols
+    BLOCK_M: tl.constexpr,  # tile over M (rows)
+    BLOCK_N: tl.constexpr,  # tile over N=H
+    BLOCK_K: tl.constexpr,  # tile over K=H
+):
+    # One program per batch is not supported in grid; use (B, 1)
+    # For simplicity, this kernel is launched once per batch with grid=(1,)
+    # We emulate per-batch by indexing x_ptr, w_ptr, y_ptr via b.
+    # However, Triton kernels are stateless; we can pass pointers for one batch.
+    # Here we assume caller passes batch pointers directly.
+    # To keep it general, we'll implement as if B=1 (forward will allocate per-batch).
+    # Note: Triton does not support retrieving program_id(0) for batch; so we assume single kernel call per forward.
+    # Therefore, we will not use batch indexing in this kernel; we assume forward passes proper pointers.
+
+    # This kernel assumes x_ptr, w_ptr, y_ptr correspond to a single batch.
+    # We can rewrite it to use program_id(0) to handle multiple batches by calling it for each batch separately.
+
+    # Implement a simple GEMM: Y = X @ W, where X is [M, H], W is [H, H], Y is [M, H]
+    # We'll iterate over K=H with BLOCK_K; N is H as well. M is provided as M.
+    # Accumulate in float32.
+
+    # Initialize accumulator
+    acc = tl.zeros((M, H), dtype=tl.float32)
+
+    # Loop over K dimension in tiles
+    for k0 in range(0, H, BLOCK_K):
+        k_range = k0 + tl.arange(0, BLOCK_K)
+        # Accumulate acc += X[:, k_range] * W[k_range, :]
+        # X[:, k_range] is a vector of length M; W[k_range, :] is [BLOCK_K, H]
+        # We need to load each k in k_range and multiply with W[k, :] then add.
+        for kk in range(BLOCK_K):
+            k_curr = k0 + kk
+            mask_k = k_curr < H
+            # Load x_row for all rows
+            x_rows = tl.load(x_ptr + tl.arange(0, M) * H + k_curr, mask=mask_k, other=0.0)  # [M]
+            # Load W[k_curr, :] which is length H
+            w_row = tl.load(w_ptr + k_curr * H + tl.arange(0, H))  # [H]
+            # Outer product and add to acc
+            acc += x_rows[:, None] * w_row[None, :]
+
+    # Store result Y
+    # y_ptr points to [M, H]; we store acc
+    for m in range(M):
+        for n in range(H):
+            tl.store(y_ptr + m * H + n, acc[m, n])
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, process_weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Ensure CUDA and contiguity
+        assert hidden_states.is_cuda and encoder_hidden_states.is_cuda and process_weight.is_cuda, "All tensors must be on CUDA for Triton kernels."
+        B = hidden_states.shape[0]
+        T = encoder_hidden_states.shape[1]
+        I = hidden_states.shape[1]
+        H = hidden_states.shape[2]
+        assert encoder_hidden_states.shape[2] == H and process_weight.shape[1] == H and process_weight.shape[0] == H, "Mismatched hidden dimensions."
+
+        # Make contiguous
+        e = encoder_hidden_states.contiguous()
+        i = hidden_states.contiguous()
+        w = process_weight.contiguous()
+
+        # Ensure dtype consistency (matmul in fp32 for stability)
+        compute_dtype = torch.float32
+        e = e.to(compute_dtype)
+        i = i.to(compute_dtype)
+        w = w.to(compute_dtype)
+
+        # Allocate X_cat per batch: [B, T+I, H]
+        X_cat = torch.empty((B, T + I, H), dtype=compute_dtype, device=e.device)
+
+        # Launch cat_rows_kernel: grid over (B, T+I)
+        grid_cat = (B, T + I)
+        cat_rows_kernel[grid_cat](
+            e, i, X_cat,
+            B=B, T=T, I=I, H=H,
+            num_warps=4,
+        )
+
+        # Allocate output Y per batch: [B, T+I, H]
+        Y = torch.empty((B, T + I, H), dtype=compute_dtype, device=e.device)
+
+        # Launch batched_matmul_kernel: grid over (B,). Note: Triton expects 1D grid; one program per batch.
+        # However, Triton kernels don't have program_id(0) concept; we can call it once per batch by allocating pointers per batch and launching.
+        # Simpler: treat as single batch by using X_cat[0] and w; but we need per-batch. Triton supports pointer arithmetic via tensors.
+        # We will call the kernel for each batch manually by passing appropriate pointers.
+        # Implement a small loop in Python to launch per batch. This is acceptable as forward.
+        for b in range(B):
+            x_b = X_cat[b]  # [T+I, H]
+            w_b = w         # [H, H]
+            y_b = Y[b]      # [T+I, H]
+            # Choose block sizes; H is hidden_dim, often up to 1024. Use BLOCK_N=128, BLOCK_K=64, BLOCK_M=64 for M=T+I.
+            # The kernel above implements a simple accumulation. For better performance, a standard Triton GEMM would be faster,
+            # but here we prioritize correctness and Triton usage. We can tune these later.
+            grid_mm = (1,)
+            # Note: The kernel expects pointers; we pass x_b, w_b, y_b.
+            batched_matmul_kernel[grid_mm](
+                x_b, w_b, y_b,
+                M=T + I, H=H,
+                BLOCK_M=64, BLOCK_N=128, BLOCK_K=64,
+                num_warps=4,
+            )
+
+        # Return slices: processed_encoder = Y[:, :T, :], processed_hidden = Y[:, T:, :]
+        processed_encoder = Y[:, :T, :]
+        processed_hidden = Y[:, T:, :]
+
+        # Cast back to original dtype if needed
+        # Original tensors are float32 by default; we kept compute in fp32.
+        return processed_encoder, processed_hidden
+
+
+def run(*args):
+    return ModelNew()(*args)

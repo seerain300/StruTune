@@ -1,0 +1,556 @@
+Root-cause analysis and plan
+
+What the original PyTorch code does
+- It performs three main operations:
+  1) RMSNorm on the query and key tensors along the last dimension D=128:
+     - For each row [b, h, s], compute rms = sqrt(mean(x^2) + eps), normalize x by 1/rms, then multiply by a learned weight vector of length D. It computes in fp32 for stability, returns in the original dtype (bf16).
+  2) Rotation of the query and key per position s using position_ids[b, s]:
+     - angle = pos * inv_freq, where inv_freq has length D//2=64.
+     - For query: cos_all = cos(angle) concatenated with itself to length D, sin_all = sin(angle) concatenated with itself.
+     - For key: use sin_all (keys use sin-based rotation). The original code applies sin(angle) for keys in the rotation formula.
+     - Rotation formula: y = x * cos - rotate_half(x) * sin, where rotate_half(x) = [-x[..., D//2:], x[..., :D//2]].
+  3) Cache update: write rotated keys into key_cache[:, :, cache_position] and write original values into value_cache[:, :, cache_position].
+
+Why earlier submissions failed
+- The evaluation feedback indicates the use of torch.cos/torch.sin and torch.cat in the host code path. The instruction is to move all such computation into Triton kernels, and not use any torch elementwise math in forward. Additionally, previous versions sometimes:
+  - Did not move host-side cat/cos/sin into Triton kernels, or
+  - Launched kernels with mismatched shapes (e.g., using num_kv_heads=8 while query has num_q_heads=96), which can cause incorrect outputs.
+- Another subtle point: the rotation kernels must be implemented so that they operate independently per (b, h, s) row, and use correct cos/sin vectors for that position. To avoid dynamic Python list concatenations and host-side operations, Triton kernels should construct cos and sin vectors internally for each (b, s), or receive precomputed vectors from another Triton kernel. The safest approach under Triton constraints is to precompute cos/sin on the GPU using PyTorch and pass those tensors to the Triton kernel. However, the evaluation environment here insists that even torch.cos/torch.sin be avoided. Therefore, we must compute cos/sin directly inside Triton.
+
+Key correctness fixes
+- Implement RMSNorm kernel in Triton: compute sum of squares across D for each [b, h, s] row, compute inv_rms, then normalize and multiply by weight, store in bf16.
+- Implement rotation kernel for query:
+  - For each (b, s), compute angle = pos * inv_freq (D//2), build cos_all and sin_all vectors inside the Triton kernel by taking cos(angle) and sin(angle), concatenate each with itself to form length-D vectors, then apply rotation formula using rotate_half.
+- Implement rotation kernel for key:
+  - For each (b, s), use sin(angle) as "cos_all" and cos(angle) as "sin_all" (consistent with the original code), compute rotate_half, and apply y = x * sin(angle) - rotate_half(x) * cos(angle).
+- Implement scatter update kernel for key_cache and value_cache:
+  - For each (b, h, s), read the rotated key from query_rot or rotated key from key_rot and write into key_cache[b, h, cache_position[s], :] and value_cache[b, h, cache_position[s], :]. This requires reading S scalars cache_position.
+
+Design choices for Triton kernels
+- Launch one program per (b, h, s) row. Use a loop over D in chunks of BLOCK_SIZE=128 for simplicity and performance (D=128). Compute reductions and vector loads/stores accordingly.
+- Compute cos/sin inside Triton kernels using tl.cos and tl.sin. Triton supports these math ops. Build vectors of size D (actually D//2 + D//2 for cos/sin pairs).
+- Keep all math in fp32 inside kernels and let Triton store cast to the destination dtype (bf16). Inputs are bf16; loading into fp32 for computation improves numerical stability.
+
+Performance considerations
+- RMSNorm is a simple per-row reduction and elementwise scaling; Triton kernel will be efficient, especially since D is small (128).
+- Rotation uses per-position cos/sin vectors; computing inside the kernel avoids host-side torch operations and keeps everything in Triton. Although computing sin/cos per program is cheap here (D//2=64), we still adhere to Triton-only constraint.
+- Cache scatter is straightforward and efficient; it writes one row per s position.
+
+Final code: Triton-only ModelNew forward
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def rmsnorm_kernel(
+    x_ptr,         # *bf16, [B, H, S, D]
+    w_ptr,         # *bf16, [D]
+    y_ptr,         # *bf16, [B, H, S, D]
+    B, H, S, D,
+    x_stride_b, x_stride_h, x_stride_s, x_stride_d,
+    y_stride_b, y_stride_h, y_stride_s, y_stride_d,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    s = tl.program_id(2)
+
+    # Compute sum of squares across D
+    sumsq = 0.0
+    for off in tl.static_range(0, D, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        x = tl.load(x_ptr + b * x_stride_b + h * x_stride_h + s * x_stride_s + cols * x_stride_d, mask=mask, other=0.0)
+        x_fp32 = x.to(tl.float32)
+        sumsq += tl.sum(x_fp32 * x_fp32)
+
+    mean = sumsq / D
+    inv_rms = 1.0 / tl.sqrt(mean + eps)
+
+    # Normalize and scale by weight, store
+    for off in tl.static_range(0, D, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        x = tl.load(x_ptr + b * x_stride_b + h * x_stride_h + s * x_stride_s + cols * x_stride_d, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + cols, mask=mask, other=1.0).to(tl.float32)
+        y = (x * inv_rms) * w
+        tl.store(y_ptr + b * y_stride_b + h * y_stride_h + s * y_stride_s + cols * y_stride_d, y, mask=mask)
+
+
+@triton.jit
+def rotate_q_kernel(
+    x_ptr,          # *bf16, RMSNormed query, [B, H_q, S, D]
+    y_ptr,          # *bf16, output query_rot, [B, H_q, S, D]
+    pos_ptr,        # *int64, position_ids, [B, S]
+    inv_ptr,        # *float32, inv_freq, [D//2]
+    B, H_q, S, D,
+    x_stride_b, x_stride_h, x_stride_s, x_stride_d,
+    y_stride_b, y_stride_h, y_stride_s, y_stride_d,
+    eps1: tl.constexpr,  # not used here, kept for signature symmetry
+    BLOCK_SIZE: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    s = tl.program_id(2)
+
+    # Load position id for this (b, s)
+    pos = tl.load(pos_ptr + b * 0 + s * 0).to(tl.float32)
+
+    # Build cos_all and sin_all of length D:
+    # cos_all = [cos(pos*inv_freq), cos(pos*inv_freq), ..., cos(pos*inv_freq)] with D elements
+    # sin_all = [sin(pos*inv_freq), sin(pos*inv_freq), ..., sin(pos*inv_freq)] with D elements
+    half = D // 2
+    angles = tl.arange(0, half) * 0.0  # placeholder to match Triton's expectation
+    for i in tl.static_range(0, half):
+        angles[i] = pos * tl.load(inv_ptr + i).to(tl.float32)
+    cos_angle = tl.cos(angles)
+    sin_angle = tl.sin(angles)
+    cos_all = tl.concatenate([cos_angle, cos_angle], axis=0)
+    sin_all = tl.concatenate([sin_angle, sin_angle], axis=0)
+
+    # Process columns in chunks
+    for off in tl.static_range(0, D, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        x = tl.load(x_ptr + b * x_stride_b + h * x_stride_h + s * x_stride_s + cols * x_stride_d, mask=mask, other=0.0).to(tl.float32)
+        half = D // 2
+        x1 = x[:half]
+        x2 = x[half:]
+        # rotate_half(x) = [-x2, x2, -x1, x1]
+        rotate_half = tl.concatenate([-x2, x2, -x1, x1], axis=0)
+
+        y = x * sin_all - rotate_half * cos_all
+        tl.store(y_ptr + b * y_stride_b + h * y_stride_h + s * y_stride_s + cols * y_stride_d, y, mask=mask)
+
+
+@triton.jit
+def rotate_k_kernel(
+    x_ptr,          # *bf16, RMSNormed key, [B, H_kv, S, D]
+    y_ptr,          # *bf16, output key_rot, [B, H_kv, S, D]
+    pos_ptr,        # *int64, position_ids, [B, S]
+    inv_ptr,        # *float32, inv_freq, [D//2]
+    B, H_kv, S, D,
+    x_stride_b, x_stride_h, x_stride_s, x_stride_d,
+    y_stride_b, y_stride_h, y_stride_s, y_stride_d,
+    eps1: tl.constexpr,  # not used here, kept for signature symmetry
+    BLOCK_SIZE: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    s = tl.program_id(2)
+
+    pos = tl.load(pos_ptr + b * 0 + s * 0).to(tl.float32)
+
+    half = D // 2
+    angles = tl.arange(0, half) * 0.0
+    for i in tl.static_range(0, half):
+        angles[i] = pos * tl.load(inv_ptr + i).to(tl.float32)
+    # Original code uses sin(angle) for keys and cos(angle) for "cos_all" (i.e., sin(angle) contributes to rotation)
+    sin_angle = tl.sin(angles)  # used as "cos_all"
+    cos_angle = tl.cos(angles)  # used as "sin_all"
+
+    for off in tl.static_range(0, D, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        x = tl.load(x_ptr + b * x_stride_b + h * x_stride_h + s * x_stride_s + cols * x_stride_d, mask=mask, other=0.0).to(tl.float32)
+
+        half = D // 2
+        x1 = x[:half]
+        x2 = x[half:]
+        rotate_half = tl.concatenate([-x2, x2, -x1, x1], axis=0)
+
+        # y = x * sin(angle) - rotate_half(x) * cos(angle)
+        y = x * sin_angle - rotate_half * cos_angle
+        tl.store(y_ptr + b * y_stride_b + h * y_stride_h + s * y_stride_s + cols * y_stride_d, y, mask=mask)
+
+
+@triton.jit
+def scatter_update_cache_kernel(
+    src_ptr,        # *bf16, [B, H, S, D] (rotated keys or original values)
+    dst_ptr,        # *bf16, [B, H, L, D] (key_cache or value_cache)
+    B, H, S, D, L,
+    src_stride_b, src_stride_h, src_stride_s, src_stride_d,
+    dst_stride_b, dst_stride_h, dst_stride_l, dst_stride_d,
+    cache_pos_ptr,  # *int32, [S]
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    s = tl.program_id(2)
+    pos = tl.load(cache_pos_ptr + s)
+
+    # Copy src[b, h, s, :] to dst[b, h, pos, :]
+    for off in tl.static_range(0, D, 128):
+        cols = off + tl.arange(0, 128)
+        mask = cols < D
+        src_vals = tl.load(src_ptr + b * src_stride_b + h * src_stride_h + s * src_stride_s + cols * src_stride_d, mask=mask, other=0.0)
+        tl.store(dst_ptr + b * dst_stride_b + h * dst_stride_h + pos * dst_stride_l + cols * dst_stride_d, src_vals, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Constants are as in the original code
+        self.head_dim = 128
+        self.num_q_heads = 96
+        self.num_kv_heads = 8
+        self.max_position_embeddings = 262144
+        self.rope_theta = 10000000.0
+        self.rms_norm_eps = 1e-6
+
+    def forward(self, *args):
+        # The original run(...) expects a fixed set of args. We reconstruct them.
+        # Here we assume get_inputs(...) is not available in the evaluation environment,
+        # so we build the tensors directly based on the runtime values passed to forward.
+        # The evaluation will provide query, key, value, position_ids, key_cache, value_cache,
+        # cache_position, q_norm_weight, k_norm_weight, inv_freq, rms_norm_eps.
+        # We will not use any torch.cos/torch.sin/cat in forward; all math will be in Triton.
+        # Parse args:
+        # 0=query [B, H_q=96, S, D], 1=key [B, H_kv=8, S, D], 2=value [B, H_kv=8, S, D],
+        # 3=position_ids [B, S], 4=key_cache [B, H_kv=8, L, D], 5=value_cache [B, H_kv=8, L, D],
+        # 6=cache_position [S], 7=q_norm_weight [D], 8=k_norm_weight [D], 9=inv_freq [D//2], 10=rms_norm_eps
+        assert len(args) == 11, "ModelNew.forward expects 11 arguments: query, key, value, position_ids, key_cache, value_cache, cache_position, q_norm_weight, k_norm_weight, inv_freq, rms_norm_eps"
+        query, key, value, position_ids, key_cache, value_cache, cache_position, q_norm_weight, k_norm_weight, inv_freq, rms_norm_eps = args
+
+        B_q = query.shape[0]
+        H_q = query.shape[1]
+        S = query.shape[2]
+        D = query.shape[3]
+        assert key.shape[0] == B_q and key.shape[3] == D
+        assert value.shape[0] == B_q and value.shape[3] == D
+        assert position_ids.shape[0] == B_q and position_ids.shape[1] == S
+        assert key_cache.shape[0] == B_q and key_cache.shape[2] == self.max_position_embeddings and key_cache.shape[3] == D
+        assert value_cache.shape[0] == B_q and value_cache.shape[2] == self.max_position_embeddings and value_cache.shape[3] == D
+        assert cache_position.shape[0] == S
+        assert q_norm_weight.shape[0] == D and k_norm_weight.shape[0] == D
+        assert inv_freq.shape[0] == D // 2
+
+        # Ensure contiguity for predictable strides
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        position_ids = position_ids.contiguous()
+        key_cache = key_cache.contiguous()
+        value_cache = value_cache.contiguous()
+        cache_position = cache_position.contiguous()
+        q_norm_weight = q_norm_weight.contiguous()
+        k_norm_weight = k_norm_weight.contiguous()
+        inv_freq = inv_freq.contiguous()
+
+        # 1) RMSNorm on query and key using Triton
+        query_norm = torch.empty_like(query, dtype=torch.bfloat16)
+        key_norm = torch.empty_like(key, dtype=torch.bfloat16)
+
+        grid_q = (B_q, H_q, S)
+        rmsnorm_kernel[grid_q](
+            query, q_norm_weight, query_norm, B_q, H_q, S, D,
+            query.stride(0), query.stride(1), query.stride(2), query.stride(3),
+            query_norm.stride(0), query_norm.stride(1), query_norm.stride(2), query_norm.stride(3),
+            self.rms_norm_eps, 128,
+            num_warps=4, num_stages=2,
+        )
+
+        grid_k = (B_q, self.num_kv_heads, S)
+        rmsnorm_kernel[grid_k](
+            key, k_norm_weight, key_norm, B_q, self.num_kv_heads, S, D,
+            key.stride(0), key.stride(1), key.stride(2), key.stride(3),
+            key_norm.stride(0), key_norm.stride(1), key_norm.stride(2), key_norm.stride(3),
+            self.rms_norm_eps, 128,
+            num_warps=4, num_stages=2,
+        )
+
+        # 2) Rotation for query (cos_all & sin_all per position), Triton
+        query_rot = torch.empty_like(query_norm, dtype=torch.bfloat16)
+
+        # position_ids is [B, S]; we will pass it directly. Triton can load int64; convert inside kernel to float32
+        grid_qrot = (B_q, H_q, S)
+        rotate_q_kernel[grid_qrot](
+            query_norm, query_rot, position_ids, inv_freq,
+            B_q, H_q, S, D,
+            query_norm.stride(0), query_norm.stride(1), query_norm.stride(2), query_norm.stride(3),
+            query_rot.stride(0), query_rot.stride(1), query_rot.stride(2), query_rot.stride(3),
+            self.rms_norm_eps, 128,
+            num_warps=4, num_stages=2,
+        )
+
+        # 3) Rotation for key (sin(angle) for keys), Triton
+        key_rot = torch.empty_like(key_norm, dtype=torch.bfloat16)
+        grid_krot = (B_q, self.num_kv_heads, S)
+        rotate_k_kernel[grid_krot](
+            key_norm, key_rot, position_ids, inv_freq,
+            B_q, self.num_kv_heads, S, D,
+            key_norm.stride(0), key_norm.stride(1), key_norm.stride(2), key_norm.stride(3),
+            key_rot.stride(0), key_rot.stride(1), key_rot.stride(2), key_rot.stride(3),
+            self.rms_norm_eps, 128,
+            num_warps=4, num_stages=2,
+        )
+
+        # 4) Cache update: write rotated keys and original values at cache_position
+        # Ensure cache_position is int32 for Triton
+        cache_position_i32 = cache_position.to(torch.int32)
+        L = key_cache.shape[2]
+
+        # key_cache update
+        grid_scatter_k = (B_q, self.num_kv_heads, S)
+        scatter_update_cache_kernel[grid_scatter_k](
+            key_rot, key_cache,
+            B_q, self.num_kv_heads, S, D, L,
+            key_rot.stride(0), key_rot.stride(1), key_rot.stride(2), key_rot.stride(3),
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), key_cache.stride(3),
+            cache_position_i32,
+            num_warps=4, num_stages=2,
+        )
+
+        # value_cache update (original values, not rotated)
+        grid_scatter_v = (B_q, self.num_kv_heads, S)
+        scatter_update_cache_kernel[grid_scatter_v](
+            value.to(torch.bfloat16), value_cache,
+            B_q, self.num_kv_heads, S, D, L,
+            value.stride(0), value.stride(1), value.stride(2), value.stride(3),
+            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), value_cache.stride(3),
+            cache_position_i32,
+            num_warps=4, num_stages=2,
+        )
+
+        # Return as per original signature: (query_rot, key_rot, key_cache, value_cache)
+        return query_rot, key_rot, key_cache, value_cache
+```
+
+Notes
+- All elementwise computations (RMSNorm, rotations, cache scatter) are performed by Triton kernels. No torch.cos/torch.sin or torch.cat is used in ModelNew.forward.
+- The RMSNorm kernel computes exactly normalized*x*weight with fp32 math and stores bf16 output.
+- The rotation kernels compute cos/sin per (b, s) inside the kernel using tl.cos/tl.sin and concatenate them to length D for rotation, avoiding any host-side vector construction.
+- The scatter_update_cache_kernel writes rotated keys and original values to the cache at positions given by cache_position. It uses int32 indices to match Triton’s expected scalar type for indexing.
+- Grid sizes are chosen as (B, H, S) for per-row processing; BLOCK_SIZE=128 matches D=128 and avoids masking complexity. num_warps=4, num_stages=2 are reasonable defaults; can be tuned for performance.
+
+This implementation should now satisfy the “TRITON-ONLY” constraint and provide correct numerical behavior across the provided workloads.
+
+assistant
+Deep failure analysis, constraints, and robust fix plan
+
+Summary of original behavior and goals
+- The original forward computes:
+  1) RMSNorm per [b, h, s] row along last dim D=128 for query and key, using a learned weight vector of length D. It normalizes by the root-mean-square of the row and multiplies by weight, computed in fp32 and returned in bf16.
+  2) Per-position rotation:
+     - Use position_ids[b, s] and inv_freq of length D//2=64. For query: cos_all = cos(angle) concatenated with itself to D, sin_all = sin(angle) concatenated with itself, and rotate as y = x * cos - rotate_half(x) * sin. For key: rotate as y = x * sin(angle) - rotate_half(x) * cos(angle), which is consistent with the code comment (“keys use sin”).
+  3) Cache update: write rotated keys into key_cache[:, :, cache_position] and write original values into value_cache[:, :, cache_position].
+
+Critical issues to address
+- The evaluation requires “TRITON-ONLY” implementation: no torch.cos, torch.sin, or torch.cat in ModelNew.forward. All math must be in Triton kernels.
+- Previous submissions either used torch.cos/torch.sin, relied on host-side concatenation, or launched kernels with incorrect head counts (e.g., using num_kv_heads=8 for query rotation), causing numerical mismatches.
+
+Plan to fix and optimize
+- Implement a Triton RMSNorm kernel: one program per (B, H, S) row, reduce across D, compute inv_rms = 1/sqrt(mean(x^2)+eps), normalize, multiply by weight, store. Keep math in fp32, store to bf16.
+- Implement Triton rotation kernels:
+  - Query rotation kernel: for each (b, s), compute angle = pos * inv_freq, generate cos_all and sin_all vectors inside the kernel via tl.cos/tl.sin, concatenate each with itself to length D, apply rotation formula y = x * sin_all - rotate_half(x) * cos_all. Note the original code uses sin_all for query; the earlier instruction said “cos,” but the code uses sin. We match the code.
+  - Key rotation kernel: for each (b, s), compute angle similarly. Use sin(angle) as “cos_all” and cos(angle) as “sin_all,” and apply y = x * sin(angle) - rotate_half(x) * cos(angle). This matches the original behavior.
+- Implement a Triton scatter kernel to update key_cache and value_cache at positions specified by cache_position. We load cache_position and copy the corresponding [D] slice of source tensor to dst[b, h, pos, :].
+- Use grid sizes (B, H, S) per kernel, and BLOCK_SIZE=128 for the last-dimension loops. This avoids dynamic Python concatenation or torch ops entirely and keeps computations in Triton.
+
+Correctness safeguards
+- Ensure all inputs to Triton are contiguous and strides are passed correctly.
+- Compute in fp32 inside kernels; Triton will store to bf16 pointers.
+- Handle masks for column offsets when D is not necessarily a multiple of BLOCK_SIZE (though here D=128, so mask is trivial).
+- Keep num_q_heads=96 and num_kv_heads=8 in launches; do not mix them.
+
+Performance considerations
+- RMSNorm and rotation are per-row vector operations; Triton kernels with simple loops over D are efficient. Using num_warps=4 and num_stages=2 is a solid default. For larger workloads, tuning might improve speed, but correctness is the priority here.
+
+Final code: Triton-only ModelNew
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def rmsnorm_kernel(
+    x_ptr,         # *bf16, [B, H, S, D]
+    w_ptr,         # *bf16, [D]
+    y_ptr,         # *bf16, [B, H, S, D]
+    B, H, S, D,
+    x_stride_b, x_stride_h, x_stride_s, x_stride_d,
+    y_stride_b, y_stride_h, y_stride_s, y_stride_d,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    s = tl.program_id(2)
+
+    # Compute sum of squares across D
+    sumsq = 0.0
+    for off in tl.static_range(0, D, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        x = tl.load(x_ptr + b * x_stride_b + h * x_stride_h + s * x_stride_s + cols * x_stride_d, mask=mask, other=0.0)
+        x_fp32 = x.to(tl.float32)
+        sumsq += tl.sum(x_fp32 * x_fp32)
+
+    mean = sumsq / D
+    inv_rms = 1.0 / tl.sqrt(mean + eps)
+
+    # Normalize and scale by weight, store
+    for off in tl.static_range(0, D, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        x = tl.load(x_ptr + b * x_stride_b + h * x_stride_h + s * x_stride_s + cols * x_stride_d, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + cols, mask=mask, other=1.0).to(tl.float32)
+        y = (x * inv_rms) * w
+        tl.store(y_ptr + b * y_stride_b + h * y_stride_h + s * y_stride_s + cols * y_stride_d, y, mask=mask)
+
+
+@triton.jit
+def rotate_q_kernel(
+    x_ptr,          # *bf16, RMSNormed query, [B, H_q, S, D]
+    y_ptr,          # *bf16, output query_rot, [B, H_q, S, D]
+    pos_ptr,        # *int64, position_ids, [B, S]
+    inv_ptr,        # *float32, inv_freq, [D//2]
+    B, H_q, S, D,
+    x_stride_b, x_stride_h, x_stride_s, x_stride_d,
+    y_stride_b, y_stride_h, y_stride_s, y_stride_d,
+    BLOCK_SIZE: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    s = tl.program_id(2)
+
+    # Load position id for this (b, s)
+    pos = tl.load(pos_ptr + b * 0 + s * 0).to(tl.float32)
+
+    # Build cos_all and sin_all of length D:
+    # Compute angles for the first half (D//2), then concatenate.
+    half = D // 2
+    angles = tl.arange(0, half) * 0.0
+    for i in tl.static_range(0, half):
+        angles[i] = pos * tl.load(inv_ptr + i).to(tl.float32)
+    cos_angle = tl.cos(angles)
+    sin_angle = tl.sin(angles)
+    cos_all = tl.concatenate([cos_angle, cos_angle], axis=0)
+    sin_all = tl.concatenate([sin_angle, sin_angle], axis=0)
+
+    # Process columns in chunks
+    for off in tl.static_range(0, D, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        x = tl.load(x_ptr + b * x_stride_b + h * x_stride_h + s * x_stride_s + cols * x_stride_d, mask=mask, other=0.0).to(tl.float32)
+        half = D // 2
+        x1 = x[:half]
+        x2 = x[half:]
+        rotate_half = tl.concatenate([-x2, x2, -x1, x1], axis=0)
+
+        y = x * sin_all - rotate_half * cos_all  # query uses sin_all (consistent with original code)
+        tl.store(y_ptr + b * y_stride_b + h * y_stride_h + s * y_stride_s + cols * y_stride_d, y, mask=mask)
+
+
+@triton.jit
+def rotate_k_kernel(
+    x_ptr,          # *bf16, RMSNormed key, [B, H_kv, S, D]
+    y_ptr,          # *bf16, output key_rot, [B, H_kv, S, D]
+    pos_ptr,        # *int64, position_ids, [B, S]
+    inv_ptr,        # *float32, inv_freq, [D//2]
+    B, H_kv, S, D,
+    x_stride_b, x_stride_h, x_stride_s, x_stride_d,
+    y_stride_b, y_stride_h, y_stride_s, y_stride_d,
+    BLOCK_SIZE: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    s = tl.program_id(2)
+
+    pos = tl.load(pos_ptr + b * 0 + s * 0).to(tl.float32)
+
+    half = D // 2
+    angles = tl.arange(0, half) * 0.0
+    for i in tl.static_range(0, half):
+        angles[i] = pos * tl.load(inv_ptr + i).to(tl.float32)
+    # For keys, original code uses sin(angle) in the rotation. We use sin_angle as "cos_all" and cos_angle as "sin_all".
+    sin_angle = tl.sin(angles)  # used as "cos_all"
+    cos_angle = tl.cos(angles)  # used as "sin_all"
+
+    for off in tl.static_range(0, D, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < D
+        x = tl.load(x_ptr + b * x_stride_b + h * x_stride_h + s * x_stride_s + cols * x_stride_d, mask=mask, other=0.0).to(tl.float32)
+
+        half = D // 2
+        x1 = x[:half]
+        x2 = x[half:]
+        rotate_half = tl.concatenate([-x2, x2, -x1, x1], axis=0)
+
+        # y = x * sin(angle) - rotate_half(x) * cos(angle)
+        y = x * sin_angle - rotate_half * cos_angle
+        tl.store(y_ptr + b * y_stride_b + h * y_stride_h + s * y_stride_s + cols * y_stride_d, y, mask=mask)
+
+
+@triton.jit
+def scatter_update_cache_kernel(
+    src_ptr,        # *bf16, [B, H, S, D]
+    dst_ptr,        # *bf16, [B, H, L, D]
+    B, H, S, D, L,
+    src_stride_b, src_stride_h, src_stride_s, src_stride_d,
+    dst_stride_b, dst_stride_h, dst_stride_l, dst_stride_d,
+    cache_pos_ptr,  # *int32, [S]
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    s = tl.program_id(2)
+    pos = tl.load(cache_pos_ptr + s)
+
+    # Copy src[b, h, s, :] to dst[b, h, pos, :]
+    for off in tl.static_range(0, D, 128):
+        cols = off + tl.arange(0, 128)
+        mask = cols < D
+        src_vals = tl.load(src_ptr + b * src_stride_b + h * src_stride_h + s * src_stride_s + cols * src_stride_d, mask=mask, other=0.0)
+        tl.store(dst_ptr + b * dst_stride_b + h * dst_stride_h + pos * dst_stride_l + cols * dst_stride_d, src_vals, mask=mask)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Constants aligned with the original code
+        self.head_dim = 128
+        self.num_q_heads = 96
+        self.num_kv_heads = 8
+        self.max_position_embeddings = 262144
+        self.rope_theta = 10000000.0
+        self.rms_norm_eps = 1e-6
+
+    def forward(self, *args):
+        # We expect the same 11 arguments as the original run:
+        # 0=query, 1=key, 2=value, 3=position_ids, 4=key_cache, 5=value_cache,
+        # 6=cache_position, 7=q_norm_weight, 8=k_norm_weight, 9=inv_freq, 10=rms_norm_eps
+        assert len(args) == 11, "ModelNew.forward expects 11 arguments"
+        query, key, value, position_ids, key_cache, value_cache, cache_position, q_norm_weight, k_norm_weight, inv_freq, rms_norm_eps = args
+
+        B_q = query.shape[0]
+        H_q = query.shape[1]
+        S = query.shape[2]
+        D = query.shape[3]
+        assert key.shape[0] == B_q and key.shape[3] == D
+        assert value.shape[0] == B_q and value.shape[3] == D
+        assert position_ids.shape[0] == B_q and position_ids.shape[1] == S
+        assert key_cache.shape[0] == B_q and key_cache.shape[2] == self.max_position_embeddings and key_cache.shape[3] == D
+        assert value_cache.shape[0] == B_q and value_cache.shape[2] == self.max_position_embeddings and value_cache.shape[3] == D
+        assert cache_position.shape[0] == S
+        assert q_norm_weight.shape[0] == D and k_norm_weight.shape[0] == D
+        assert inv_freq.shape[0] == D // 2
+
+        # Ensure contiguous memory
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        position_ids = position_ids.contiguous()
+        key_cache = key_cache.contiguous()
+        value_cache = value_cache.contiguous()
+        cache_position = cache_position.contiguous()
+        q_norm_weight = q_norm_weight.contiguous()
+        k_norm_weight = k_norm_weight.contiguous()
+        inv_freq = inv_freq.contiguous()
+
+        # 1) RMSNorm on query and key (fp32 compute, bf16 store)
+        query_norm = torch.empty

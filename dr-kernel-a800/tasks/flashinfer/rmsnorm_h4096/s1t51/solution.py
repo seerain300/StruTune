@@ -1,0 +1,140 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def row_norm_kernel(
+    x_ptr,          # *pointer to hidden_states
+    inv_rms_ptr,    # *pointer to output per-row inverse RMS (float32)
+    B,              # batch size (rows)
+    H,              # hidden size (columns)
+    EPS,            # epsilon (float32)
+    stride_x_row,   # stride for row in x
+    stride_x_col,   # stride for col in x
+    BLOCK_SIZE: tl.constexpr,  # base chunk size along columns
+    VEC: tl.constexpr,         # columns processed per iteration
+):
+    row_id = tl.program_id(0)  # one program per row
+    # Accumulate sum of squares in FP32
+    sum_sq = 0.0
+    # Loop over columns in tiles
+    for it in range(0, tl.cdiv(H, BLOCK_SIZE * VEC)):
+        col_start = it * BLOCK_SIZE * VEC
+        cols = col_start + tl.arange(0, BLOCK_SIZE * VEC)
+        mask = cols < H
+        # Compute per-tile offsets
+        x_offsets = row_id * stride_x_row + cols * stride_x_col
+        x_vals = tl.load(x_ptr + x_offsets, mask=mask, other=0.0)
+        x_vals = x_vals.to(tl.float32)
+        sum_sq += tl.sum(x_vals * x_vals, axis=0)
+    mean = sum_sq / H
+    inv = tl.rsqrt(mean + EPS)  # 1 / sqrt(mean + EPS)
+    tl.store(inv_rms_ptr + row_id, inv)
+
+
+@triton.jit
+def row_scale_kernel(
+    x_ptr,          # *pointer to hidden_states
+    w_ptr,          # *pointer to weight (float32)
+    inv_rms_ptr,    # *pointer to per-row inverse RMS (float32)
+    out_ptr,        # *pointer to output
+    B,              # batch size (rows)
+    H,              # hidden size (columns)
+    OUT_DTYPE: tl.constexpr,  # output dtype (tl.float16 or tl.bfloat16)
+    stride_x_row,   # stride for row in x
+    stride_x_col,   # stride for col in x
+    stride_out_row, # stride for row in out
+    stride_out_col, # stride for col in out
+    BLOCK_SIZE: tl.constexpr,  # base chunk size along columns
+    VEC: tl.constexpr,         # columns processed per iteration
+):
+    row_id = tl.program_id(0)  # one program per row
+    inv = tl.load(inv_rms_ptr + row_id)  # scalar FP32
+    for it in range(0, tl.cdiv(H, BLOCK_SIZE * VEC)):
+        col_start = it * BLOCK_SIZE * VEC
+        cols = col_start + tl.arange(0, BLOCK_SIZE * VEC)
+        mask = cols < H
+        x_offsets = row_id * stride_x_row + cols * stride_x_col
+        out_offsets = row_id * stride_out_row + cols * stride_out_col
+        x_vals = tl.load(x_ptr + x_offsets, mask=mask, other=0.0).to(tl.float32)
+        w_vals = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        y_vals = x_vals * inv * w_vals
+        # Cast to desired output dtype
+        if OUT_DTYPE == tl.bfloat16:
+            y_vals = y_vals.to(tl.bfloat16)
+        else:
+            y_vals = y_vals.to(tl.float16)  # default if not bfloat16
+        tl.store(out_ptr + out_offsets, y_vals, mask=mask)
+
+
+def _run_triton(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    # Ensure CUDA tensors
+    assert hidden_states.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors."
+    # Shapes
+    B, H = hidden_states.shape
+    # Compute in float32
+    x = hidden_states
+    w = weight
+    # Output tensor in original dtype
+    out = torch.empty_like(x)
+    # Allocate per-row inv_rms (float32)
+    inv_rms = torch.empty(B, device=x.device, dtype=torch.float32)
+    # Strides (assuming contiguous, but handle generic strides)
+    stride_x_row = x.stride(0)
+    stride_x_col = x.stride(1)
+    stride_out_row = out.stride(0)
+    stride_out_col = out.stride(1)
+
+    # Tuning params: these deliver good performance and keep loop overhead minimal for H=4096
+    BLOCK_SIZE = 512
+    VEC = 16  # columns processed per iteration (BLOCK_SIZE * VEC = 8192)
+    NUM_ITERS = triton.cdiv(H, BLOCK_SIZE * VEC)  # typically 1 for H=4096
+
+    # Kernel 1: compute per-row inv_rms
+    grid = (B,)
+    row_norm_kernel[grid](
+        x, inv_rms,
+        B, H, 1e-5,
+        stride_x_row, stride_x_col,
+        BLOCK_SIZE=BLOCK_SIZE, VEC=VEC,
+        num_warps=8, num_stages=2,
+    )
+
+    # Ensure weight is float32 for compute; out dtype based on input dtype
+    w_fp32 = w.to(torch.float32)
+
+    # Output dtype for store: match hidden_states dtype
+    if x.dtype == torch.bfloat16:
+        out_dtype = tl.bfloat16
+    elif x.dtype == torch.float16:
+        out_dtype = tl.float16
+    else:
+        out_dtype = tl.float32  # default
+
+    # Kernel 2: scale rows using inv_rms and weight
+    row_scale_kernel[grid](
+        x, w_fp32, inv_rms, out,
+        B, H,
+        OUT_DTYPE=out_dtype,
+        stride_x_row=stride_x_row, stride_x_col=stride_x_col,
+        stride_out_row=stride_out_row, stride_out_col=stride_out_col,
+        BLOCK_SIZE=BLOCK_SIZE, VEC=VEC,
+        num_warps=8, num_stages=2,
+    )
+    return out
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states, weight):
+        # Triton path: ensure CUDA and use kernels
+        # If inputs are on CPU, you can move to CUDA; here we assume evaluation provides CUDA tensors.
+        if not hidden_states.is_cuda:
+            hidden_states = hidden_states.cuda()
+        if not weight.is_cuda:
+            weight = weight.cuda()
+        return _run_triton(hidden_states, weight)
+
+
+def run(*args):
+    return ModelNew()(*args)

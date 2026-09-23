@@ -1,0 +1,240 @@
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def sort_stable_kernel(exp_ptr, wt_ptr, N, BLOCK: tl.constexpr):
+    """
+    Stable sort of arrays 'exp_ptr' (int64) and 'wt_ptr' (bfloat16) of length N
+    using odd-even transposition sort. Each program handles a block of indices.
+    """
+    pid = tl.program_id(0)
+    start = pid * BLOCK
+    idx = start + tl.arange(0, BLOCK)
+    in_bounds = idx < N
+
+    # Run N passes of odd-even sort
+    for t in range(0, N):
+        # Even phase: pairs (0,1), (2,3), ...
+        even_pairs = ((idx % 2) == 0) & (idx + 1 < N) & in_bounds
+        # Odd phase:  pairs (1,2), (3,4), ...
+        odd_pairs  = ((idx % 2) == 1) & (idx < N - 1) & in_bounds
+
+        # Load current and partner values
+        exp_i = tl.load(exp_ptr + idx, mask=in_bounds, other=0)
+        wt_i  = tl.load(wt_ptr  + idx, mask=in_bounds, other=tl.zeros((), dtype=tl.bfloat16))
+        exp_j = tl.load(exp_ptr + (idx + 1), mask=(idx + 1 < N), other=0)
+        wt_j  = tl.load(wt_ptr  + (idx + 1), mask=(idx + 1 < N), other=tl.zeros((), dtype=tl.bfloat16))
+
+        # Swap when out-of-order and within valid pairs
+        need_swap_even = even_pairs & (exp_i > exp_j)
+        need_swap_odd  = odd_pairs  & (exp_i > exp_j)
+
+        new_exp_i = tl.where(need_swap_even | need_swap_odd, exp_j, exp_i)
+        new_wt_i  = tl.where(need_swap_even | need_swap_odd, wt_j,  wt_i)
+        new_exp_j = tl.where(need_swap_even | need_swap_odd, exp_i, exp_j)
+        new_wt_j  = tl.where(need_swap_even | need_swap_odd, wt_i,  wt_j)
+
+        # Store results back
+        tl.store(exp_ptr + idx, new_exp_i, mask=in_bounds)
+        tl.store(wt_ptr  + idx, new_wt_i,  mask=in_bounds)
+        tl.store(exp_ptr + (idx + 1), new_exp_j, mask=(idx + 1 < N))
+        tl.store(wt_ptr  + (idx + 1), new_wt_j, mask=(idx + 1 < N))
+
+
+@triton.jit
+def bincount_kernel(arr_ptr, out_ptr, N, num_buckets: tl.constexpr):
+    """
+    Triton bincount of int32/ int64 array 'arr_ptr' of length N into 'out_ptr' of length num_buckets.
+    out_ptr is int32. We do one program per bucket with a loop over N.
+    Note: This is simple and correct; for very large N, a block-based reduction would be faster.
+    """
+    e = tl.program_id(0)  # bucket index
+    # Initialize count for this bucket
+    count = tl.zeros((), dtype=tl.int32)
+    # Loop over N elements and count occurrences of e
+    for i in range(0, N):
+        val = tl.load(arr_ptr + i)
+        # If val == e, increment count
+        count += (val == e).to(tl.int32)
+    tl.store(out_ptr + e, count)
+
+
+@triton.jit
+def cumsum_kernel(inp_ptr, out_ptr, L: tl.constexpr):
+    """
+    Triton prefix sum (cumsum) for int32 array 'inp_ptr' of length L into 'out_ptr' int64.
+    Single-program sequential scan.
+    """
+    # out[0] = inp[0]
+    out_ptr[0] = inp_ptr[0]
+    for i in range(1, L):
+        out_ptr[i] = out_ptr[i - 1] + inp_ptr[i]
+
+
+@triton.jit
+def bmm_forward_kernel_right(A_ptr, B_ptr, C_ptr,
+                             M, N, K,
+                             BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                             num_warps: tl.constexpr):
+    """
+    Triton kernel computing C = A @ B, where:
+      A: [M, K] (input batch per expert), bfloat16
+      B: [K, N] (per-expert weight), bfloat16
+      C: [M, N] (output per-expert), bfloat16
+    Uses tiles with fp32 accumulation. Each program computes a BLOCK_M x BLOCK_N tile of C.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, K, BLOCK_K):
+        k_idx = k_start + offs_k  # [BLOCK_K]
+        a_ptrs = A_ptr + (offs_m[:, None] * K + k_idx[None, :])
+        b_ptrs = B_ptr + (k_idx[:, None] * K + offs_n[None, :])
+
+        a_mask = (offs_m[:, None] < M) & (k_idx[None, :] < K)
+        b_mask = (k_idx[:, None] < K) & (offs_n[None, :] < N)
+
+        A_tile = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        B_tile = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(A_tile.to(tl.float32), B_tile.to(tl.float32))
+
+    c_ptrs = C_ptr + (offs_m[:, None] * N + offs_n[None, :])
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc.to(tl.bfloat16), mask=c_mask)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor,
+                selected_experts: torch.Tensor,
+                routing_weights: torch.Tensor,
+                expert_gate_weights: torch.Tensor,
+                expert_up_weights: torch.Tensor,
+                expert_down_weights: torch.Tensor):
+        """
+        hidden_states: [num_tokens, hidden_size], bfloat16
+        selected_experts: [num_tokens, K], int64
+        routing_weights: [num_tokens, K], bfloat16
+        expert_gate_weights: [num_experts, hidden_size, intermediate_size], bfloat16
+        expert_up_weights:    [num_experts, hidden_size, intermediate_size], bfloat16
+        expert_down_weights:  [num_experts, intermediate_size, hidden_size], bfloat16
+        """
+        device = hidden_states.device
+        num_tokens, hidden_size = hidden_states.shape
+        num_experts = expert_gate_weights.shape[0]
+        intermediate_size = expert_gate_weights.shape[2]
+        K = selected_experts.shape[1]
+
+        # Flatten selected_experts and routing_weights, ensure contiguity
+        selected_exp = selected_experts.reshape(-1).contiguous()          # [N], int64
+        routing_flat = routing_weights.reshape(-1).contiguous()           # [N], bfloat16
+        N = selected_exp.shape[0]
+
+        # 1) Triton stable sort: sort by selected_experts
+        BLOCK_SORT = 1024
+        grid_sort = (triton.cdiv(N, BLOCK_SORT),)
+        sorted_exp = torch.empty(N, dtype=torch.int64, device=device)
+        sorted_wt = torch.empty(N, dtype=torch.bfloat16, device=device)
+        sort_stable_kernel[grid_sort](selected_exp, routing_flat, N, BLOCK=BLOCK_SORT)
+
+        # 2) Triton bincount per expert
+        per_exp_counts = torch.empty(num_experts, dtype=torch.int32, device=device)
+        grid_bin = (num_experts,)
+        bincount_kernel[grid_bin](sorted_exp, per_exp_counts, N, num_buckets=num_experts)
+
+        # 3) Triton cumsum to get starts
+        starts = torch.empty(num_experts, dtype=torch.int64, device=device)
+        grid_cum = (num_experts,)
+        cumsum_kernel[grid_cum](per_exp_counts, starts, L=num_experts)
+
+        # 4) Compute capacity and token-to-expert mapping
+        total_selected = N
+        avg_tokens_per_expert = total_selected // num_experts
+        capacity = max(int(avg_tokens_per_expert * 1.25), 1)
+
+        # Per-expert counts as list for quick lookup
+        per_exp_counts_cpu = per_exp_counts.tolist()
+
+        # 5) Assemble per-expert inputs: PyTorch scatter-add (Triton lacks efficient dynamic scatter into 3D)
+        expert_inputs = torch.zeros((num_experts, capacity, hidden_size), dtype=torch.bfloat16, device=device)
+
+        # For each position in sorted list, map to original token and expert, and scatter hidden_states
+        # original_token = position // K (since we flattened tokens with K elements per token)
+        for p in range(N):
+            original_token = p // K
+            expert_id = int(sorted_exp[p].item())
+            pos = int(p - int(starts[expert_id].item()))  # position within expert after sorting
+            if pos < int(per_exp_counts_cpu[expert_id]) and pos < capacity:
+                expert_inputs[expert_id, pos] = hidden_states[original_token]
+
+        # 6) Compute per-expert gate_out, up_out, expert_outputs via Triton bmm for each selected token within capacity
+        result = torch.zeros((num_tokens, hidden_size), dtype=torch.bfloat16, device=device)
+
+        # Precompute gate and up weights pointers per expert
+        gate_w = expert_gate_weights
+        up_w   = expert_up_weights
+        down_w = expert_down_weights
+
+        # Launch Triton bmm per selected token within capacity for each expert
+        for p in range(N):
+            original_token = p // K
+            expert_id = int(sorted_exp[p].item())
+            pos = int(p - int(starts[expert_id].item()))
+            if pos < int(per_exp_counts_cpu[expert_id]) and pos < capacity:
+                # A: expert_inputs[expert_id, pos] -> [hidden_size]
+                A = expert_inputs[expert_id, pos].reshape(1, hidden_size).contiguous()
+                # Gate weight: [hidden_size, intermediate_size]
+                B_gate = gate_w[expert_id]
+                C_gate = torch.empty((1, intermediate_size), dtype=torch.bfloat16, device=device)
+                M_gate = A.shape[0] = 1
+                N_gate = B_gate.shape[1] = intermediate_size
+                K_gate = hidden_size
+                BLOCK_M = 1
+                BLOCK_N = 128
+                BLOCK_K = 32
+                grid_gate = (triton.cdiv(M_gate, BLOCK_M), triton.cdiv(N_gate, BLOCK_N))
+                bmm_forward_kernel_right[grid_gate](A, B_gate, C_gate, M_gate, N_gate, K_gate, BLOCK_M, BLOCK_N, BLOCK_K, num_warps=4)
+
+                # Up weight: [hidden_size, intermediate_size]
+                B_up = up_w[expert_id]
+                C_up = torch.empty((1, intermediate_size), dtype=torch.bfloat16, device=device)
+                M_up = 1
+                N_up = intermediate_size
+                K_up = hidden_size
+                grid_up = (triton.cdiv(M_up, BLOCK_M), triton.cdiv(N_up, BLOCK_N))
+                bmm_forward_kernel_right[grid_up](A, B_up, C_up, M_up, N_up, K_up, BLOCK_M, BLOCK_N, BLOCK_K, num_warps=4)
+
+                # Compute SiLU(gate_out) * up_out
+                # Convert to float32 for math, then back to bfloat16
+                gate_out = C_gate.to(torch.float32)
+                up_out = C_up.to(torch.float32)
+                activated = torch.sigmoid(gate_out) * up_out
+
+                # Down weight: [intermediate_size, hidden_size]
+                B_down = down_w[expert_id]
+                C_exp = torch.empty((1, hidden_size), dtype=torch.bfloat16, device=device)
+                M_exp = 1
+                N_exp = hidden_size
+                K_exp = intermediate_size
+                grid_exp = (triton.cdiv(M_exp, BLOCK_M), triton.cdiv(N_exp, BLOCK_N))
+                bmm_forward_kernel_right[grid_exp](activated.to(torch.bfloat16), B_down, C_exp, M_exp, N_exp, K_exp, BLOCK_M, BLOCK_N, BLOCK_K, num_warps=4)
+
+                # Weight for this token from sorted routing
+                wt_val = sorted_wt[p].item()
+                # Accumulate into result at original token
+                result[original_token] += C_exp[0] * wt_val
+
+        return result
+
+
+def run(*args):
+    return ModelNew()(*args)

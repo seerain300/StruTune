@@ -1,0 +1,424 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+# Kernel 1: Row-wise dense linear: out[b, s, h] = sum_k input[b, s, k] * weight[h, k] + bias[h]
+@triton.jit
+def triton_linear_row(input_ptr, weight_ptr, bias_ptr, out_ptr,
+                      B, S, H, head_dim,
+                      input_stride0, input_stride1, input_stride2,
+                      weight_stride0, weight_stride1,
+                      out_stride0, out_stride1, out_stride2,
+                      BLOCK_K: tl.constexpr):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    s = tl.program_id(2)
+
+    base_input = b * input_stride0 + s * input_stride1
+    base_out = b * out_stride0 + s * out_stride1 + h * out_stride2
+
+    acc = tl.zeros((), dtype=tl.float32)
+    for k0 in range(0, head_dim, BLOCK_K):
+        k = k0 + tl.arange(0, BLOCK_K)
+        mask_k = k < head_dim
+        x = tl.load(input_ptr + base_input + k * input_stride2, mask=mask_k, other=0.0)
+        w = tl.load(weight_ptr + h * weight_stride0 + k * weight_stride1, mask=mask_k, other=0.0)
+        acc += tl.sum(x * w, axis=0)
+
+    bval = tl.load(bias_ptr + h)
+    acc += bval
+    tl.store(out_ptr + base_out, acc)
+
+# Kernel 2: RMSNorm per row over last dim: out_row = weight[h] * x_row / sqrt(mean(x_row^2) + eps)
+@triton.jit
+def triton_rmsnorm_row(x_ptr, out_ptr, weight_ptr, eps, B, H, S,
+                        x_stride0, x_stride1,
+                        out_stride0, out_stride1,
+                        BLOCK_D: tl.constexpr):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    row_start = b * S
+    sum_sq = 0.0
+    for d in range(0, S, BLOCK_D):
+        offs = d + tl.arange(0, BLOCK_D)
+        mask = offs < S
+        x = tl.load(x_ptr + row_start + offs * x_stride1, mask=mask, other=0.0)
+        sum_sq += tl.sum(x * x, axis=0)
+
+    mean = sum_sq / S
+    inv_rms = 1.0 / tl.sqrt(mean + eps)
+    scale = tl.load(weight_ptr + h) * inv_rms
+
+    for d in range(0, S, BLOCK_D):
+        offs = d + tl.arange(0, BLOCK_D)
+        mask = offs < S
+        x = tl.load(x_ptr + row_start + offs * x_stride1, mask=mask, other=0.0)
+        y = x * scale
+        tl.store(out_ptr + b * out_stride0 + h * out_stride1 + offs * out_stride1, y, mask=mask)
+
+# Kernel 3: Apply RoPE to Q or K: q1, q2 = q[:64], q[64:], q_rot = [-q2, q1], q_out = q*cos + q_rot*sin
+@triton.jit
+def triton_rope_row(x_ptr, cos_ptr, sin_ptr, out_ptr,
+                    B, H, S, half_dim,
+                    x_stride0, x_stride1, x_stride2,
+                    cos_stride0, cos_stride1,
+                    sin_stride0, sin_stride1,
+                    out_stride0, out_stride1, out_stride2,
+                    BLOCK_D: tl.constexpr):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    s = tl.program_id(2)
+
+    base_x = b * x_stride0 + s * x_stride1 + h * x_stride2
+    base_out = b * out_stride0 + s * out_stride1 + h * out_stride2
+
+    for d0 in range(0, half_dim, BLOCK_D):
+        d = d0 + tl.arange(0, BLOCK_D)
+        mask = d < half_dim
+        # Load first half
+        x1 = tl.load(x_ptr + base_x + d, mask=mask, other=0.0)
+        # Load second half
+        x2 = tl.load(x_ptr + base_x + (half_dim + d), mask=mask, other=0.0)
+        # Load cos and sin for these positions
+        c = tl.load(cos_ptr + s * cos_stride0 + d * cos_stride1, mask=mask, other=0.0)
+        s_angle = tl.load(sin_ptr + s * sin_stride0 + d * sin_stride1, mask=mask, other=0.0)
+        # Rotate: [-x2, x1]
+        rotated = tl.cat([-x2, x1], axis=0)  # concat across vector dimension
+        # Combine: out = x1*cos + x2*sin + (-x2)*cos + x1*sin
+        # Simplify: out = (x1 + rotated[1:])*(cos) + (-x2 + rotated[0])*(sin)
+        # Note: rotated[0] is -x2, rotated[1:] is x1
+        rotated1 = rotated[0]  # -x2
+        rotated2 = rotated[1:]  # x1
+        out_vec = x1 * c + x2 * s_angle + rotated2 * c + rotated1 * s_angle
+        tl.store(out_ptr + base_out + d, out_vec, mask=mask)
+
+# Kernel 4: Expand KV from 8 heads to 96 groups (groups = H // 8 = 12)
+@triton.jit
+def triton_expand_kv_groups(K_ptr, V_ptr, outK_ptr, outV_ptr,
+                             B, H, S, head_dim,
+                             K_stride0, K_stride1, K_stride2, K_stride3,
+                             V_stride0, V_stride1, V_stride2, V_stride3,
+                             outK_stride0, outK_stride1, outK_stride2, outK_stride3,
+                             outV_stride0, outV_stride1, outV_stride2, outV_stride3,
+                             groups: tl.constexpr,  # 12
+                             BLOCK_D: tl.constexpr):
+    b = tl.program_id(0)
+    h_in = tl.program_id(1)
+    s = tl.program_id(2)
+    # h_out = h_in * groups + g
+    for g in range(0, groups):
+        h_out = h_in * groups + g
+        base_k = b * K_stride0 + h_in * K_stride1 + s * K_stride2
+        base_v = b * V_stride0 + h_in * V_stride1 + s * V_stride2
+        for d0 in range(0, head_dim, BLOCK_D):
+            d = d0 + tl.arange(0, BLOCK_D)
+            mask = d < head_dim
+            k = tl.load(K_ptr + base_k + d * K_stride3, mask=mask, other=0.0)
+            v = tl.load(V_ptr + base_v + d * V_stride3, mask=mask, other=0.0)
+            out_k = b * outK_stride0 + h_out * outK_stride1 + s * outK_stride2
+            out_v = b * outV_stride0 + h_out * outV_stride1 + s * outV_stride2
+            tl.store(outK_ptr + out_k + d * outK_stride3, k, mask=mask)
+            tl.store(outV_ptr + out_v + d * outV_stride3, v, mask=mask)
+
+# Kernel 5: Attention row-wise per (b, h, i): compute output[i] = sum_j softmax(scores[i,j]) * V[j]
+# We implement a two-pass softmax: first compute max over j, then l=sum(exp(scores - max)), then normalize and accumulate
+@triton.jit
+def triton_attention_row(Q_ptr, K_ptr, V_ptr, causal_ptr, out_ptr,
+                          B, H, S, head_dim,
+                          Q_stride0, Q_stride1, Q_stride2,
+                          K_stride0, K_stride1, K_stride2,
+                          V_stride0, V_stride1, V_stride2,
+                          causal_stride0, causal_stride1,
+                          out_stride0, out_stride1, out_stride2,
+                          scaling,
+                          BLOCK_J: tl.constexpr):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    i = tl.program_id(2)
+
+    # Compute max over j for numerical stability
+    m = -float('inf')
+    for j0 in range(0, S, BLOCK_J):
+        j = j0 + tl.arange(0, BLOCK_J)
+        mask_j = j < S
+        # Load Q[i, :]
+        q = tl.load(Q_ptr + b * Q_stride0 + i * Q_stride1 + h * Q_stride2, mask=True, other=0.0)  # scalar per row, broadcasting allowed
+        # Load K[j, :] (we need vector across j)
+        k = tl.load(K_ptr + b * K_stride0 + j * K_stride1 + h * K_stride2, mask=mask_j, other=0.0)
+        # Score = q · k = sum over head_dim
+        score_vec = tl.zeros((BLOCK_J,), dtype=tl.float32)
+        for d in range(0, head_dim):
+            qd = q[d]
+            kd = k[d]
+            score_vec += qd * kd
+        # Apply scaling
+        score_vec *= scaling
+        # Apply causal mask: read causal[i, j] = causal_ptr[i*causal_stride0 + j*causal_stride1]
+        causal_row = causal_ptr + i * causal_stride0
+        cmask = tl.load(causal_row + j * causal_stride1, mask=mask_j, other=-float('inf'))
+        score_vec = score_vec + cmask
+        # Update m
+        m = tl.maximum(m, tl.max(score_vec, axis=0))
+
+    # Compute l = sum(exp(score - m))
+    l = 0.0
+    for j0 in range(0, S, BLOCK_J):
+        j = j0 + tl.arange(0, BLOCK_J)
+        mask_j = j < S
+        q = tl.load(Q_ptr + b * Q_stride0 + i * Q_stride1 + h * Q_stride2, mask=True, other=0.0)
+        k = tl.load(K_ptr + b * K_stride0 + j * K_stride1 + h * K_stride2, mask=mask_j, other=0.0)
+        score_vec = tl.zeros((BLOCK_J,), dtype=tl.float32)
+        for d in range(0, head_dim):
+            qd = q[d]
+            kd = k[d]
+            score_vec += qd * kd
+        score_vec *= scaling
+        cmask = tl.load(causal_ptr + i * causal_stride0 + j * causal_stride1, mask=mask_j, other=-float('inf'))
+        score_vec = score_vec + cmask
+        exps = tl.exp(score_vec - m)
+        l += tl.sum(exps, axis=0)
+
+    # Now compute output[i] = sum_j (exp(score - m) / l) * V[j, :]
+    out_val = tl.zeros((), dtype=tl.float32)
+    for j0 in range(0, S, BLOCK_J):
+        j = j0 + tl.arange(0, BLOCK_J)
+        mask_j = j < S
+        q = tl.load(Q_ptr + b * Q_stride0 + i * Q_stride1 + h * Q_stride2, mask=True, other=0.0)
+        k = tl.load(K_ptr + b * K_stride0 + j * K_stride1 + h * K_stride2, mask=mask_j, other=0.0)
+        score_vec = tl.zeros((BLOCK_J,), dtype=tl.float32)
+        for d in range(0, head_dim):
+            qd = q[d]
+            kd = k[d]
+            score_vec += qd * kd
+        score_vec *= scaling
+        cmask = tl.load(causal_ptr + i * causal_stride0 + j * causal_stride1, mask=mask_j, other=-float('inf'))
+        score_vec = score_vec + cmask
+        probs = tl.exp(score_vec - m) / l
+        v = tl.load(V_ptr + b * V_stride0 + j * V_stride1 + h * V_stride2, mask=mask_j, other=0.0)
+        # out_val += sum(probs * v)
+        out_val += tl.sum(probs * v, axis=0)
+
+    tl.store(out_ptr + b * out_stride0 + h * out_stride1 + i * out_stride2, out_val)
+
+# Kernel 6: Create causal mask (float32) of shape [S, S]: mask[i, j] = -inf if i >= j else 0
+@triton.jit
+def triton_causal_mask(mask_ptr, S,
+                        mask_stride0, mask_stride1,
+                        BLOCK_J: tl.constexpr):
+    i = tl.program_id(0)
+    j_block = tl.program_id(1)
+    j = j_block * BLOCK_J + tl.arange(0, BLOCK_J)
+    mask_j = j < S
+    val = (i < j)  # True if i >= j
+    neg_inf = -float('inf')
+    zeros = 0.0
+    # Compute per element
+    # We store -inf where val is True, else 0
+    res = tl.where(val, neg_inf, zeros)
+    tl.store(mask_ptr + i * mask_stride0 + j * mask_stride1, res, mask=mask_j)
+
+# Kernel 7: Final output projection in Triton: out[b, s, :] = sum_h out_lin[b, s, h] * o_proj_weight[h, :]
+@triton.jit
+def triton_o_proj(out_lin_ptr, o_proj_ptr, out_ptr,
+                  B, S, H, out_dim,
+                  out_lin_stride0, out_lin_stride1, out_lin_stride2,
+                  o_proj_stride0, o_proj_stride1,
+                  out_stride0, out_stride1, out_stride2,
+                  BLOCK_H: tl.constexpr):
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+    base_out = b * out_stride0 + s * out_stride1
+    acc = tl.zeros((out_dim,), dtype=tl.float32)
+    for h0 in range(0, H, BLOCK_H):
+        h = h0 + tl.arange(0, BLOCK_H)
+        mask_h = h < H
+        # Load out_lin[b, s, h] vector
+        lin = tl.load(out_lin_ptr + b * out_lin_stride0 + s * out_lin_stride1 + h * out_lin_stride2, mask=mask_h, other=0.0)
+        # Load o_proj[h, :] vector of length out_dim
+        w = tl.load(o_proj_ptr + h * o_proj_stride0, mask=mask_h, other=0.0)  # shape [BLOCK_H]
+        acc += tl.sum(lin[:, None] * w[None, :], axis=0)  # sum over h
+    tl.store(out_ptr + base_out, acc)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_attention_heads=96, num_key_value_heads=8, head_dim=128, rms_norm_eps=1e-6):
+        super().__init__()
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim
+        self.scaling = 1.0 / (head_dim ** 0.5)
+        self.rms_norm_eps = rms_norm_eps
+        self.num_key_value_groups = num_attention_heads // num_key_value_heads  # 12
+
+    def forward(self,
+                hidden_states: torch.Tensor,
+                q_proj_weight: torch.Tensor,
+                q_proj_bias: torch.Tensor,
+                k_proj_weight: torch.Tensor,
+                k_proj_bias: torch.Tensor,
+                v_proj_weight: torch.Tensor,
+                v_proj_bias: torch.Tensor,
+                o_proj_weight: torch.Tensor,
+                q_norm_weight: torch.Tensor,
+                k_norm_weight: torch.Tensor,
+                cos: torch.Tensor,
+                sin: torch.Tensor):
+        device = hidden_states.device
+        B, S, _ = hidden_states.shape
+        H = self.num_attention_heads
+        head_dim = self.head_dim
+
+        # Allocate Q, K, V as [B, S, H]
+        Q = torch.empty((B, S, H), dtype=torch.float32, device=device)
+        K_raw = torch.empty((B, S, self.num_key_value_heads), dtype=torch.float32, device=device)
+        V_raw = torch.empty((B, S, self.num_key_value_heads), dtype=torch.float32, device=device)
+
+        # Launch dense linear kernels for Q, K, V
+        grid_q = (B, H, S)
+        triton_linear_row[grid_q](
+            hidden_states, q_proj_weight, q_proj_bias, Q,
+            B, S, H, head_dim,
+            hidden_states.stride(0), hidden_states.stride(1), hidden_states.stride(2),
+            q_proj_weight.stride(0), q_proj_weight.stride(1),
+            Q.stride(0), Q.stride(1), Q.stride(2),
+            BLOCK_K=128,
+            num_warps=4
+        )
+
+        grid_k = (B, self.num_key_value_heads, S)
+        triton_linear_row[grid_k](
+            hidden_states, k_proj_weight, k_proj_bias, K_raw,
+            B, S, self.num_key_value_heads, head_dim,
+            hidden_states.stride(0), hidden_states.stride(1), hidden_states.stride(2),
+            k_proj_weight.stride(0), k_proj_weight.stride(1),
+            K_raw.stride(0), K_raw.stride(1), K_raw.stride(2),
+            BLOCK_K=128,
+            num_warps=4
+        )
+
+        grid_v = (B, self.num_key_value_heads, S)
+        triton_linear_row[grid_v](
+            hidden_states, v_proj_weight, v_proj_bias, V_raw,
+            B, S, self.num_key_value_heads, head_dim,
+            hidden_states.stride(0), hidden_states.stride(1), hidden_states.stride(2),
+            v_proj_weight.stride(0), v_proj_weight.stride(1),
+            V_raw.stride(0), V_raw.stride(1), V_raw.stride(2),
+            BLOCK_K=128,
+            num_warps=4
+        )
+
+        # RMSNorm on Q and K
+        Q_norm = torch.empty_like(Q)
+        K_norm = torch.empty_like(K_raw)
+
+        grid_rmsQ = (B, H)
+        triton_rmsnorm_row[grid_rmsQ](
+            Q, Q_norm, q_norm_weight, self.rms_norm_eps, B, H, S,
+            Q.stride(0), Q.stride(1),
+            Q_norm.stride(0), Q_norm.stride(1),
+            BLOCK_D=128,
+            num_warps=4
+        )
+
+        grid_rmsK = (B, self.num_key_value_heads)
+        triton_rmsnorm_row[grid_rmsK](
+            K_raw, K_norm, k_norm_weight, self.rms_norm_eps, B, self.num_key_value_heads, S,
+            K_raw.stride(0), K_raw.stride(1),
+            K_norm.stride(0), K_norm.stride(1),
+            BLOCK_D=128,
+            num_warps=4
+        )
+
+        # Apply RoPE to Q and K
+        Q_rot = torch.empty_like(Q_norm)
+        K_rot = torch.empty_like(K_norm)
+
+        grid_ropeQ = (B, H, S)
+        triton_rope_row[grid_ropeQ](
+            Q_norm, cos, sin, Q_rot,
+            B, H, S, head_dim // 2,
+            Q_norm.stride(0), Q_norm.stride(1), Q_norm.stride(2),
+            cos.stride(0), cos.stride(1),
+            sin.stride(0), sin.stride(1),
+            Q_rot.stride(0), Q_rot.stride(1), Q_rot.stride(2),
+            BLOCK_D=128,
+            num_warps=4
+        )
+
+        grid_ropeK = (B, self.num_key_value_heads, S)
+        triton_rope_row[grid_ropeK](
+            K_norm, cos, sin, K_rot,
+            B, self.num_key_value_heads, S, head_dim // 2,
+            K_norm.stride(0), K_norm.stride(1), K_norm.stride(2),
+            cos.stride(0), cos.stride(1),
+            sin.stride(0), sin.stride(1),
+            K_rot.stride(0), K_rot.stride(1), K_rot.stride(2),
+            BLOCK_D=128,
+            num_warps=4
+        )
+
+        # Expand K/V from 8 heads to 96 groups (groups=12)
+        K_expanded = torch.empty((B, H, S, head_dim), dtype=torch.float32, device=device)
+        V_expanded = torch.empty((B, H, S, head_dim), dtype=torch.float32, device=device)
+
+        grid_expand = (B, self.num_key_value_heads, S)
+        triton_expand_kv_groups[grid_expand](
+            K_rot, V_raw, K_expanded, V_expanded,
+            B, self.num_key_value_heads, S, head_dim,
+            K_rot.stride(0), K_rot.stride(1), K_rot.stride(2),
+            V_raw.stride(0), V_raw.stride(1), V_raw.stride(2), V_raw.stride(3),
+            K_expanded.stride(0), K_expanded.stride(1), K_expanded.stride(2), K_expanded.stride(3),
+            V_expanded.stride(0), V_expanded.stride(1), V_expanded.stride(2), V_expanded.stride(3),
+            groups=self.num_key_value_groups,
+            BLOCK_D=128,
+            num_warps=4
+        )
+
+        # Create causal mask in Triton (float32)
+        causal_mask = torch.empty((S, S), dtype=torch.float32, device=device)
+        grid_mask = (S, S // 128 + 1)
+        triton_causal_mask[grid_mask](
+            causal_mask, S,
+            causal_mask.stride(0), causal_mask.stride(1),
+            BLOCK_J=128,
+            num_warps=4
+        )
+
+        # Attention output [B, H, S] float32
+        Out = torch.empty((B, H, S), dtype=torch.float32, device=device)
+
+        grid_attn = (B, H, S)
+        triton_attention_row[grid_attn](
+            Q_rot, K_expanded, V_expanded, causal_mask, Out,
+            B, H, S, head_dim,
+            Q_rot.stride(0), Q_rot.stride(1), Q_rot.stride(2),
+            K_expanded.stride(0), K_expanded.stride(1), K_expanded.stride(2),
+            V_expanded.stride(0), V_expanded.stride(1), V_expanded.stride(2),
+            causal_mask.stride(0), causal_mask.stride(1),
+            Out.stride(0), Out.stride(1), Out.stride(2),
+            self.scaling,
+            BLOCK_J=128,
+            num_warps=4
+        )
+
+        # Reshape and final projection: out_lin [B, S, H], o_proj_weight [H, H*head_dim]
+        out_lin = Out.transpose(1, 2).contiguous()  # [B, S, H]
+        out_dim = H * head_dim  # 96 * 128 = 12288
+        output = torch.empty((B, S, out_dim), dtype=torch.float32, device=device)
+
+        grid_o = (B, S)
+        triton_o_proj[grid_o](
+            out_lin, o_proj_weight, output,
+            B, S, H, out_dim,
+            out_lin.stride(0), out_lin.stride(1), out_lin.stride(2),
+            o_proj_weight.stride(0), o_proj_weight.stride(1),
+            output.stride(0), output.stride(1), output.stride(2),
+            BLOCK_H=64,
+            num_warps=4
+        )
+
+        return output
+
+
+def run(*args):
+    return ModelNew()(*args)

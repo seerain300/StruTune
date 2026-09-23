@@ -1,0 +1,103 @@
+import math
+import torch
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+@triton.jit
+def fused_gqa_row_kernel(
+    q_ptr,          # *bf16, [B, H, D]
+    k_ptr,          # *bf16, [Np, 1, K, D]
+    v_ptr,          # *bf16, [Np, 1, K, D]
+    indptr_ptr,     # *int32, [B+1]
+    indices_ptr,    # *int32, [num_tokens]
+    out_ptr,        # *bf16, [B, H, D]
+    lse_ptr,        # *fp32,  [B, H]
+    sm_scale,       # fp32
+    B: tl.constexpr,  # batch size
+    H: tl.constexpr,  # num_qo_heads = 32
+    D: tl.constexpr,  # head_dim = 128
+    K: tl.constexpr,  # num_kv_heads = 8
+):
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    # Grouped query attention mapping: each q head maps to a group of kv heads
+    gqa_ratio = H // K  # 4 for H=32, K=8
+    kv_head = pid_h // gqa_ratio  # 0..7
+
+    # Load q vector for this (b, h)
+    q_offset = pid_b * H * D + pid_h * D
+    q_vec = tl.load(q_ptr + q_offset).to(tl.float32)  # [D], fp32
+
+    # Load indptr[start, end]
+    start = tl.load(indptr_ptr + pid_b).to(tl.int32)
+    end = tl.load(indptr_ptr + pid_b + 1).to(tl.int32)
+    num_tokens = end - start
+
+    # Pass 1: compute lse using per-token dot products
+    sum_exp = 0.0
+    t = 0
+    while t < num_tokens:
+        idx = tl.load(indices_ptr + start + t).to(tl.int32)  # Triton int32 scalar
+        # k row pointer: [Np,1,K,D] layout, strides are (K*D, D, 1)
+        k_row_ptr = k_ptr + idx * (K * D) + kv_head * D  # Triton pointer with Triton scalars
+        k_row = tl.load(k_row_ptr + tl.arange(0, D), mask=tl.arange(0, D) < D, other=0.0).to(tl.float32)  # [D]
+        dot = tl.sum(q_vec * k_row, axis=0)  # scalar fp32
+        sum_exp += tl.exp(dot * sm_scale)
+        t += 1
+
+    lse_acc = tl.log(sum_exp) * (1.4426950408889634)  # log2(sum_exp) = log(sum_exp) / ln(2)
+
+    # Pass 2: compute output vector out[b, h, :] in fp32, then cast to bf16
+    out_vec = tl.zeros((D,), dtype=tl.float32)
+    t = 0
+    while t < num_tokens:
+        idx = tl.load(indices_ptr + start + t).to(tl.int32)
+        k_row_ptr = k_ptr + idx * (K * D) + kv_head * D
+        v_row_ptr = v_ptr + idx * (K * D) + kv_head * D
+        k_row = tl.load(k_row_ptr + tl.arange(0, D), mask=tl.arange(0, D) < D, other=0.0).to(tl.float32)  # [D]
+        v_row = tl.load(v_row_ptr + tl.arange(0, D), mask=tl.arange(0, D) < D, other=0.0).to(tl.float32)  # [D]
+
+        dot = tl.sum(q_vec * k_row, axis=0)  # scalar fp32
+        attn = tl.exp((dot - lse_acc) * sm_scale)
+        out_vec += attn * v_row
+        t += 1
+
+    # Store output as bfloat16
+    out_offset = pid_b * H * D + pid_h * D
+    tl.store(out_ptr + out_offset, out_vec.to(tl.bfloat16))
+
+    # Store lse (base-2)
+    lse_offset = pid_b * H + pid_h
+    tl.store(lse_ptr + lse_offset, (lse_acc * 1.4426950408889634))
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale):
+        # Ensure Triton is available and tensors are on CUDA
+        if not TRITON_AVAILABLE:
+            raise RuntimeError("Triton is not available")
+        device = q.device
+        assert device.type == "cuda", "Inputs must be on CUDA device"
+
+        # Shapes and asserts
+        B, H, D = q.shape
+        assert H == 32 and D == 128, "This Triton implementation expects H=32 and D=128"
+        assert k_cache.shape[1] == 1 and v_cache.shape[1] == 1, "num_pages must be 1 (indptr length indicates batch, but cache has 1 page)"
+        Np, _, K, _ = k_cache.shape
+        assert K == 8, "This Triton implementation expects K=8"
+        assert kv_indptr.shape[0] == B + 1, "kv_indptr shape must be [B+1]"
+
+        # Ensure contiguity
+        q = q.contiguous()
+        k_cache = k_cache.contiguous()
+
+
+def run(*args):
+    return ModelNew()(*args)

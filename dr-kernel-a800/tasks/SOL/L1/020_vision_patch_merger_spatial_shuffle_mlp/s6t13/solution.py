@@ -1,0 +1,214 @@
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _layer_norm_affine_kernel(
+    X_ptr,      # *bf16, input of shape [M, K] where M=num_patches, K=hidden_size
+    W_ptr,      # *bf16, ln_weight of shape [K]
+    B_ptr,      # *bf16, ln_bias of shape [K]
+    Out_ptr,    # *bf16, output of shape [M, K]
+    M: tl.constexpr,   # number of rows (patches)
+    K: tl.constexpr,   # hidden size (1536)
+    eps: tl.constexpr, # epsilon for LN
+    BLOCK: tl.constexpr
+):
+    # one program per row
+    pid = tl.program_id(0)
+    # compute sum and sum of squares in FP32
+    sum_val = 0.0
+    sum_sq = 0.0
+    for col in range(0, K, BLOCK):
+        offs = col + tl.arange(0, BLOCK)
+        mask = offs < K
+        x = tl.load(X_ptr + pid * K + offs, mask=mask, other=0.0).to(tl.float32)
+        sum_val += tl.sum(x, axis=0)
+        sum_sq += tl.sum(x * x, axis=0)
+    n = K
+    mean = sum_val / n
+    var = sum_sq / n - mean * mean
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    # second pass: normalize and apply affine
+    for col in range(0, K, BLOCK):
+        offs = col + tl.arange(0, BLOCK)
+        mask = offs < K
+        x = tl.load(X_ptr + pid * K + offs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W_ptr + offs, mask=mask, other=1.0).to(tl.float32)
+        b = tl.load(B_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        y = (x - mean) * inv_std
+        y = y * w + b
+        tl.store(Out_ptr + pid * K + offs, y.to(tl.bfloat16), mask=mask)
+
+
+@triton.jit
+def _gemm_bias_kernel(
+    A_ptr,           # *bf16, input matrix, shape [M, K]
+    B_ptr,           # *bf16, weight matrix, shape [N, K] (we compute A @ B^T by loading B[k, n])
+    Bias_ptr,        # *bf16, bias, shape [N]
+    C_ptr,           # *bf16, output matrix, shape [M, N]
+    M: tl.constexpr, # number of rows in A (and C)
+    N: tl.constexpr, # number of columns in C (and number of rows in Bias)
+    K: tl.constexpr, # feature dimension
+    BLOCK_M: tl.constexpr,  # e.g., 128
+    BLOCK_N: tl.constexpr,  # e.g., 128
+    BLOCK_K: tl.constexpr,  # e.g., 64
+):
+    # 2D launch grid: tile over M and N
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    m0 = pid_m * BLOCK_M
+    n0 = pid_n * BLOCK_N
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, K, BLOCK_K):
+        # load A tile: [BLOCK_M, BLOCK_K]
+        a_ptrs = A_ptr + m0 * K + (tl.arange(0, BLOCK_M)[:, None]) * K + (k0 + tl.arange(0, BLOCK_K))[None, :]
+        a = tl.load(a_ptrs, mask=(tl.arange(0, BLOCK_M)[:, None] < BLOCK_M) & ((k0 + tl.arange(0, BLOCK_K))[None, :] < K), other=0.0)
+        a = a.to(tl.float32)
+
+        # load B tile as B[n, k] with B_ptr[n*K + k]
+        b_ptrs = B_ptr + n0 * K + (k0 + tl.arange(0, BLOCK_K))[None, :] * N + (tl.arange(0, BLOCK_N)[:, None])
+        b = tl.load(b_ptrs, mask=((k0 + tl.arange(0, BLOCK_K))[None, :] < K) & (tl.arange(0, BLOCK_N)[:, None] < BLOCK_N), other=0.0)
+        b = b.to(tl.float32)
+
+        acc += tl.dot(a, b)  # (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N)
+
+    # add bias
+    bias = tl.load(Bias_ptr + n0 + tl.arange(0, BLOCK_N), mask=(tl.arange(0, BLOCK_N) < BLOCK_N), other=0.0).to(tl.float32)
+    acc = acc + bias[None, :]
+
+    # store
+    c_ptrs = C_ptr + m0 * N + (tl.arange(0, BLOCK_M)[:, None]) * N + (n0 + tl.arange(0, BLOCK_N)[None, :])
+    mask_c = (tl.arange(0, BLOCK_M)[:, None] < BLOCK_M) & (tl.arange(0, BLOCK_N)[None, :] < BLOCK_N)
+    tl.store(c_ptrs, acc.to(tl.bfloat16), mask=mask_c)
+
+
+@triton.jit
+def _gelu_kernel(
+    In_ptr,     # *bf16, input of shape [M, N]
+    Out_ptr,    # *bf16, output of shape [M, N]
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_N: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    m = pid_m
+    n0 = pid_n * BLOCK_N
+    x = tl.load(In_ptr + m * N + n0 + tl.arange(0, BLOCK_N), mask=(n0 + tl.arange(0, BLOCK_N) < N), other=0.0).to(tl.float32)
+    c = 0.7978845608028654  # sqrt(2/pi)
+    # tanh-based GELU approximation: 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+    x3 = x * x * x
+    inner = c * (x + 0.044715 * x3)
+    y = 0.5 * x * (1.0 + tl.math.tanh(inner))
+    tl.store(Out_ptr + m * N + n0 + tl.arange(0, BLOCK_N), y.to(tl.bfloat16), mask=(n0 + tl.arange(0, BLOCK_N) < N))
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, hidden: torch.Tensor, grid_thw: torch.Tensor,
+                ln_weight: torch.Tensor, ln_bias: torch.Tensor,
+                fc1_weight: torch.Tensor, fc1_bias: torch.Tensor,
+                fc2_weight: torch.Tensor, fc2_bias: torch.Tensor,
+                eps: float):
+        device = hidden.device
+        assert hidden.is_cuda and ln_weight.is_cuda and ln_bias.is_cuda and fc1_weight.is_cuda and fc1_bias.is_cuda and fc2_weight.is_cuda and fc2_bias.is_cuda, "All tensors must be on CUDA for Triton."
+
+        # 1) LayerNorm + affine (Triton)
+        num_patches, hidden_size = hidden.shape
+        ln_out = torch.empty_like(hidden, dtype=torch.bfloat16, device=device)
+        BLOCK_ln = 256
+        grid_ln = (num_patches,)
+        _layer_norm_affine_kernel[grid_ln](
+            hidden, ln_weight, ln_bias, ln_out,
+            M=num_patches, K=hidden_size, eps=eps,
+            BLOCK=BLOCK_ln,
+            num_warps=4, num_stages=2
+        )
+
+        # 2) Spatial packing: reshape to [num_patches//4, 4*hidden_size] (T=1, 2x2 merge)
+        # This is a view and does not move data; it is required by the original dataflow.
+        M_out = num_patches // 4
+        K = hidden_size
+        K_expanded = 4 * K
+        ln_out_view = ln_out.view(M_out, K_expanded)  # view is fine, no copy
+
+        # 3) fc1: (M_out, 6144) @ (6144, 6144)^T + bias -> (M_out, 6144) (here 6144 == K_expanded)
+        fc1_out = _launch_gemm_bias(ln_out_view, fc1_weight, fc1_bias, device)
+
+        # 4) GELU activation (Triton)
+        fc1_after_gelu = _launch_gelu(fc1_out, device)
+
+        # 5) fc2: (M_out, 6144) @ (3584, 6144)^T + bias -> (M_out, 3584)
+        out = _launch_fc2(fc1_after_gelu, fc2_weight, fc2_bias, device)
+
+        return out
+
+
+# Helper functions to launch Triton kernels
+def _launch_layer_norm(X: torch.Tensor, W: torch.Tensor, B: torch.Tensor, device: torch.device):
+    M, K = X.shape
+    Out = torch.empty_like(X, dtype=torch.bfloat16, device=device)
+    BLOCK = 256
+    grid = (M,)
+    _layer_norm_affine_kernel[grid](
+        X, W, B, Out,
+        M=M, K=K, eps=1e-6, BLOCK=BLOCK,
+        num_warps=4, num_stages=2
+    )
+    return Out
+
+
+def _launch_gemm_bias(A: torch.Tensor, W: torch.Tensor, Bias: torch.Tensor, device: torch.device):
+    # A: [M, K]; W: [N, K]; returns C: [M, N]
+    M = A.shape[0]
+    K = A.shape[1]
+    N = W.shape[0]
+    C = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    _gemm_bias_kernel[grid](
+        A, W, Bias, C,
+        M=M, N=N, K=K,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=4, num_stages=2
+    )
+    return C
+
+
+def _launch_gelu(X: torch.Tensor, device: torch.device):
+    M, N1 = X.shape
+    Y = torch.empty_like(X, dtype=torch.bfloat16, device=device)
+    BLOCK_N = 256
+    grid = (M, triton.cdiv(N1, BLOCK_N))
+    _gelu_kernel[grid](
+        X, Y,
+        M=M, N=N1, BLOCK_N=BLOCK_N,
+        num_warps=4, num_stages=2
+    )
+    return Y
+
+
+def _launch_fc2(X: torch.Tensor, W: torch.Tensor, Bias: torch.Tensor, device: torch.device):
+    M, K1 = X.shape
+    N2 = W.shape[0]  # output size, e.g., 3584
+    C = torch.empty((M, N2), dtype=torch.bfloat16, device=device)
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 64
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N2, BLOCK_N))
+    _gemm_bias_kernel[grid](
+        X, W, Bias, C,
+        M=M, N=N2, K=K1,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=4, num_stages=2
+    )
+    return C
+
+
+def run(*args):
+    return ModelNew()(*args)

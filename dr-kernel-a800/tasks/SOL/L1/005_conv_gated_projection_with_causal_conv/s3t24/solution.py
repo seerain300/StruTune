@@ -1,0 +1,266 @@
+import torch
+import triton
+import triton.language as tl
+
+
+# Kernel 1: Triple linear projection F.linear(x, in_proj_weight, in_proj_bias)
+# x: (B, S, H), in_proj_weight: (Nproj, H), in_proj_bias: (Nproj,), Nproj = 3 * H
+# output: BCx (B, S, Nproj), float32
+@triton.jit
+def triple_linear_kernel(
+    x_ptr,                  # *f32, shape (B, S, H)
+    in_proj_weight_ptr,     # *f32, shape (Nproj, H)
+    in_proj_bias_ptr,       # *f32, shape (Nproj,)
+    BCx_ptr,                # *f32, shape (B, S, Nproj)
+    B, S, H, Nproj,         # ints
+    stride_x_b, stride_x_s, stride_x_h,
+    stride_w_co, stride_w_ci,
+    stride_bc_b, stride_bc_s, stride_bc_co,
+):
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+    co = tl.program_id(2)  # output channel index in [0, Nproj)
+
+    if b >= B or s >= S or co >= Nproj:
+        return
+
+    acc = 0.0
+    # Reduction over H: acc = sum_{ci=0..H-1} x[b, s, ci] * in_proj_weight[co, ci]
+    for ci in range(0, H):
+        x_val = tl.load(x_ptr + b * stride_x_b + s * stride_x_s + ci * stride_x_h)
+        w_val = tl.load(in_proj_weight_ptr + co * stride_w_co + ci * stride_w_ci)
+        acc += x_val * w_val
+
+    # Add bias
+    bias_val = tl.load(in_proj_bias_ptr + co)
+    acc += bias_val
+
+    # Store to BCx[b, s, co]
+    tl.store(BCx_ptr + b * stride_bc_b + s * stride_bc_s + co * stride_bc_co, acc)
+
+
+# Kernel 2: Gating: Bx = B * x_proj
+# BCx: (B, 3H, S), we read B (channel 0) and x_proj (channel 1) and write Bx: (B, S, H)
+@triton.jit
+def gating_mul_kernel(
+    BCx_ptr,        # *f32, shape (B, 3H, S)
+    Bx_ptr,         # *f32, shape (B, S, H)
+    B, S, H,        # ints
+    stride_bcx_b, stride_bcx_c, stride_bcx_s,
+    stride_bx_b, stride_bx_s, stride_bx_h,
+):
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+    h = tl.program_id(2)  # output feature index (0..H-1)
+
+    if b >= B or s >= S or h >= H:
+        return
+
+    # Read B and x_proj from BCx: channel 0 and channel 1
+    B_val = tl.load(BCx_ptr + b * stride_bcx_b + 0 * stride_bcx_c + s * stride_bcx_s)
+    x_proj_val = tl.load(BCx_ptr + b * stride_bcx_b + 1 * stride_bcx_c + s * stride_bcx_s)
+
+    bx = B_val * x_proj_val
+    tl.store(Bx_ptr + b * stride_bx_b + s * stride_bx_s + h * stride_bx_h, bx)
+
+
+# Kernel 3: Grouped causal 1D convolution (depthwise, kernel_size=4), groups=H
+# Input conceptual as (B, H, S), weight (H, H, 4), bias (H,), output (B, H, S)
+@triton.jit
+def causal_conv_groups_kernel(
+    Bx_ptr,             # *f32, shape (B, S, H)
+    conv_weight_ptr,    # *f32, shape (H, H, 4)
+    conv_bias_ptr,      # *f32, shape (H,)
+    conv_out_ptr,       # *f32, shape (B, H, S)
+    B, S, H,            # ints
+    stride_bx_b, stride_bx_s, stride_bx_h,    # strides for (b, t, ci)
+    stride_w_go, stride_w_gi, stride_w_k,     # strides for weight
+    stride_out_b, stride_out_ci, stride_out_s,  # strides for (b, ci, t)
+):
+    b = tl.program_id(0)
+    ci = tl.program_id(1)  # output channel index (also input channel, groups=H)
+    if b >= B or ci >= H:
+        return
+
+    # Accumulator for (b, ci)
+    acc = 0.0
+
+    # Causal conv with kernel_size=4: y[b, ci, t] = sum_{k=0..3} w[ci, ci, k] * x[b, ci, t + k] + bias[ci]
+    for t in range(0, S):
+        # t + k might exceed S for k=1..3; masked loads handle that (return 0).
+        for k in range(0, 4):
+            pos = t + k
+            # For pos >= S, load 0.0
+            x_val = tl.load(
+                Bx_ptr + b * stride_bx_b + pos * stride_bx_s + ci * stride_bx_h,
+                mask=pos < S,
+                other=0.0,
+            )
+            w_val = tl.load(conv_weight_ptr + ci * stride_w_go + ci * stride_w_gi + k * stride_w_k)
+            acc += x_val * w_val
+
+    # Add bias
+    bias_val = tl.load(conv_bias_ptr + ci)
+    acc += bias_val
+
+    # Store to conv_out[b, ci, t]
+    tl.store(conv_out_ptr + b * stride_out_b + ci * stride_out_ci + t * stride_out_s, acc)
+
+
+# Kernel 4: Gating with C: y = C * conv_out
+# Read C from BCx[:, 2, :]
+@triton.jit
+def gating_mul_y_kernel(
+    BCx_ptr,        # *f32, shape (B, 3H, S)
+    conv_out_ptr,   # *f32, shape (B, H, S)
+    y_ptr,          # *f32, shape (B, S, H)
+    B, S, H,
+    stride_bcx_b, stride_bcx_c, stride_bcx_s,
+    stride_out_b, stride_out_ci, stride_out_s,
+    stride_y_b, stride_y_s, stride_y_h,
+):
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+    h = tl.program_id(2)
+
+    if b >= B or s >= S or h >= H:
+        return
+
+    C_val = tl.load(BCx_ptr + b * stride_bcx_b + 2 * stride_bcx_c + s * stride_bcx_s)
+    conv_val = tl.load(conv_out_ptr + b * stride_out_b + h * stride_out_ci + s * stride_out_s)
+
+    y_val = C_val * conv_val
+    tl.store(y_ptr + b * stride_y_b + s * stride_y_s + h * stride_y_h, y_val)
+
+
+# Kernel 5: Final linear projection F.linear(y, out_proj_weight, out_proj_bias)
+# y: (B, S, H), out_proj_weight: (H, H), out_proj_bias: (H,), output: (B, S, H)
+@triton.jit
+def linear_final_kernel(
+    y_ptr,             # *f32, shape (B, S, H)
+    out_proj_weight_ptr,# *f32, shape (H, H)
+    out_proj_bias_ptr,  # *f32, shape (H,)
+    out_ptr,           # *f32, shape (B, S, H)
+    B, S, H,           # ints
+    stride_y_b, stride_y_s, stride_y_h,
+    stride_w_oh, stride_w_oi,
+    stride_out_b, stride_out_s, stride_out_h,
+):
+    b = tl.program_id(0)
+    s = tl.program_id(1)
+    h = tl.program_id(2)
+
+    if b >= B or s >= S or h >= H:
+        return
+
+    acc = 0.0
+    # Output dimension oh = h (since weight is HxH and output is (B, S, H))
+    for oh in range(0, H):
+        y_val = tl.load(y_ptr + b * stride_y_b + s * stride_y_s + oh * stride_y_h)
+        w_val = tl.load(out_proj_weight_ptr + oh * stride_w_oh + h * stride_w_oi)
+        acc += y_val * w_val
+
+    bias_val = tl.load(out_proj_bias_ptr + h)
+    acc += bias_val
+
+    tl.store(out_ptr + b * stride_out_b + s * stride_out_s + h * stride_out_h, acc)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, x: torch.Tensor,
+                in_proj_weight: torch.Tensor,
+                in_proj_bias: torch.Tensor,
+                conv_weight: torch.Tensor,
+                conv_bias: torch.Tensor,
+                out_proj_weight: torch.Tensor,
+                out_proj_bias: torch.Tensor):
+        """
+        Triton-only implementation of the fused pipeline:
+        1) Triple linear: x -> (B, S, 3H)
+        2) Split into B, C, x_proj; gating Bx = B * x_proj
+        3) Grouped causal conv1d (kernel_size=4) on Bx, groups=H
+        4) Gating: y = C * conv_out
+        5) Final linear projection
+        """
+        device = x.device
+        dtype = torch.float32
+
+        # 1) Triple linear projection BCx: (B, S, 3H)
+        B, S, H = x.shape
+        Nproj = 3 * H
+
+        x32 = x.contiguous().to(dtype)
+        in_proj_w32 = in_proj_weight.contiguous().to(dtype)
+        in_proj_b32 = in_proj_bias.contiguous().to(dtype)
+
+        BCx = torch.empty((B, S, Nproj), device=device, dtype=dtype)
+        grid1 = (B, S, Nproj)
+        triple_linear_kernel[grid1](
+            x32, in_proj_w32, in_proj_b32, BCx,
+            B, S, H, Nproj,
+            x32.stride(0), x32.stride(1), x32.stride(2),
+            in_proj_w32.stride(0), in_proj_w32.stride(1),
+            BCx.stride(0), BCx.stride(1), BCx.stride(2),
+            num_warps=1, num_stages=1,
+        )
+
+        # 2) Gating: Bx = B * x_proj
+        # BCx is (B, 3H, S) for easy channel access
+        BCx_trans = BCx.permute(0, 2, 1).contiguous()  # (B, 3H, S)
+        Bx = torch.empty((B, S, H), device=device, dtype=dtype)
+        grid2 = (B, S, H)
+        gating_mul_kernel[grid2](
+            BCx_trans, Bx,
+            B, S, H,
+            BCx_trans.stride(0), BCx_trans.stride(1), BCx_trans.stride(2),
+            Bx.stride(0), Bx.stride(1), Bx.stride(2),
+            num_warps=1, num_stages=1,
+        )
+
+        # 3) Causal conv: conv_out (B, H, S)
+        # Input Bx conceptual (b, ci, t) via (b, t, ci)
+        Bx_for_conv = Bx.permute(0, 2, 1).contiguous()  # (B, S, H)
+        conv_w32 = conv_weight.contiguous().to(dtype)   # (H, H, 4)
+        conv_b32 = conv_bias.contiguous().to(dtype)     # (H,)
+        conv_out = torch.empty((B, H, S), device=device, dtype=dtype)
+        grid3 = (B, H)
+        causal_conv_groups_kernel[grid3](
+            Bx_for_conv, conv_w32, conv_b32, conv_out,
+            B, S, H,
+            Bx_for_conv.stride(0), Bx_for_conv.stride(1), Bx_for_conv.stride(2),  # (b, t, ci)
+            conv_w32.stride(0), conv_w32.stride(1), conv_w32.stride(2),
+            conv_out.stride(0), conv_out.stride(1), conv_out.stride(2),           # (b, ci, t)
+            num_warps=1, num_stages=1,
+        )
+
+        # 4) Gating with C: y = C * conv_out
+        y_perm = torch.empty((B, S, H), device=device, dtype=dtype)
+        grid4 = (B, S, H)
+        gating_mul_y_kernel[grid4](
+            BCx_trans, conv_out, y_perm,
+            B, S, H,
+            BCx_trans.stride(0), BCx_trans.stride(1), BCx_trans.stride(2),
+            conv_out.stride(0), conv_out.stride(1), conv_out.stride(2),
+            y_perm.stride(0), y_perm.stride(1), y_perm.stride(2),
+            num_warps=1, num_stages=1,
+        )
+
+        # 5) Final linear projection
+        out_proj_w32 = out_proj_weight.contiguous().to(dtype)  # (H, H)
+        out_proj_b32 = out_proj_bias.contiguous().to(dtype)    # (H,)
+        output = torch.empty((B, S, H), device=device, dtype=dtype)
+        grid5 = (B, S, H)
+        linear_final_kernel[grid5](
+            y_perm, out_proj_w32, out_proj_b32, output,
+            B, S, H,
+            y_perm.stride(0), y_perm.stride(1), y_perm.stride(2),
+            out_proj_w32.stride(0), out_proj_w32.stride(1),
+            output.stride(0), output.stride(1), output.stride(2),
+            num_warps=1, num_stages=1,
+        )
+
+        return output
+
+
+def run(*args):
+    return ModelNew()(*args)

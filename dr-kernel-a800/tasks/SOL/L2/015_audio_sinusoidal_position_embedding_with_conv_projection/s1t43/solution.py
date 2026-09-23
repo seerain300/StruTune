@@ -1,0 +1,248 @@
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+# Triton conv2d kernel: 3x3, stride=2, padding=1
+# Input: X(B, Cin, H, T) bfloat16
+# Weight: W(Cout, Cin, 3, 3) bfloat16
+# Bias: Bias(Cout) bfloat16
+# Output: Y(B, Cout, H_out, T_out) bfloat16, H_out=H//2, T_out=(T-3)//2+1
+@triton.jit
+def conv2d_3x3_stride2_padding1_kernel(
+    X_ptr,         # *const bfloat16
+    W_ptr,         # *const bfloat16
+    BIAS_ptr,      # *const bfloat16
+    Y_ptr,         # *bfloat16
+    B: tl.int32, Cin: tl.int32, H: tl.int32, T: tl.int32, Cout: tl.int32, T_out: tl.int32,
+    BLOCK_C: tl.constexpr,
+):
+    # Program IDs: over (B*H), tiles of Cout, and T_out
+    pid_m = tl.program_id(0)  # over B*H
+    pid_c = tl.program_id(1)  # tiles over Cout
+    pid_t = tl.program_id(2)  # over T_out
+
+    # Decode b and oh from pid_m
+    b = pid_m // H
+    oh = pid_m % H  # note: H_out == H//2, but oh still valid for indexing input/output mapping
+
+    # Output time index
+    t_out_idx = pid_t
+
+    # Tile of output channels
+    c_offsets = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    mask_c = c_offsets < Cout
+
+    # Accumulator for this tile of output channels
+    acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
+
+    # Loop over input channels and 3x3 kernel
+    for cin in range(Cin):
+        for kh in range(3):
+            # input height index for this kh
+            ih = oh + kh - 1
+            in_h_valid = (ih >= 0) & (ih < H)
+            for kt in range(3):
+                # input time index for this kt
+                it = t_out_idx + kt - 1
+                in_t_valid = (it >= 0) & (it < T)
+                if in_h_valid & in_t_valid:
+                    # Load X[b, cin, ih, it] as bfloat16 and cast to float32
+                    x_ptr = X_ptr + b * (Cin * H * T) + cin * (H * T) + ih * T + it
+                    x_val = tl.load(x_ptr, mask=True, other=0.0).to(tl.float32)
+
+                    # Load weights W[c_offsets, cin, kh, kt] and accumulate
+                    # W layout: [Cout, Cin, 3, 3] contiguous
+                    # offset = c * (Cin*3*3) + cin*(3*3) + kh*3 + kt
+                    for c_idx in range(BLOCK_C):
+                        c = c_offsets[c_idx]
+                        if mask_c[c_idx]:
+                            w_ptr = W_ptr + c * (Cin * 3 * 3) + cin * (3 * 3) + kh * 3 + kt
+                            w_val = tl.load(w_ptr, mask=True, other=0.0).to(tl.float32)
+                            acc[c_idx] += x_val * w_val
+
+    # Add bias
+    bias = tl.load(BIAS_ptr + c_offsets, mask=mask_c, other=0.0).to(tl.float32)
+    acc += bias
+
+    # Apply GELU (exact, erf-based)
+    inv_sqrt2 = 0.7071067811865476  # 1/sqrt(2)
+    gelu = 0.5 * acc * (1.0 + tl.math.erf(acc * inv_sqrt2))
+
+    # Store to Y[b, c_offsets, oh, t_out_idx] as bfloat16
+    # Y layout: [B, Cout, H_out, T_out] contiguous
+    # H_out = H // 2, T_out = (T - 3) // 2 + 1
+    y_ptr = Y_ptr + b * (Cout * (H // 2) * T_out) + c_offsets * ((H // 2) * T_out) + oh * T_out + t_out_idx
+    tl.store(y_ptr, gelu.to(tl.bfloat16), mask=mask_c)
+
+
+# Triton GELU (exact, erf-based) applied to a tensor Y
+# Input: Y flattened pointer (B*Cout*H_out*T_out), size N, output overwritten
+@triton.jit
+def gelu_erf_kernel(Y_ptr, N: tl.int32):
+    pid = tl.program_id(0)
+    if pid < N:
+        val = tl.load(Y_ptr + pid, mask=True, other=0.0).to(tl.float32)
+        inv_sqrt2 = 0.7071067811865476  # 1/sqrt(2)
+        gelu = 0.5 * val * (1.0 + tl.math.erf(val * inv_sqrt2))
+        tl.store(Y_ptr + pid, gelu.to(tl.bfloat16), mask=True)
+
+
+# Triton GEMM + positional embedding add for final linear projection
+# Inputs:
+#   X: (B, T, K) bfloat16 (we pass as float32 for compute), strides (stride_Xb, stride_Xt, stride_Xk)
+#   WT: (K, N) bfloat16 (conv_out_weight.T), strides (stride_WTk, stride_WTn)
+#   POS: (T, N) bfloat16 positional embedding slice, strides (stride_PosT, stride_PosN)
+# Output:
+#   Y: (B, T, N) bfloat16
+@triton.jit
+def gemm_add_pos_kernel(
+    X_ptr, WT_ptr, POS_ptr, Y_ptr,
+    B: tl.int32, T: tl.int32, K: tl.int32, N: tl.int32,
+    stride_Xb: tl.int32, stride_Xt: tl.int32, stride_Xk: tl.int32,
+    stride_WTk: tl.int32, stride_WTn: tl.int32,
+    stride_PosT: tl.int32, stride_PosN: tl.int32,
+    embed_scale: tl.float32,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # Grid: (B*T, tiles over N, tiles over K)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    b = pid_m // T
+    t = pid_m % T
+
+    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    k_offsets = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+
+    mask_n = n_offsets < N
+    mask_k = k_offsets < K
+
+    # Accumulator for this (b, t) row over N tile
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    # Loop over K in chunks and compute acc += sum_{kk} X[b,t,kk] * WT[kk, n_offsets]
+    for kk in range(0, K, BLOCK_K):
+        k_curr = k_offsets + kk
+        mask_k_curr = k_curr < K
+
+        # Load X[b, t, k_curr]
+        x_ptr = X_ptr + b * stride_Xb + t * stride_Xt + k_curr * stride_Xk
+        x_vals = tl.load(x_ptr, mask=mask_k_curr, other=0.0).to(tl.float32)
+
+        # Load WT[k_curr, n_offsets]
+        wt_ptrs = WT_ptr + k_curr[:, None] * stride_WTk + n_offsets[None, :] * stride_WTn
+        mask_2d = mask_k_curr[:, None] & mask_n[None, :]
+        wt_vals = tl.load(wt_ptrs, mask=mask_2d, other=0.0).to(tl.float32)
+
+        # Accumulate: acc += sum over k of x_vals[k] * wt_vals[k, :]
+        # x_vals shape: (BLOCK_K,) -> broadcast to (BLOCK_K, BLOCK_N) by multiplying wt_vals
+        acc += tl.sum(x_vals[:, None] * wt_vals, axis=0)
+
+    # Add scaled positional embedding for time index t: pos[b, t, n_offsets] scaled by embed_scale
+    pos_ptrs = POS_ptr + t * stride_PosT + n_offsets * stride_PosN
+    pos_vals = tl.load(pos_ptrs, mask=mask_n, other=0.0).to(tl.float32)
+    acc += pos_vals * embed_scale
+
+    # Store Y[b, t, n_offsets] as bfloat16
+    y_ptrs = Y_ptr + b * (T * N) + t * N + n_offsets
+    tl.store(y_ptrs, acc.to(tl.bfloat16), mask=mask_n)
+
+
+def triton_conv2d_3x3_stride2_padding1(X, W, bias, B, Cin, H, T, Cout, T_out):
+    # X: (B, Cin, H, T) bfloat16, W: (Cout, Cin, 3, 3) bfloat16, bias: (Cout)
+    y = torch.empty((B, Cout, H // 2, T_out), dtype=torch.bfloat16, device=X.device)
+    BLOCK_C = 64
+    grid = (B * (H // 2), triton.cdiv(Cout, BLOCK_C), T_out)
+    conv2d_3x3_stride2_padding1_kernel[grid](
+        X, W, bias, y,
+        B, Cin, H, T, Cout, T_out, BLOCK_C=BLOCK_C, num_warps=4, num_stages=2
+    )
+    return y
+
+
+def triton_gelu_erf(Y):
+    # Apply GELU in-kernel to tensor Y
+    N = Y.numel()
+    grid = (N,)
+    gelu_erf_kernel[grid](Y, N, num_warps=1, num_stages=1)
+
+
+def triton_gemm_add_pos(X, WT, POS, B, T, K, N, embed_scale):
+    # X: (B, T, K) bfloat16, WT: (K, N) bfloat16, POS: (T, N) bfloat16
+    # Compute Y = X @ WT (float32) + embed_scale * POS
+    Y = torch.empty((B, T, N), dtype=torch.bfloat16, device=X.device)
+    BLOCK_N = 64
+    BLOCK_K = 128
+    grid = (B * T, triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
+    gemm_add_pos_kernel[grid](
+        X, WT, POS, Y,
+        B, T, K, N,
+        X.stride(0), X.stride(1), X.stride(2),
+        WT.stride(0), WT.stride(1),
+        POS.stride(0), POS.stride(1),
+        embed_scale,
+        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=4, num_stages=2
+    )
+    return Y
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, input_features, conv2d1_weight, conv2d1_bias,
+                conv2d2_weight, conv2d2_bias,
+                conv2d3_weight, conv2d3_bias,
+                conv_out_weight, positional_embedding, embed_scale):
+        # All computation is done via Triton kernels
+
+        # Conv1: (B, 1, 80, time_dim) -> (B, 384, 40, T//2)
+        B, Cin, H, T = input_features.shape
+        Cout1 = conv2d1_weight.shape[0]  # 384
+        T1_out = (T - 3) // 2 + 1  # stride=2, padding=1
+        x1 = triton_conv2d_3x3_stride2_padding1(input_features, conv2d1_weight, conv2d1_bias, B, Cin, H, T, Cout1, T1_out)
+        # GELU
+        triton_gelu_erf(x1)
+
+        # Conv2: (B, 384, 40, T1_out) -> (B, 384, 20, T1_out//2)
+        H1 = H // 2
+        T2_in = T1_out
+        Cout2 = conv2d2_weight.shape[0]  # 384
+        T2_out = (T2_in - 3) // 2 + 1
+        x2 = triton_conv2d_3x3_stride2_padding1(x1, conv2d2_weight, conv2d2_bias, B, Cout1, H1, T2_in, Cout2, T2_out)
+        # GELU
+        triton_gelu_erf(x2)
+
+        # Conv3: (B, 384, 20, T2_out) -> (B, 384, 10, T2_out//2)
+        H2 = H1 // 2
+        T3_in = T2_out
+        Cout3 = conv2d3_weight.shape[0]  # 384
+        T3_out = (T3_in - 3) // 2 + 1
+        x3 = triton_conv2d_3x3_stride2_padding1(x2, conv2d3_weight, conv2d3_bias, B, Cout2, H2, T3_in, Cout3, T3_out)
+        # GELU
+        triton_gelu_erf(x3)
+
+        # Reshape: (B, t_after_conv, C*F) with C=384, F=40 -> K=15360
+        B3, C, H3, T3 = x3.shape
+        assert C == 384 and H3 == 20 and T3 == T3_out, "Conv3 shape mismatch"
+        K = C * 40  # F hardcoded as 40 as in original
+        x3_flat = x3.permute(0, 3, 1, 2).contiguous().view(B3, T3, K)  # (B, t_after_conv, 15360)
+
+        # Prepare WT = conv_out_weight.T (shape: (K, N_out)) where N_out=1024 in provided inputs
+        N_out = conv_out_weight.shape[0]  # 1024
+        WT = conv_out_weight.t().contiguous()  # (K, N_out)
+
+        # Select positional embedding slice up to T3
+        pos_emb = positional_embedding[:T3, :].contiguous().to(torch.bfloat16)  # (T3, 1024)
+
+        # GEMM + add scaled positional embedding
+        Y = triton_gemm_add_pos(x3_flat, WT, pos_emb, B3, T3, K, N_out, float(embed_scale))
+
+        return Y
+
+
+def run(*args):
+    return ModelNew()(*args)

@@ -1,0 +1,207 @@
+import torch
+import triton
+import triton.language as tl
+
+
+# Kernel 1: Create a 2D lower-triangular mask with diagonal=-1: 1 if j <= i, else 0.
+# Output: mask_ptr[K, K] int8
+@triton.jit
+def create_tril_mask_minus1(mask_ptr, K: tl.constexpr):
+    i = tl.program_id(0)
+    j = tl.program_id(1)
+    # Bounds check (grid will be exactly K x K)
+    if j <= i:
+        mask_val = 1
+    else:
+        mask_val = 0
+    tl.store(mask_ptr + i * K + j, mask_val)
+
+
+# Kernel 2: Compute masked cumsum (lower-triangular with diagonal=-1) and exp to produce L.
+# A: [B, H, N, K, K], mask: [K, K], L: [B, H, N, K, K]
+# For each (b,h,n,i): cumsum += A[b,h,n,i,j] if j <= i; store exp(cumsum) in L[b,h,n,i,j].
+@triton.jit
+def masked_cumsum_tril_exp(A_ptr, L_ptr, mask_ptr,
+                           B_batch, B_heads, B_n,
+                           A_stride_b, A_stride_h, A_stride_n, A_stride_i, A_stride_j,
+                           L_stride_b, L_stride_n, L_stride_i, L_stride_j, L_stride_h,
+                           mask_stride0, mask_stride1,
+                           K: tl.constexpr):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    n = tl.program_id(2)
+    i = tl.program_id(3)
+    cumsum = 0.0
+    # Loop over j
+    for j in range(K):
+        # Load mask for (i, j). mask is [K, K].
+        mask_ij = tl.load(mask_ptr + i * mask_stride0 + j * mask_stride1)
+        # If j <= i and mask==1, add A[b, h, n, i, j] to cumsum; else add 0
+        if (j <= i) and (mask_ij != 0):
+            a_off = b * A_stride_b + h * A_stride_h + n * A_stride_n + i * A_stride_i + j * A_stride_j
+            val = tl.load(A_ptr + a_off)
+            cumsum += val
+        l_off = b * L_stride_b + h * L_stride_h + n * L_stride_n + i * L_stride_i + j * L_stride_j
+        # Store exp(cumsum). For j > i, mask_ij==0 path will not add, but we still store exp(cumsum).
+        tl.store(L_ptr + l_off, tl.exp(cumsum))
+
+
+# Kernel 3: Contract B and C to form G: G[i, j, h] = sum over g and s of C[b,n,i,g,s] * B[b,n,j,g,s]
+# B: [B, N, K, n_groups, STATE_SIZE], C: [B, N, K, n_groups, STATE_SIZE]
+# G: [B, N, K, K, H]
+@triton.jit
+def contract_BC_to_G(B_ptr, C_ptr, G_ptr,
+                     B_batch, B_n, B_K, B_ng, B_STATE,
+                     G_stride_b, G_stride_n, G_stride_i, G_stride_j, G_stride_h,
+                     B_stride_b, B_stride_n, B_stride_k, B_stride_g, B_stride_s,
+                     C_stride_b, C_stride_n, C_stride_k, C_stride_g, C_stride_s,
+                     K: tl.constexpr, H: tl.constexpr, BLOCK_S: tl.constexpr):
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    h = tl.program_id(2)
+    for i in range(K):
+        for j in range(K):
+            acc = 0.0
+            # Accumulate over groups and state_size
+            for g in range(B_ng):
+                for s_start in range(0, B_STATE, BLOCK_S):
+                    s = s_start + tl.arange(0, BLOCK_S)
+                    mask_s = s < B_STATE
+                    B_off = b * B_stride_b + n * B_stride_n + j * B_stride_k + g * B_stride_g + s * B_stride_s
+                    C_off = b * C_stride_b + n * C_stride_n + i * C_stride_k + g * C_stride_g + s * C_stride_s
+                    B_vals = tl.load(B_ptr + B_off, mask=mask_s, other=0.0)
+                    C_vals = tl.load(C_ptr + C_off, mask=mask_s, other=0.0)
+                    acc += tl.sum(B_vals * C_vals, axis=0)
+            G_off = b * G_stride_b + n * G_stride_n + i * G_stride_i + j * G_stride_j + h * G_stride_h
+            tl.store(G_ptr + G_off, acc)
+
+
+# Kernel 4: Final reduction to produce Y_diag
+# Y_diag[b, n, i, h, d] = sum_j G[b, n, i, j, h] * L[b, h, n, j, i] * hidden[b, n, j, h, d]
+# hidden: [B, N, K, H, D], out: [B, N, K, H, D] (float32)
+@triton.jit
+def final_reduce(G_ptr, L_ptr, hidden_ptr, out_ptr,
+                 B_batch, B_n, B_K, B_H, B_D,
+                 G_stride_b, G_stride_n, G_stride_i, G_stride_j, G_stride_h,
+                 L_stride_b, L_stride_n, L_stride_i, L_stride_j, L_stride_h,
+                 hidden_stride_b, hidden_stride_n, hidden_stride_k, hidden_stride_h, hidden_stride_d,
+                 out_stride_b, out_stride_n, out_stride_k, out_stride_h, out_stride_d,
+                 K: tl.constexpr, D: tl.constexpr, BLOCK_D: tl.constexpr):
+    b = tl.program_id(0)
+    n = tl.program_id(1)
+    i = tl.program_id(2)
+    h = tl.program_id(3)
+    # Accumulate over j
+    for j in range(K):
+        g_val = tl.load(G_ptr + b * G_stride_b + n * G_stride_n + i * G_stride_i + j * G_stride_j + h * G_stride_h)
+        l_val = tl.load(L_ptr + b * L_stride_b + h * L_stride_h + n * L_stride_n + j * L_stride_j + i * L_stride_i)
+        # Sum over d in blocks
+        for d_start in range(0, D, BLOCK_D):
+            d = d_start + tl.arange(0, BLOCK_D)
+            mask_d = d < D
+            hidden_off = b * hidden_stride_b + n * hidden_stride_n + j * hidden_stride_k + h * hidden_stride_h + d * hidden_stride_d
+            hidden_vals = tl.load(hidden_ptr + hidden_off, mask=mask_d, other=0.0)
+            # out[b, n, i, h, d] += g_val * l_val * hidden_vals
+            out_off = b * out_stride_b + n * out_stride_n + i * out_stride_k + h * out_stride_h + d * out_stride_d
+            tl.store(out_ptr + out_off, g_val * l_val * hidden_vals, mask=mask_d)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor,
+                A_cumsum: torch.Tensor,
+                B: torch.Tensor,
+                C: torch.Tensor) -> torch.Tensor:
+        """
+        Triton-only implementation of the original computation.
+        hidden_states: [B, N, K, H, D]
+        A_cumsum: [B, H, N, K, K]
+        B: [B, N, K, n_groups, STATE_SIZE]
+        C: [B, N, K, n_groups, STATE_SIZE]
+        Returns: Y_diag: [B, N, K, H, D] (bfloat16)
+        """
+        # Infer shapes
+        B, N, K, H, D = hidden_states.shape
+        # A_cumsum must be [B, H, N, K, K]
+        assert A_cumsum.shape == (B, H, N, K, K), f"A_cumsum shape {A_cumsum.shape} != (B={B}, H={H}, N={N}, K={K}, K={K})"
+        # B and C must be [B, N, K, n_groups, STATE_SIZE]
+        assert B.shape == (B, N, K, B.shape[3], B.shape[4]), "B shape not [B, N, K, n_groups, STATE_SIZE]"
+        assert C.shape == (B, N, K, C.shape[3], C.shape[4]), "C shape not [B, N, K, n_groups, STATE_SIZE]"
+        n_groups = B.shape[3]
+        state_size = B.shape[4]
+        # Ensure REPEAT divides H so heads grouping is consistent
+        N_GROUPS = 8  # original code uses 8 groups
+        REPEAT = H // (N_GROUPS * H)  # original uses 4, but keep general
+        assert H % (N_GROUPS * REPEAT) == 0, f"H={H} must be divisible by N_GROUPS={N_GROUPS} * REPEAT={REPEAT}"
+
+        # Allocate intermediate buffers
+        tril_mask = torch.empty((K, K), dtype=torch.int8, device=hidden_states.device)
+        L = torch.empty((B, H, N, K, K), dtype=torch.float32, device=hidden_states.device)
+        G = torch.empty((B, N, K, K, H), dtype=torch.float32, device=hidden_states.device)
+        out = torch.empty((B, N, K, H, D), dtype=torch.float32, device=hidden_states.device)
+
+        # 1) Create lower-triangular mask with diagonal=-1
+        # Use a 2D grid over (K, K)
+        grid_mask = (K, K)
+        create_tril_mask_minus1[grid_mask](tril_mask, K)
+
+        # 2) Compute L from A_cumsum: masked cumsum and exp (and set upper triangle to 1)
+        # We'll use strides for A and L
+        A_stride_b, A_stride_h, A_stride_n, A_stride_i, A_stride_j = (
+            A_cumsum.stride(0), A_cumsum.stride(1), A_cumsum.stride(2), A_cumsum.stride(3), A_cumsum.stride(4)
+        )
+        L_stride_b, L_stride_n, L_stride_i, L_stride_j, L_stride_h = (
+            L.stride(0), L.stride(1), L.stride(2), L.stride(3), L.stride(4)
+        )
+        # Grid over (b, h, n, i)
+        grid_L = (B, H, N, K)
+        masked_cumsum_tril_exp[grid_L](
+            A_cumsum, L, tril_mask,
+            B, H, N,
+            A_stride_b, A_stride_h, A_stride_n, A_stride_i, A_stride_j,
+            L_stride_b, L_stride_n, L_stride_i, L_stride_j, L_stride_h,
+            tril_mask.stride(0), tril_mask.stride(1),
+            K
+        )
+
+        # 3) Contract B and C into G
+        # Strides for B, C, G
+        B_stride_b, B_stride_n, B_stride_k, B_stride_g, B_stride_s = B.stride(0), B.stride(1), B.stride(2), B.stride(3), B.stride(4)
+        C_stride_b, C_stride_n, C_stride_k, C_stride_g, C_stride_s = C.stride(0), C.stride(1), C.stride(2), C.stride(3), C.stride(4)
+        G_stride_b, G_stride_n, G_stride_i, G_stride_j, G_stride_h = G.stride(0), G.stride(1), G.stride(2), G.stride(3), G.stride(4)
+
+        grid_G = (B, N, H)
+        contract_BC_to_G[grid_G](
+            B, C, G,
+            B, N, K, n_groups, state_size,
+            G_stride_b, G_stride_n, G_stride_i, G_stride_j, G_stride_h,
+            B_stride_b, B_stride_n, B_stride_k, B_stride_g, B_stride_s,
+            C_stride_b, C_stride_n, C_stride_k, C_stride_g, C_stride_s,
+            K, H, 64  # BLOCK_S
+        )
+
+        # 4) Final reduction: out = sum_j G * L * hidden
+        hidden = hidden_states.to(torch.float32)
+        hidden_stride_b, hidden_stride_n, hidden_stride_k, hidden_stride_h, hidden_stride_d = (
+            hidden.stride(0), hidden.stride(1), hidden.stride(2), hidden.stride(3), hidden.stride(4)
+        )
+        out_stride_b, out_stride_n, out_stride_k, out_stride_h, out_stride_d = (
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4)
+        )
+
+        grid_out = (B, N, K, H)
+        final_reduce[grid_out](
+            G, L, hidden, out,
+            B, N, K, H, D,
+            G_stride_b, G_stride_n, G_stride_i, G_stride_j, G_stride_h,
+            L_stride_b, L_stride_n, L_stride_i, L_stride_j, L_stride_h,
+            hidden_stride_b, hidden_stride_n, hidden_stride_k, hidden_stride_h, hidden_stride_d,
+            out_stride_b, out_stride_n, out_stride_k, out_stride_h, out_stride_d,
+            K, D, 64  # BLOCK_D
+        )
+
+        # Cast output to bfloat16 to match original return dtype
+        return out.to(torch.bfloat16)
+
+
+def run(*args):
+    return ModelNew()(*args)

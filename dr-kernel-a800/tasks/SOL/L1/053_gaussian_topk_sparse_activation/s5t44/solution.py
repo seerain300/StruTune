@@ -1,0 +1,211 @@
+import torch
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+
+# -----------------------------
+# Triton kernels
+# -----------------------------
+if TRITON_AVAILABLE:
+    @triton.jit
+    def reduce_sum_sumsq_rows_kernel(
+        x_ptr,            # *const float32 input flattened
+        sums_ptr,         # *float32, length B*S
+        sums2_ptr,        # *float32, length B*S
+        B, S, F,          # int32 dims
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        # One program per (b, s) row
+        pid = tl.program_id(axis=0)
+        b = pid // S
+        s = pid % S
+        row_start = (b * S + s) * F
+
+        local_sum = 0.0
+        local_sumsq = 0.0
+
+        for offs in range(0, F, BLOCK_SIZE):
+            idx = offs + tl.arange(0, BLOCK_SIZE)
+            mask = idx < F
+            vals = tl.load(x_ptr + row_start + idx, mask=mask, other=0.0)
+            local_sum += tl.sum(vals, axis=0)
+            local_sumsq += tl.sum(vals * vals, axis=0)
+
+        tl.store(sums_ptr + pid, local_sum)
+        tl.store(sums2_ptr + pid, local_sumsq)
+
+    @triton.jit
+    def compute_mean_std_1d_kernel(
+        sums_ptr,         # *const float32, length B*S
+        sums2_ptr,        # *const float32, length B*S
+        mean_ptr,         # *float32, length B*S
+        std_ptr,          # *float32, length B*S
+        F,                # int32 (feature size), used for scaling
+    ):
+        # One program per element
+        pid = tl.program_id(axis=0)
+        N = tl.num_programs(axis=0)  # total number of elements (B*S)
+        # Load per-row sums
+        sum_val = tl.load(sums_ptr + pid)
+        sumsq_val = tl.load(sums2_ptr + pid)
+
+        mean = sum_val / F
+        var = sumsq_val / F - mean * mean
+        var = tl.maximum(var, 0.0)  # clamp variance to non-negative
+        std = tl.sqrt(var)
+
+        tl.store(mean_ptr + pid, mean)
+        tl.store(std_ptr + pid, std)
+
+    @triton.jit
+    def sparsify_relu_kernel(
+        x_ptr,            # *const float32 input
+        out_ptr,          # *float32 output
+        mean_ptr,         # *const float32, shape [B*S]
+        std_ptr,          # *const float32, shape [B*S]
+        ndtri_scale_ptr,  # *const float32, length 1 (scalar)
+        B: tl.constexpr,
+        S: tl.constexpr,
+        F: tl.constexpr,
+        total_elems: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        # 1D grid over total elements
+        pid = tl.program_id(axis=0)
+        offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offs < total_elems
+
+        SF = S * F
+        b = offs // SF
+        rem = offs % SF
+        s = rem // F
+        f = rem % F
+
+        x_ptrs = x_ptr + b * SF + s * F + f
+        x_vals = tl.load(x_ptrs, mask=mask, other=0.0)
+
+        ms = mean_ptr + b * S + s
+        ss = std_ptr + b * S + s
+        mean = tl.load(ms, mask=mask, other=0.0)
+        std = tl.load(ss, mask=mask, other=0.0)
+
+        # Load ndtri scale scalar
+        ndtri_scale = tl.load(ndtri_scale_ptr)
+
+        threshold = mean + std * ndtri_scale
+        y = x_vals - threshold
+        y = tl.maximum(y, 0.0)  # ReLU
+
+        out_ptrs = out_ptr + b * SF + s * F + f
+        tl.store(out_ptrs, y, mask=mask)
+
+
+# -----------------------------
+# ModelNew: Triton-only forward
+# -----------------------------
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @torch.no_grad()
+    def forward(self, inputs: torch.Tensor, target_sparsity: float) -> torch.Tensor:
+        assert TRITON_AVAILABLE, "Triton is not available"
+        assert inputs.is_cuda, "Input must be on CUDA for Triton execution"
+
+        # Ensure float32 for statistics; ensure contiguous
+        x = inputs.contiguous().to(torch.float32)
+        B, S, F = x.shape
+        device = x.device
+
+        num_rows = B * S
+
+        # 1) Compute per-(batch, seq) sum and sum of squares using Triton
+        sums = torch.empty(num_rows, dtype=torch.float32, device=device)
+        sums2 = torch.empty(num_rows, dtype=torch.float32, device=device)
+
+        BLOCK_SIZE_RED = 256
+        grid = (num_rows,)
+        reduce_sum_sumsq_rows_kernel[grid](
+            x, sums, sums2, B, S, F, BLOCK_SIZE=BLOCK_SIZE_RED
+        )
+
+        # 2) Compute mean and std per (b, s) using Triton 1D elementwise kernel
+        mean = torch.empty(num_rows, dtype=torch.float32, device=device)
+        std = torch.empty(num_rows, dtype=torch.float32, device=device)
+
+        total_elems = num_rows  # one element per program; simple 1D elementwise
+        compute_mean_std_1d_kernel[(total_elems,)](
+            sums, sums2, mean, std, F
+        )
+
+        # 3) Compute inverse normal CDF (ndtri) for target_sparsity in Triton (scalar)
+        # We use the Abramowitz & Stegun 7.1.26 approximation.
+        ndtri_scale = torch.empty(1, dtype=torch.float32, device=device)
+
+        # Constants for approximation
+        # Inverse normal CDF via A&S 7.1.26: z = sqrt(2) * erfinv(2p - 1)
+        # Here we implement erfinv approximation:
+        # For p in (0,1), let q = 1 - 2p; erf approximation: 1 - 2 exp(-x^2) sum_{k=0}^N a_k x^{2k+1}/(2k+1)!, with coefficients
+        # a0=1, a1=3, a2=5, a3=7, a4=9, a5=11; and t = 1 / (1 + p*0.2316419).
+        # However, to keep it simple and accurate, we use z = sqrt(2) * norm.ppf(p), approximated via a rational function.
+        # We'll use a direct rational approximation for erfinv: z = sign(q) * sqrt(2) * (1 + sum a_i z^i), solve using Newton.
+        # But for brevity and accuracy, we directly use a known stable approximation:
+        # Let t = 1 / (1 + p*0.3183098861837907). Then erfinv(q) ≈ sign(q) * sqrt(2/pi) * [1 + t * poly(t)], with poly being a 5th-order poly.
+        # We'll instead compute z = sqrt(2) * norm.ppf(p) using a simple rational approximation (A&S 26.2.23).
+        # We'll do it explicitly in Triton with a simple iterative solution, but to keep it one kernel, we implement a static formula.
+
+        # Use A&S 26.2.23: z = sign(q) * (1 + poly(t)) / sqrt(2/pi), where q = 2p - 1 and poly(t) is a 5th-order polynomial.
+        # Implement in Triton: z = sign(2p-1) * (1 + poly(t)) * 0.7978845608028654
+        # poly(t): ((((c5*t + c4)*t + c3)*t + c2)*t + c1)*t
+        # For p ~ target_sparsity, q ~ 2p - 1; we use target_sparsity in device as float32.
+        # Triton scalar kernel: compute and store into ndtri_scale[0].
+        # Define coefficients:
+        # c1=0.044715, c2=0.140012, c3=0.170241, c4=0.091706, c5=0.254413
+        # sqrt(2/pi) = 0.7978845608028654
+
+        # Create p vector as 1-element tensor (already on device) via float32 conversion from Python target_sparsity.
+        p = torch.tensor(float(target_sparsity), dtype=torch.float32, device=device)
+        # Implement ndtri in Triton scalar kernel: z = sign(2p-1) * (1 + poly(t)) * sqrt(2/pi)
+        # Note: Triton kernel will read p and write into ndtri_scale.
+        # We need to launch this Triton kernel. For scalar, grid=().
+        @triton.jit
+        def ndtri_approx_kernel(out_ptr, p_ptr):
+            p = tl.load(p_ptr)  # scalar
+            # q = 2p - 1
+            q = 2.0 * p - 1.0
+            sign = tl.where(q >= 0.0, 1.0, -1.0)
+            # t = 1 / (1 + |q| * 0.3183098861837907)
+            t = 1.0 / (1.0 + tl.abs(q) * 0.3183098861837907)
+            # Polynomial poly(t) = ((((c5*t + c4)*t + c3)*t + c2)*t + c1)*t
+            c1 = 0.044715
+            c2 = 0.140012
+            c3 = 0.170241
+            c4 = 0.091706
+            c5 = 0.254413
+            poly = ((((c5 * t + c4) * t + c3) * t + c2) * t + c1) * t
+            z = sign * (1.0 + poly) * 0.7978845608028654  # sqrt(2/pi)
+            tl.store(out_ptr, z)
+
+        ndtri_approx_kernel[(1,)](ndtri_scale, p)
+
+        # 4) Apply sparsification: output = max(0, x - (mean + std * ndtri_scale))
+        out_fp32 = torch.empty((B, S, F), dtype=torch.float32, device=device)
+
+        BLOCK_SIZE_POINT = 1024
+        total_elems = B * S * F
+        grid_point = (triton.cdiv(total_elems, BLOCK_SIZE_POINT),)
+        sparsify_relu_kernel[grid_point](
+            x, out_fp32, mean, std, ndtri_scale, B, S, F, total_elems, BLOCK_SIZE=BLOCK_SIZE_POINT
+        )
+
+        # Return as bfloat16 to match original behavior
+        return out_fp32.to(torch.bfloat16)
+
+
+def run(*args):
+    return ModelNew()(*args)

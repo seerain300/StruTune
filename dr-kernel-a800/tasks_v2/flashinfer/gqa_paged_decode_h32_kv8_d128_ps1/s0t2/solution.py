@@ -1,0 +1,201 @@
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+# Triton kernel: compute per-token logits for a given (b, h)
+# Grid: (num_tokens,)
+# Inputs:
+#   q_ptr:       *f32, [D] pointer to q[b, h, :]
+#   k_ptr:       *f32, [num_tokens, D] pointer to K gathered per token
+#   logits_ptr:  *f32, [num_tokens] output buffer
+#   num_tokens:  i32
+#   D:           i32
+#   sm_scale:    f32
+@triton.jit
+def _compute_logits_kernel_2d(
+    q_ptr,               # *f32, [D]
+    k_ptr,               # *f32, [num_tokens, D]
+    logits_ptr,          # *f32, [num_tokens]
+    num_tokens,          # i32
+    D,                   # i32
+    sm_scale,            # f32
+    BLOCK_SIZE: tl.constexpr,
+):
+    t = tl.program_id(0)
+    if t >= num_tokens:
+        return
+    acc = 0.0
+    # Iterate over head_dim in chunks
+    for offs in range(0, D, BLOCK_SIZE):
+        idx = offs + tl.arange(0, BLOCK_SIZE)
+        mask = idx < D
+        q_vec = tl.load(q_ptr + idx, mask=mask, other=0.0)
+        k_vec = tl.load(k_ptr + t * D + idx, mask=mask, other=0.0)
+        acc += tl.sum(q_vec * k_vec, axis=0)
+    tl.store(logits_ptr + t, acc * sm_scale)
+
+
+# Triton kernel: compute output vector for (b, h) using softmax over scaled logits
+# Grid: (num_tokens,)
+# Inputs:
+#   logits_ptr:    *f32, [num_tokens]
+#   v_ptr:         *f32, [num_tokens, D]
+#   out_ptr:       *f32, [D]
+# Outputs:
+#   out_ptr[i] = sum_t softmax(logits_scaled)[t] * v_ptr[t, i]
+@triton.jit
+def _compute_out_atomic_kernel_2d(
+    logits_ptr,  # *f32, [num_tokens]
+    v_ptr,       # *f32, [num_tokens, D]
+    out_ptr,     # *f32, [D]
+    num_tokens,  # i32
+    D,           # i32
+):
+    t = tl.program_id(0)
+    if t >= num_tokens:
+        return
+    # Compute exp and sum for normalization
+    sum_exp = 0.0
+    for tt in range(0, num_tokens):
+        sum_exp += tl.exp(logits_ptr[tt])
+    # Load q scaled value and compute attn
+    x_t = tl.exp(logits_ptr[t])
+    attn_t = x_t / sum_exp
+    v_vec = tl.load(v_ptr + t * D + tl.arange(0, D))
+    # Atomically accumulate into out_ptr
+    for i in range(0, D):
+        tl.atomic_add(out_ptr + i, attn_t * v_vec[i])
+
+
+# Triton kernel: compute lse[b, h] = logsumexp(logits_scaled) / ln(2)
+# Grid: (B, Hq)
+# Inputs:
+#   logits_ptr:    *f32, [B * Hq * MAX_TOKS] but we pass per-(b,h) vector; host ensures pointer layout
+#   b_idx:         i32
+#   h_idx:         i32
+#   num_toks:      i32
+#   lse_ptr:       *f32, [B * Hq] to write lse
+#   MAX_TOKS:      i32 (runtime const for loop bound)
+@triton.jit
+def _lse_atomic_kernel_2d(
+    logits_ptr,  # *f32, [num_tokens]
+    b_idx,       # i32
+    h_idx,       # i32
+    num_toks,    # i32
+    lse_ptr,     # *f32, [B * Hq]
+    MAX_TOKS: tl.constexpr,
+):
+    # Online logsumexp across first num_toks entries
+    max_val = -float('inf')
+    sum_exp = 0.0
+    for t in range(0, MAX_TOKS):
+        if t >= num_toks:
+            break
+        x = tl.load(logits_ptr + t)
+        if x > max_val:
+            sum_exp = sum_exp * tl.exp(max_val - x) + 1.0
+            max_val = x
+        else:
+            sum_exp += tl.exp(x - max_val)
+    lse = max_val + tl.log(sum_exp) / tl.log(2.0)
+    # Write to lse_ptr[b, h]
+    out_index = b_idx * Hq + h_idx
+    tl.store(lse_ptr + out_index, lse)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, head_dim=128, num_qo_heads=32, num_kv_heads=8, sm_scale=1.0 / math.sqrt(128)):
+        super().__init__()
+        self.head_dim = head_dim
+        self.num_qo_heads = num_qo_heads
+        self.num_kv_heads = num_kv_heads
+        self.gqa_ratio = num_qo_heads // num_kv_heads
+        self.sm_scale = float(sm_scale)
+        self.BLOCK_SIZE = 128  # matches head_dim
+
+    def forward(self, q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale=None):
+        # Ensure inputs are on CUDA for Triton
+        assert q.is_cuda, "q must be on CUDA for Triton"
+        assert k_cache.is_cuda, "k_cache must be on CUDA for Triton"
+        assert v_cache.is_cuda, "v_cache must be on CUDA for Triton"
+        assert kv_indptr.is_cuda, "kv_indptr must be on CUDA for Triton"
+        assert kv_indices.is_cuda, "kv_indices must be on CUDA for Triton"
+
+        B = q.shape[0]
+        Hq = q.shape[1]
+        D = q.shape[2]
+        assert D == self.head_dim, "head_dim mismatch"
+        assert Hq == self.num_qo_heads, "num_qo_heads mismatch"
+
+        # Flatten K/V: [num_pages, 1, num_kv_heads, D] -> [num_pages, num_kv_heads, D]
+        # We will gather per token using kv_indices.
+        k_cache = k_cache.squeeze(1).contiguous()  # [P, Hk, D]
+        v_cache = v_cache.squeeze(1).contiguous()  # [P, Hk, D]
+        P, Hk, D2 = k_cache.shape
+        assert D2 == D, "k_cache dimension mismatch"
+        assert Hk == self.num_kv_heads, "num_kv_heads mismatch"
+
+        # Prepare output and lse
+        output = torch.zeros((B, Hq, D), dtype=torch.bfloat16, device=q.device)
+        lse = torch.full((B, Hq), -float("inf"), dtype=torch.float32, device=q.device)
+
+        # Process each batch b
+        for b in range(B):
+            # Determine token range for this batch
+            start = int(kv_indptr[b].item())
+            end = int(kv_indptr[b + 1].item())
+            num_tokens = end - start
+            if num_tokens <= 0:
+                continue
+
+            # Gather token indices for this batch
+            token_indices = kv_indices[start:end].to(torch.int32).contiguous()  # [num_tokens]
+
+            # Compute q vector for this batch and head mapping
+            # We need a 2D loop over heads; Triton kernels are launched per (b, h)
+            for h in range(Hq):
+                kv_head = h // self.gqa_ratio  # GQA mapping
+
+                # Prepare q vector: q[b, h, :]
+                q_vec = q[b, h, :].to(torch.float32).contiguous()  # [D]
+
+                # Gather K and V vectors for each token
+                # k_cache[token_indices, kv_head, :] -> [num_tokens, D]
+                k_rows = k_cache[token_indices, kv_head, :].contiguous()  # [num_tokens, D]
+                v_rows = v_cache[token_indices, kv_head, :].contiguous()  # [num_tokens, D]
+
+                # Allocate buffers
+                logits = torch.empty(num_tokens, dtype=torch.float32, device=q.device)
+                out_vec = torch.zeros(D, dtype=torch.float32, device=q.device)
+
+                # Launch Triton kernels
+                # Kernel 1: compute logits
+                _compute_logits_kernel_2d[(num_tokens,)](
+                    q_vec, k_rows, logits, num_tokens, D, self.sm_scale if sm_scale is None else float(sm_scale), self.BLOCK_SIZE
+                )
+
+                # Kernel 2: compute output vector using atomics
+                _compute_out_atomic_kernel_2d[(num_tokens,)](
+                    logits, v_rows, out_vec, num_tokens, D
+                )
+
+                # Store output
+                # out_vec is float32; cast to bfloat16 and write to output[b, h, :]
+                output[b, h, :] = out_vec.to(torch.bfloat16)
+
+                # Kernel 3: compute lse
+                # lse per (b, h) = logsumexp(logits * sm_scale) / ln(2)
+                # For Triton kernel, pass the logits buffer and perform online reduction
+                # We must ensure MAX_TOKS >= num_tokens; Triton will loop up to MAX_TOKS and break at num_tokens.
+                # We set MAX_TOKS to num_tokens for exact loop bound; Triton allows runtime integers in constexpr context.
+                _lse_atomic_kernel_2d[(1,)](
+                    logits, b, h, num_tokens, lse, num_tokens
+                )
+
+        return output, lse
+
+
+def run(*args):
+    return ModelNew()(*args)

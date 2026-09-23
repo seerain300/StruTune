@@ -1,0 +1,325 @@
+import torch
+import torch.nn as nn
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except Exception:
+    TRITON_AVAILABLE = False
+
+# Triton kernel: dense linear Y = X @ W^T + B
+# X: [M, K], W: [N, K], B: [N], Y: [M, N]
+@triton.jit
+def linear_kernel_2d(
+    X_ptr, W_ptr, B_ptr, Y_ptr,
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    stride_xm, stride_xk,
+    stride_w0, stride_w1,
+    stride_ym, stride_yn,
+    BLOCK_K: tl.constexpr,
+):
+    m = tl.program_id(axis=0)
+    n = tl.program_id(axis=1)
+    acc = tl.zeros((), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        offs = k0 + tl.arange(0, BLOCK_K)
+        x = tl.load(X_ptr + m * stride_xm + offs * stride_xk, mask=offs < K, other=0.0)
+        w = tl.load(W_ptr + n * stride_w0 + offs * stride_w1, mask=offs < K, other=0.0)
+        acc += tl.sum(x * w, axis=0)
+    b = tl.load(B_ptr + n)
+    tl.store(Y_ptr + m * stride_ym + n * stride_yn, acc)
+
+
+# Triton kernel: RMSNorm per (b, h, s, d)
+# X: [B, H, S, D], W: [D], Y: [B, H, S, D]
+@triton.jit
+def rmsnorm_kernel(
+    X_ptr, W_ptr, Y_ptr,
+    B: tl.constexpr, H: tl.constexpr, S: tl.constexpr, D: tl.constexpr,
+    stride_xb, stride_xh, stride_xs, stride_xd,
+    stride_yb, stride_yh, stride_ys, stride_yd,
+    eps: tl.float32,
+):
+    b = tl.program_id(axis=0)
+    h = tl.program_id(axis=1)
+    s = tl.program_id(axis=2)
+    d = tl.program_id(axis=3)
+    x = tl.load(X_ptr + b * stride_xb + h * stride_xh + s * stride_xs + d * stride_xd).to(tl.float32)
+    sum_sq = tl.sum(x * x, axis=0)
+    mean_sq = sum_sq / D
+    inv_rms = tl.rsqrt(mean_sq + eps)
+    w = tl.load(W_ptr + d).to(tl.float32)
+    y = (x * inv_rms) * w
+    tl.store(Y_ptr + b * stride_yb + h * stride_yh + s * stride_ys + d * stride_yd, y)
+
+
+# Triton kernel: apply rotation (RoPE) for last dim D=128, split into two halves (64,64)
+# X: [B, H, S, D], C: [S, D/2], S: [S, D/2], Y: [B, H, S, D]
+@triton.jit
+def rotate_half_kernel(
+    X_ptr, C_ptr, S_ptr, Y_ptr,
+    B: tl.constexpr, H: tl.constexpr, S: tl.constexpr, D: tl.constexpr,
+    stride_xb, stride_xh, stride_xs, stride_xd,
+    stride_yb, stride_yh, stride_ys, stride_yd,
+    stride_c0, stride_c1,     # cos strides: [S, D/2]
+    stride_s0, stride_s1,     # sin strides: [S, D/2]
+):
+    b = tl.program_id(axis=0)
+    h = tl.program_id(axis=1)
+    s = tl.program_id(axis=2)
+    d = tl.program_id(axis=3)
+    x = tl.load(X_ptr + b * stride_xb + h * stride_xh + s * stride_xs + d * stride_xd).to(tl.float32)
+    # split into two halves
+    q1 = x[:64]
+    q2 = x[64:]
+    rotated_half = tl.cat((-q2, q1), axis=0)  # [128]
+    cos = tl.load(C_ptr + s * stride_c0 + d // 2 * stride_c1).to(tl.float32)
+    sin = tl.load(S_ptr + s * stride_s0 + d // 2 * stride_s1).to(tl.float32)
+    y = x * cos + rotated_half * sin
+    tl.store(Y_ptr + b * stride_yb + h * stride_yh + s * stride_ys + d * stride_yd, y)
+
+
+# Triton kernel: compute attention scores S[b, h, i, j] = Q[b,h,i,:] @ K[b,h,j,:] * scaling
+# X: Q shaped [B, H, S, 128], W: K shaped [B, H, S, 128], Y: S shaped [B, H, S, S]
+@triton.jit
+def attn_scores_kernel(
+    Q_ptr, K_ptr, S_ptr,
+    B: tl.constexpr, H: tl.constexpr, S: tl.constexpr,
+    stride_qb, stride_qh, stride_qs, stride_qd,
+    stride_kb, stride_kh, stride_ks, stride_kd,
+    stride_sb, stride_sh, stride_ss, stride_sd,
+    scaling: tl.float32,
+):
+    b = tl.program_id(axis=0)
+    h = tl.program_id(axis=1)
+    i = tl.program_id(axis=2)
+    for j in range(0, S):
+        q = tl.load(Q_ptr + b * stride_qb + h * stride_qh + i * stride_qs + tl.arange(0, 128) * stride_qd)
+        k = tl.load(K_ptr + b * stride_kb + h * stride_kh + j * stride_ks + tl.arange(0, 128) * stride_kd)
+        dot = tl.sum(q * k, axis=0)
+        score = dot * scaling
+        # causal mask: if i >= j, set to -inf
+        score = tl.where(i >= j, score, -float('inf'))
+        tl.store(S_ptr + b * stride_sb + h * stride_sh + i * stride_ss + j * stride_sd, score)
+
+
+# Triton kernel: softmax per row Soft[b, h, i, :] in-place, then Out[b, h, i, :] = sum_j soft_j * V[b,h,j,:]
+@triton.jit
+def softmax_out_kernel(
+    Soft_ptr, V_ptr, Out_ptr,
+    B: tl.constexpr, H: tl.constexpr, S: tl.constexpr,
+    stride_sb, stride_sh, stride_ss, stride_sd,
+    stride_vb, stride_vh, stride_vs, stride_vd,
+    stride_ob, stride_oh, stride_os, stride_od,
+):
+    b = tl.program_id(axis=0)
+    h = tl.program_id(axis=1)
+    i = tl.program_id(axis=2)
+    row = Soft_ptr + b * stride_sb + h * stride_sh + i * stride_ss
+    scores = tl.load(row + tl.arange(0, S) * stride_sd, mask=tl.arange(0, S) < S, other=-float('inf'))  # [S]
+    max_score = tl.max(scores, axis=0)
+    scores = scores - max_score
+    exp_scores = tl.exp(scores)
+    sum_exp = tl.sum(exp_scores, axis=0)
+    soft = exp_scores / sum_exp  # [S]
+    # write Out[b, h, i, :] which is 128-d
+    out_vec = tl.zeros((), dtype=tl.float32)
+    for j in range(0, S):
+        v = tl.load(V_ptr + b * stride_vb + h * stride_vh + j * stride_vs + tl.arange(0, 128) * stride_vd)  # [128]
+        v = v.to(tl.float32)
+        soft_j = tl.load(Soft_ptr + b * stride_sb + h * stride_sh + i * stride_ss + j * stride_sd).to(tl.float32)
+        out_vec += tl.sum(v * soft_j, axis=0)  # scalar
+    tl.store(Out_ptr + b * stride_ob + h * stride_oh + i * stride_os + tl.arange(0, 128) * stride_od, out_vec)
+
+
+# Triton kernel: final linear Y = Out_flat @ O^T + B, where Out_flat: [M, 128], O: [128, 128], B: [128]
+@triton.jit
+def final_linear_kernel(
+    Out_ptr, O_ptr, B_ptr, Y_ptr,
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,  # M = B*S, N=128, K=128
+    stride_om, stride_ok,
+    stride_o0, stride_o1,
+    stride_ym, stride_yn,
+    BLOCK_K: tl.constexpr,
+):
+    m = tl.program_id(axis=0)  # over M=B*S
+    n = tl.program_id(axis=1)  # over output dim N=128
+    acc = tl.zeros((), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        offs = k0 + tl.arange(0, BLOCK_K)
+        out = tl.load(Out_ptr + m * stride_om + offs * stride_ok, mask=offs < K, other=0.0)
+        o = tl.load(O_ptr + n * stride_o0 + offs * stride_o1, mask=offs < K, other=0.0)
+        acc += tl.sum(out * o, axis=0)
+    b = tl.load(B_ptr + n)
+    tl.store(Y_ptr + m * stride_ym + n * stride_yn, acc)
+
+
+class ModelNew(nn.Module):
+    def forward(self, hidden_states: torch.Tensor,
+                q_proj_weight: torch.Tensor, q_proj_bias: torch.Tensor,
+                k_proj_weight: torch.Tensor, k_proj_bias: torch.Tensor,
+                v_proj_weight: torch.Tensor, v_proj_bias: torch.Tensor,
+                o_proj_weight: torch.Tensor, o_proj_bias: torch.Tensor,
+                q_norm_weight: torch.Tensor, k_norm_weight: torch.Tensor,
+                cos: torch.Tensor, sin: torch.Tensor,
+                rms_norm_eps: float):
+        # Cast to float32 for Triton kernels
+        device = hidden_states.device
+        B, S, D_in = hidden_states.shape  # original hidden_states is [B, S, 128]
+        hidden_states = hidden_states.float()
+        # Weights/biases and others
+        q_proj_weight = q_proj_weight.float()
+        q_proj_bias = q_proj_bias.float() if q_proj_bias is not None else None
+        k_proj_weight = k_proj_weight.float()
+        k_proj_bias = k_proj_bias.float() if k_proj_bias is not None else None
+        v_proj_weight = v_proj_weight.float()
+        v_proj_bias = v_proj_bias.float() if v_proj_bias is not None else None
+        o_proj_weight = o_proj_weight.float()
+        o_proj_bias = o_proj_bias.float() if o_proj_bias is not None else None
+        q_norm_weight = q_norm_weight.float()
+        k_norm_weight = k_norm_weight.float()
+        cos = cos.float()
+        sin = sin.float()
+
+        # 1) Dense linear for Q, K, V (Triton), M = B*S, D_in=128, D_out=128
+        M = B * S
+        N_out = 128
+
+        # Allocate outputs
+        query = torch.empty((M, N_out), device=device, dtype=torch.float32)
+        key = torch.empty((M, N_out), device=device, dtype=torch.float32)
+        value = torch.empty((M, N_out), device=device, dtype=torch.float32)
+
+        # Launch Q
+        grid_q = (M, N_out)
+        linear_kernel_2d[grid_q](
+            hidden_states.reshape(M, D_in), q_proj_weight, q_proj_bias, query,
+            M, N_out, D_in,
+            1, 1,
+            1, 1,
+            1, 1,
+            num_warps=4, BLOCK_K=64
+        )
+        # Launch K
+        grid_k = (M, N_out)
+        linear_kernel_2d[grid_k](
+            hidden_states.reshape(M, D_in), k_proj_weight, k_proj_bias, key,
+            M, N_out, D_in,
+            1, 1,
+            1, 1,
+            1, 1,
+            num_warps=4, BLOCK_K=64
+        )
+        # Launch V
+        grid_v = (M, N_out)
+        linear_kernel_2d[grid_v](
+            hidden_states.reshape(M, D_in), v_proj_weight, v_proj_bias, value,
+            M, N_out, D_in,
+            1, 1,
+            1, 1,
+            1, 1,
+            num_warps=4, BLOCK_K=64
+        )
+
+        # Reshape back to [B, S, 128]
+        query = query.view(B, S, N_out)
+        key = key.view(B, S, N_out)
+        value = value.view(B, S, N_out)
+
+        # 2) RMSNorm for Q and K (Triton)
+        # Allocate outputs
+        query_norm = torch.empty_like(query)
+        key_norm = torch.empty_like(key)
+
+        grid_rms_q = (B, S, S, 128)
+        rmsnorm_kernel[grid_rms_q](
+            query, q_norm_weight, query_norm,
+            B, S, S, 128,
+            query.stride(0), query.stride(1), query.stride(2), query.stride(3),
+            query_norm.stride(0), query_norm.stride(1), query_norm.stride(2), query_norm.stride(3),
+            rms_norm_eps,
+            num_warps=4
+        )
+
+        grid_rms_k = (B, S, S, 128)
+        rmsnorm_kernel[grid_rms_k](
+            key, k_norm_weight, key_norm,
+            B, S, S, 128,
+            key.stride(0), key.stride(1), key.stride(2), key.stride(3),
+            key_norm.stride(0), key_norm.stride(1), key_norm.stride(2), key_norm.stride(3),
+            rms_norm_eps,
+            num_warps=4
+        )
+
+        # 3) Apply Rotation (RoPE) for Q and K (Triton)
+        # For Q
+        query_rot = torch.empty_like(query_norm)
+        grid_rope_q = (B, S, S)
+        rotate_half_kernel[grid_rope_q](
+            query_norm, cos, sin, query_rot,
+            B, S, S, 128,
+            query_norm.stride(0), query_norm.stride(1), query_norm.stride(2), query_norm.stride(3),
+            query_rot.stride(0), query_rot.stride(1), query_rot.stride(2), query_rot.stride(3),
+            cos.stride(0), cos.stride(1),
+            sin.stride(0), sin.stride(1),
+            num_warps=4
+        )
+        # For K
+        key_rot = torch.empty_like(key_norm)
+        grid_rope_k = (B, S, S)
+        rotate_half_kernel[grid_rope_k](
+            key_norm, cos, sin, key_rot,
+            B, S, S, 128,
+            key_norm.stride(0), key_norm.stride(1), key_norm.stride(2), key_norm.stride(3),
+            key_rot.stride(0), key_rot.stride(1), key_rot.stride(2), key_rot.stride(3),
+            cos.stride(0), cos.stride(1),
+            sin.stride(0), sin.stride(1),
+            num_warps=4
+        )
+
+        # 4) Compute attention scores and output (Triton)
+        # Allocate score and output
+        attn_scores = torch.empty((B, S, S), device=device, dtype=torch.float32)
+        attn_output = torch.empty((B, S, 128), device=device, dtype=torch.float32)
+
+        grid_scores = (B, S, S)
+        attn_scores_kernel[grid_scores](
+            query_rot, key_rot, attn_scores,
+            B, S, S,
+            query_rot.stride(0), query_rot.stride(1), query_rot.stride(2), query_rot.stride(3),
+            key_rot.stride(0), key_rot.stride(1), key_rot.stride(2), key_rot.stride(3),
+            attn_scores.stride(0), attn_scores.stride(1), attn_scores.stride(2), attn_scores.stride(3),
+            scaling=1.0 / 128.0,  # head_dim ** -0.5
+            num_warps=4
+        )
+
+        grid_out = (B, S, S)
+        softmax_out_kernel[grid_out](
+            attn_scores, value, attn_output,
+            B, S, S,
+            attn_scores.stride(0), attn_scores.stride(1), attn_scores.stride(2), attn_scores.stride(3),
+            value.stride(0), value.stride(1), value.stride(2), value.stride(3),
+            attn_output.stride(0), attn_output.stride(1), attn_output.stride(2), attn_output.stride(3),
+            num_warps=4
+        )
+
+        # 5) Final output projection (Triton), M = B*S
+        M_final = B * S
+        output_flat = torch.empty((M_final, 128), device=device, dtype=torch.float32)
+        grid_final = (M_final, 128)
+        final_linear_kernel[grid_final](
+            attn_output.reshape(M_final, 128), o_proj_weight, o_proj_bias, output_flat,
+            M_final, 128, 128,
+            attn_output.reshape(M_final, 128).stride(0), attn_output.reshape(M_final, 128).stride(1),
+            o_proj_weight.stride(0), o_proj_weight.stride(1),
+            output_flat.stride(0), output_flat.stride(1),
+            num_warps=4, BLOCK_K=64
+        )
+
+        output = output_flat.view(B, S, 128)
+        return output
+
+
+def run(*args):
+    return ModelNew()(*args)

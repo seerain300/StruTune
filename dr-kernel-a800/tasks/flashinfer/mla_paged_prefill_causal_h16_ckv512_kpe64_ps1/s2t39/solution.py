@@ -1,0 +1,169 @@
+import torch
+import math
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _forward_single_abs_query_kernel(
+    q_nope_ptr,     # *bf16, [Q_total, 16, 512]
+    q_pe_ptr,       # *bf16, [Q_total, 16, 64]
+    output_ptr,     # *bf16, [Q_total, 16, 512]
+    lse_ptr,        # *f32,  [Q_total, 16]
+    Kc_sel_ptr,     # *bf16, [B_tok, 512], one per batch element b
+    Kp_sel_ptr,     # *bf16, [B_tok, 64],  one per batch element b
+    qo_indptr_ptr,  # *i32,  [B+1]
+    kv_indptr_ptr,  # *i32,  [B+1]
+    q_start,        # i32
+    q_end,          # i32
+    tok_start,      # i32
+    tok_end,        # i32
+    tok_len,        # i32
+    q_len,          # i32
+    sm_scale,       # f32
+):
+    # program_id(0): batch element b
+    # program_id(1): absolute query index q_abs across all batches
+    b = tl.program_id(0)
+    q_abs = tl.program_id(1)
+
+    # Determine if this absolute query belongs to batch b
+    in_range = (q_abs >= q_start) & (q_abs < q_end)
+
+    # If not, do nothing (host should not launch for q_abs outside range)
+    if not in_range:
+        return
+
+    # Compute local query index i within this batch
+    i = q_abs - q_start
+
+    # Initialize accumulators
+    # We'll compute per-head outputs and lse; we do this per head in a loop
+    # Constants
+    NUM_HEADS = 16
+    HEAD_DIM = 512
+
+    # Load qn[h, :] and qp[h, :] for all heads h in fp32
+    # q_nope_ptr is laid out as [q_abs, h, k], so base offset is q_abs * (NUM_HEADS*HEAD_DIM) + h*HEAD_DIM
+    for h in range(NUM_HEADS):
+        base_q = q_abs * (NUM_HEADS * HEAD_DIM) + h * HEAD_DIM
+        # Load qn[h, :] as bf16 then cast to fp32
+        qn = tl.load(q_nope_ptr + base_q + tl.arange(0, HEAD_DIM), mask=True, other=0.0)
+        qn = qn.to(tl.float32)
+        # Load qp[h, :] as bf16 then cast to fp32, dim 64
+        base_qp = q_abs * (NUM_HEADS * 64) + h * 64
+        qp = tl.load(q_pe_ptr + base_qp + tl.arange(0, 64), mask=True, other=0.0).to(tl.float32)
+
+        # Compute logits[j] for j in [0, tok_len)
+        logits = tl.full((tok_len,), -float('inf'), dtype=tl.float32)
+        for j in range(0, tok_len):
+            # Load Kc_sel[j, :] and Kp_sel[j, :]
+            # Kc_sel_ptr is [B_tok, 512], B_tok == tok_len; offset j * HEAD_DIM + arange(0, HEAD_DIM)
+            Kc_row = tl.load(Kc_sel_ptr + j * HEAD_DIM + tl.arange(0, HEAD_DIM), mask=True, other=0.0).to(tl.float32)
+            Kp_row = tl.load(Kp_sel_ptr + j * 64 + tl.arange(0, 64), mask=True, other=0.0).to(tl.float32)
+            # Dot products: qn · Kc_row, qp · Kp_row
+            # qn[h, :] is 512, Kc_row is 512 => sum over 512
+            dot_qn = tl.sum(qn * Kc_row, axis=0)  # scalar
+            dot_qp = tl.sum(qp * Kp_row, axis=0)  # scalar (64 vector, but here Kp_row is 64, so single scalar)
+            logits[j] = dot_qn + dot_qp
+
+        # Scale logits by sm_scale
+        logits = logits * sm_scale
+
+        # Apply causal mask: only j >= prefix_len + i + 1 are valid
+        # prefix_len = tok_len - q_len (tokens seen so far), i is local query index
+        prefix_len = tok_len - q_len
+        causal_start = prefix_len + i + 1
+        for j in range(0, tok_len):
+            valid = j >= causal_start
+            if valid:
+                logits[j] = logits[j]
+            else:
+                logits[j] = -float('inf')
+
+        # Compute logsumexp in fp32, with base-2 lse: lse_j = (log(sum exp(logits)) / ln(2))
+        # Stable: subtract max
+        max_log = tl.max(logits, axis=0)
+        exp_logits = tl.exp(logits - max_log)
+        sum_exp = tl.sum(exp_logits, axis=0)
+        logsumexp_base2 = (tl.log(sum_exp) + max_log) / tl.log(2.0)
+        lse_scalar = logsumexp_base2  # scalar per head
+
+        # Compute softmax and final output vector
+        softmax = exp_logits / sum_exp  # per j
+        out_vec = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+        for j in range(0, tok_len):
+            # Kc_row again
+            Kc_row = tl.load(Kc_sel_ptr + j * HEAD_DIM + tl.arange(0, HEAD_DIM), mask=True, other=0.0).to(tl.float32)
+            # soft[j] is scalar; out_vec += soft[j] * Kc_row
+            soft_j = softmax[j]
+            out_vec += soft_j * Kc_row
+
+        # Store output as bfloat16 at output[q_abs, h, :]
+        out_offset = q_abs * (NUM_HEADS * HEAD_DIM) + h * HEAD_DIM
+        out_bf16 = out_vec.to(tl.bfloat16)
+        tl.store(output_ptr + out_offset, out_bf16)
+
+        # Store lse as float32 at lse[q_abs, h]
+        lse_offset = q_abs * NUM_HEADS + h
+        tl.store(lse_ptr + lse_offset, lse_scalar)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale):
+        # Shapes and assertions
+        assert q_nope.dim() == 3 and q_pe.dim() == 3
+        total_q, num_qo_heads, head_dim_ckv = q_nope.shape
+        _, num_qo_heads2, head_dim_kpe = q_pe.shape
+        assert num_qo_heads == 16 and num_qo_heads == num_qo_heads2
+        assert head_dim_ckv == 512
+        assert head_dim_kpe == 64
+
+        # Ensure device and contiguity
+        device = q_nope.device
+        qo_indptr = qo_indptr.to(torch.int32).contiguous()
+        kv_indptr = kv_indptr.to(torch.int32).contiguous()
+        kv_indices = kv_indices.to(torch.int32).contiguous()
+
+        # Compute total queries across all batches (sum of (q_end - q_start))
+        # We will launch one Triton program per absolute query index q_abs.
+        batch_size = qo_indptr.shape[0] - 1
+        qo_indptr_sorted = qo_indptr.sort()[0]  # ascending order
+        q_starts = qo_indptr_sorted[:-1].tolist()
+        q_ends = qo_indptr_sorted[1:].tolist()
+        total_q_total = int(qo_indptr_sorted[-1].item())
+
+        # Output tensors
+        output = torch.empty((total_q_total, 16, 512), dtype=torch.bfloat16, device=device)
+        lse = torch.empty((total_q_total, 16), dtype=torch.float32, device=device)
+
+        # For each batch element b, precompute Kc_sel and Kp_sel based on tok_idx = kv_indices[kv_indptr[b]:kv_indptr[b+1]]
+        # These are device tensors and cast to fp32 inside the kernel.
+        for b in range(batch_size):
+            tok_start = int(kv_indptr[b].item())
+            tok_end = int(kv_indptr[b + 1].item())
+            tok_len = tok_end - tok_start
+            # Select token indices for this batch
+            tok_idx = kv_indices[tok_start:tok_end].to(device=device)
+            # Gather selected rows from caches
+            Kc_sel = ckv_cache[tok_idx, 0, :].to(torch.bfloat16)  # [tok_len, 512]
+            Kp_sel = kpe_cache[tok_idx, 0, :].to(torch.bfloat16)  # [tok_len, 64]
+            q_start_b = int(qo_indptr[b].item())
+            q_end_b = int(qo_indptr[b + 1].item())
+            q_len_b = q_end_b - q_start_b
+            # Launch Triton kernel: grid over absolute queries (0..total_q_total-1) and batch
+            grid = (1, total_q_total)
+            _forward_single_abs_query_kernel[grid](
+                q_nope, q_pe, output, lse,
+                Kc_sel, Kp_sel,
+                qo_indptr, kv_indptr,
+                q_start_b, q_end_b, tok_start, tok_end, tok_len, q_len_b,
+                float(sm_scale),
+                num_warps=4, num_stages=2,
+            )
+
+        return output, lse
+
+
+def run(*args):
+    return ModelNew()(*args)

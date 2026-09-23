@@ -1,0 +1,348 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# Linear projection: Y[M, N] = X[M, K] @ W[N, K]^T + bias[N]
+@triton.jit
+def linear_fwd_kernel(
+    X_ptr,        # *ptr to X [M, K]
+    W_ptr,        # *ptr to W [N, K] (row-major)
+    BIAS_ptr,     # *ptr to bias [N] or None
+    Y_ptr,        # *ptr to Y [M, N]
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_ym, stride_yn,
+    stride_bias,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # rows in X/Y
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # out features
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K in chunks
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        # Load X tile [BLOCK_M, BLOCK_K]
+        x_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+        x = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
+
+        # Load W tile [BLOCK_N, BLOCK_K] (W is [N, K], we access rows by offs_n, cols by offs_k)
+        w_ptrs = W_ptr + (offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk)
+        w = tl.load(w_ptrs, mask=(offs_n[:, None] < N) & (offs_k[None, :] < K), other=0.0)
+
+        # Accumulate dot products: acc += x @ w^T
+        acc += tl.dot(x, tl.trans(w))
+
+    # Add bias
+    bias = tl.load(BIAS_ptr + offs_n, mask=(offs_n < N), other=0.0)  # [BLOCK_N]
+    acc += bias[None, :]
+
+    # Store Y
+    y_ptrs = Y_ptr + (offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn)
+    tl.store(y_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+# RMSNorm per row across last dim: y = x * rsqrt(mean(x^2) + eps), elementwise per row
+@triton.jit
+def rmsnorm_kernel(
+    X_ptr,        # *ptr to [M, N]
+    W_ptr,        # *ptr to [N] scale (usually 1)
+    Y_ptr,        # *ptr to [M, N]
+    M: tl.constexpr, N: tl.constexpr,
+    stride_xm, stride_xn,
+    stride_ym, stride_yn,
+    stride_w,
+    eps: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    # Each program handles one row
+    sumsq = 0.0
+    # Accumulate sum of squares over N in chunks
+    for n0 in range(0, N, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        x_ptrs = X_ptr + (pid_m * stride_xm + offs_n * stride_xn)
+        x = tl.load(x_ptrs, mask=(offs_n < N), other=0.0)
+        sumsq += tl.sum(x * x)
+
+    inv_rms = 1.0 / tl.sqrt(sumsq / N + eps)
+
+    # Normalize and apply scale
+    for n0 in range(0, N, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        x_ptrs = X_ptr + (pid_m * stride_xm + offs_n * stride_xn)
+        y_ptrs = Y_ptr + (pid_m * stride_ym + offs_n * stride_yn)
+        w = tl.load(W_ptr + offs_n * stride_w, mask=(offs_n < N), other=1.0)
+        x = tl.load(x_ptrs, mask=(offs_n < N), other=0.0)
+        y = x * inv_rms * w
+        tl.store(y_ptrs, y, mask=(offs_n < N))
+
+
+# Apply half rotation: swap last two halves for Q/K, combine with cos/sin applied to last 64
+# Input X: [M, 128], Output Y: [M, 128]
+@triton.jit
+def apply_half_rotation_kernel(
+    X_ptr,        # *ptr to [M, 128]
+    cos_ptr,      # *ptr to [64]
+    sin_ptr,      # *ptr to [64]
+    Y_ptr,        # *ptr to [M, 128]
+    M: tl.constexpr,
+    stride_xm, stride_xn,
+    stride_ym, stride_yn,
+):
+    pid_m = tl.program_id(0)
+    offs = tl.arange(0, 128)
+    x = tl.load(X_ptr + pid_m * stride_xm + offs * stride_xn, mask=(offs < 128), other=0.0)
+
+    # Split into q1, q2
+    q1 = x[:64]
+    q2 = x[64:]
+
+    # Load cos and sin for last 64
+    c = tl.load(cos_ptr + tl.arange(0, 64))
+    s = tl.load(sin_ptr + tl.arange(0, 64))
+
+    # Rotate q2: (q2, -q1) with cos/sin applied to q2
+    q2_rot = q2 * c - q1 * s
+    q1_rot = q2 * s - q1 * c
+    y = tl.concatenate([q2_rot, q1_rot], axis=0)
+
+    tl.store(Y_ptr + pid_m * stride_ym + offs * stride_yn, y)
+
+
+# Final output projection: Y[M, OUT_N] = X[M, K] @ W[OUT_N, K]^T
+@triton.jit
+def linear_out_kernel(
+    X_ptr,        # *ptr to [M, K]
+    W_ptr,        # *ptr to [OUT_N, K]
+    Y_ptr,        # *ptr to [M, OUT_N]
+    M: tl.constexpr, OUT_N: tl.constexpr, K: tl.constexpr,
+    stride_xm, stride_xk,
+    stride_won, stride_wk,
+    stride_ym, stride_yn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        x_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+        w_ptrs = W_ptr + (offs_n[:, None] * stride_won + offs_k[None, :] * stride_wk)
+        x = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
+        w = tl.load(w_ptrs, mask=(offs_n[:, None] < OUT_N) & (offs_k[None, :] < K), other=0.0)
+        acc += tl.dot(x, tl.trans(w))
+
+    y_ptrs = Y_ptr + (offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn)
+    tl.store(y_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < OUT_N))
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, num_attention_heads: int = 96, num_key_value_heads: int = 8, head_dim: int = 128,
+                 num_key_value_groups: int = 12, eps: float = 1e-8):
+        super().__init__()
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim
+        self.num_key_value_groups = num_key_value_groups
+        self.eps = eps
+
+    def forward(self, hidden_states, q_proj_weight, q_proj_bias, k_proj_weight, k_proj_bias,
+                v_proj_weight, v_proj_bias, o_proj_weight, q_norm_weight, k_norm_weight,
+                cos: torch.Tensor, sin: torch.Tensor):
+        """
+        hidden_states: [B, S, 768]
+        q_proj_weight, k_proj_weight, v_proj_weight: [768, 768]
+        q_proj_bias, k_proj_bias, v_proj_bias: [768]
+        o_proj_weight: [768, 768]
+        q_norm_weight: [96 * 128]
+        k_norm_weight: [8 * 128]
+        cos, sin: [128]
+        """
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+
+        B, S, hidden_dim = hidden_states.shape
+        assert hidden_dim == 768, "hidden_dim must be 768"
+        D = self.head_dim
+        assert D == 128, "head_dim must be 128"
+
+        # 1) Flatten hidden states for linear projection
+        hs_flat = hidden_states.reshape(B * S, hidden_dim).contiguous()
+
+        # 2) Compute Q via Triton linear projection
+        query = torch.empty((B * S, hidden_dim), device=device, dtype=torch.float32)
+        grid_q = (triton.cdiv(B * S, 128), triton.cdiv(hidden_dim, 128))
+        linear_fwd_kernel[grid_q](
+            hs_flat, q_proj_weight, q_proj_bias, query,
+            B * S, hidden_dim, hidden_dim,
+            hs_flat.stride(0), hidden_dim,
+            q_proj_weight.stride(0), hidden_dim,
+            query.stride(0), hidden_dim,
+            q_proj_bias.stride(0),
+            BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
+            num_warps=4, num_stages=2,
+        )
+
+        # 3) RMSNorm for Q in Triton
+        query_rms = torch.empty_like(query)
+        grid_q_n = (B * S,)
+        rmsnorm_kernel[grid_q_n](
+            query, q_norm_weight, query_rms,
+            B * S, hidden_dim,
+            query.stride(0), hidden_dim,
+            query_rms.stride(0), hidden_dim,
+            q_norm_weight.stride(0),
+            eps=self.eps,
+            BLOCK_N=128,
+            num_warps=1, num_stages=1,
+        )
+
+        # 4) Apply half rotation to Q
+        query_rot = torch.empty_like(query_rms)
+        grid_q_r = (B * S,)
+        apply_half_rotation_kernel[grid_q_r](
+            query_rms, cos, sin, query_rot,
+            B * S,
+            query_rms.stride(0), hidden_dim,
+            query_rot.stride(0), hidden_dim,
+            num_warps=1, num_stages=1,
+        )
+
+        # 5) Compute K via Triton linear projection
+        key = torch.empty((B * S, hidden_dim), device=device, dtype=torch.float32)
+        grid_k = (triton.cdiv(B * S, 128), triton.cdiv(hidden_dim, 128))
+        linear_fwd_kernel[grid_k](
+            hs_flat, k_proj_weight, k_proj_bias, key,
+            B * S, hidden_dim, hidden_dim,
+            hs_flat.stride(0), hidden_dim,
+            k_proj_weight.stride(0), hidden_dim,
+            key.stride(0), hidden_dim,
+            k_proj_bias.stride(0),
+            BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
+            num_warps=4, num_stages=2,
+        )
+
+        # 6) RMSNorm for K in Triton
+        key_rms = torch.empty_like(key)
+        grid_k_n = (B * S,)
+        rmsnorm_kernel[grid_k_n](
+            key, k_norm_weight, key_rms,
+            B * S, hidden_dim,
+            key.stride(0), hidden_dim,
+            key_rms.stride(0), hidden_dim,
+            k_norm_weight.stride(0),
+            eps=self.eps,
+            BLOCK_N=128,
+            num_warps=1, num_stages=1,
+        )
+
+        # 7) Apply half rotation to K
+        key_rot = torch.empty_like(key_rms)
+        grid_k_r = (B * S,)
+        apply_half_rotation_kernel[grid_k_r](
+            key_rms, cos, sin, key_rot,
+            B * S,
+            key_rms.stride(0), hidden_dim,
+            key_rot.stride(0), hidden_dim,
+            num_warps=1, num_stages=1,
+        )
+
+        # 8) Compute V via Triton linear projection (V is not RMSNORMed and not rotated)
+        value = torch.empty((B * S, hidden_dim), device=device, dtype=torch.float32)
+        grid_v = (triton.cdiv(B * S, 128), triton.cdiv(hidden_dim, 128))
+        linear_fwd_kernel[grid_v](
+            hs_flat, v_proj_weight, v_proj_bias, value,
+            B * S, hidden_dim, hidden_dim,
+            hs_flat.stride(0), hidden_dim,
+            v_proj_weight.stride(0), hidden_dim,
+            value.stride(0), hidden_dim,
+            v_proj_bias.stride(0),
+            BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
+            num_warps=4, num_stages=2,
+        )
+
+        # 9) Reshape Q, K, V to [B, S, H, D] (for H = num_attention_heads)
+        #    Note: The original code has fixed H_q=96, H_k=8, D=128.
+        #    We create [B, S, 96, 128] and [B, S, 8, 128] accordingly.
+        query_4d = query_rot.view(B, S, self.num_attention_heads, D)
+        key_4d = key_rot.view(B, S, self.num_key_value_heads, D)
+        value_4d = value.view(B, S, self.num_key_value_heads, D)
+
+        # 10) GQA mapping: expand K/V from 8 heads to 96 heads by repeating groups
+        #     kv_h = i // num_key_value_groups, groups=12
+        #     K_expanded [B, S, 96, 128]
+        #     V_expanded [B, S, 96, 128]
+        kv_group = self.num_key_value_groups  # 12
+        # For each query head i in [0..96), use KV head i // 12
+        # Create expanded tensors without copying (view with repeats) to match original semantics
+        # torch.unsqueeze and expand to (B, S, 1, D), then expand to (B, S, 96, D)
+        # Note: expand is a view, no data movement; we'll call contiguous at the end.
+        key_expanded = key_4d.unsqueeze(2).expand(B, S, self.num_attention_heads, self.num_key_value_heads, D)
+        value_expanded = value_4d.unsqueeze(2).expand(B, S, self.num_attention_heads, self.num_key_value_heads, D)
+
+        # Now reshape to [B, S, 96, 128]
+        key_expanded = key_expanded.reshape(B, S, self.num_attention_heads, D).contiguous()
+        value_expanded = value_expanded.reshape(B, S, self.num_attention_heads, D).contiguous()
+
+        # 11) Compute attention scores using PyTorch matmul (Q @ K^T), then softmax + causal mask
+        #     Q is [B*S*96, 128], K is [B*S*96, 128]
+        Q_flat = query_4d.reshape(B * self.num_attention_heads * S, D).contiguous()
+        K_flat = key_expanded.reshape(B * self.num_attention_heads * S, D).contiguous()
+        scores = Q_flat.matmul(K_flat.transpose(0, 1))  # [B*S*96, B*S*96]
+        scaling = 1.0 / D**0.5
+        scores = scores * scaling
+
+        # Build causal mask for each (i, j) where i, j are flattened positions over B*S*96
+        M = B * self.num_attention_heads * S
+        i_idx = torch.arange(M, device=device)
+        j_idx = torch.arange(M, device=device)
+        causal_mask = (i_idx[:, None] < j_idx[None, :]).to(scores.dtype)  # upper-triangular
+        scores = scores + causal_mask * (-float('inf'))
+
+        # Softmax across j for each i
+        attn_weights = torch.softmax(scores, dim=1)  # [M, M]
+
+        # Compute attn_output = attn_weights @ V (V expanded similarly)
+        V_flat = value_expanded.reshape(B * self.num_attention_heads * S, D).contiguous()
+        attn_output = attn_weights.matmul(V_flat)  # [M, D]
+
+        # 12) Reshape attn_output to [B, S, 96, 128] then to [B, S, 96*128] = [B, S, 768]
+        attn_output_4d = attn_output.view(B, self.num_attention_heads, S, D)
+        attn_output_3d = attn_output_4d.transpose(1, 2).contiguous()  # [B, S, 96, 128] -> [B, S, 96, 128]
+        # Note: In the original code, attention_output reshapes to [B, S, 96*128] implicitly via [B,S,H_q,D] -> [B,S,H_q*128].
+        # We need to produce [B, S, 768], so flatten: [B, S, 96*128] -> [B, S, 768].
+        attn_output_2d = attn_output_4d.reshape(B, S, self.num_attention_heads * D).contiguous()
+
+        # 13) Final output projection via Triton
+        out = torch.empty((B * S, 768), device=device, dtype=torch.float32)
+        grid_out = (triton.cdiv(B * S, 128), triton.cdiv(768, 128))
+        linear_out_kernel[grid_out](
+            attn_output_2d.reshape(B * S, 768), o_proj_weight,
+            out,
+            B * S, 768, 768,
+            attn_output_2d.reshape(B * S, 768).stride(0), 768,
+            o_proj_weight.stride(0), 768,
+            out.stride(0), 768,
+            BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
+            num_warps=4, num_stages=2,
+        )
+
+        # 14) Reshape to [B, S, 768]
+        out = out.view(B, S, 768)
+
+        return out
+
+
+def run(*args):
+    return ModelNew()(*args)

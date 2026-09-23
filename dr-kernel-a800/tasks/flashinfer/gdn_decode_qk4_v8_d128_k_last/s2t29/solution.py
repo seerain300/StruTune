@@ -1,0 +1,208 @@
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def triton_gate_beta_kernel(
+    A_log_ptr,    # *float32, shape [H]
+    a_ptr,        # *bfloat16 or *float32, shape [B, 1, H]
+    dt_bias_ptr,  # *float32, shape [H]
+    b_ptr,        # *bfloat16 or *float32, shape [B, 1, H]
+    g_ptr,        # *float32, shape [B, 1, H]
+    beta_ptr,     # *float32, shape [B, 1, H]
+    B: tl.constexpr,  # batch size
+    H: tl.constexpr,  # number of heads
+):
+    # One program per (b,h)
+    pid = tl.program_id(axis=0)
+    b = pid // H
+    h = pid % H
+
+    # Load a[b, h] and dt_bias[h]
+    # a_ptr is [B, 1, H], linear indexing: index = b*H + h
+    a_val = tl.load(a_ptr + b * H + h)
+    dt_val = tl.load(dt_bias_ptr + h)
+
+    # Compute softplus(x) = max(x, 0) + log(1 + exp(-|x|))
+    x = tl.cast(a_val, tl.float32) + dt_val
+    abs_x = tl.abs(x)
+    sp = tl.maximum(x, 0.0) + tl.log(1.0 + tl.exp(-abs_x))
+
+    # g = exp(-exp(A_log[h]) * softplus)
+    A_log_val = tl.load(A_log_ptr + h)
+    g_val = tl.exp(-tl.exp(A_log_val) * sp)
+
+    # beta = sigmoid(b[b,h]) = 1 / (1 + exp(-b))
+    b_val = tl.load(b_ptr + b * H + h)
+    beta_val = 1.0 / (1.0 + tl.exp(-tl.cast(b_val, tl.float32)))
+
+    # Store results
+    tl.store(g_ptr + b * H + h, g_val)
+    tl.store(beta_ptr + b * H + h, beta_val)
+
+
+@triton.jit
+def triton_update_kernel(
+    q_ptr,        # *bfloat16 or *float32, shape [B, H, K]
+    k_ptr,        # *bfloat16 or *float32, shape [B, H, K]
+    v_ptr,        # *bfloat16 or *float32, shape [B, H, V]
+    state_ptr,    # *float32, shape [B, H, V, K] (k-last)
+    g_ptr,        # *float32, shape [B, 1, H]
+    beta_ptr,     # *float32, shape [B, 1, H]
+    output_ptr,   # *float32, shape [B, H]
+    new_state_ptr,# *float32, shape [B, H, V, K]
+    B: tl.constexpr,  # batch size
+    H: tl.constexpr,  # number of heads
+    V: tl.constexpr,  # num_v_heads
+    K: tl.constexpr,  # num_k
+    scale,         # float32 scalar
+):
+    # One program per (b,h)
+    pid = tl.program_id(axis=0)
+    b = pid // H
+    h = pid % H
+
+    # Load scalars
+    g_val = tl.load(g_ptr + b * H + h)
+    beta_val = tl.load(beta_ptr + b * H + h)
+
+    # Load q[b,h,:], k[b,h,:], v[b,h,:] as vectors
+    q_vec = tl.zeros([K], dtype=tl.float32)
+    k_vec = tl.zeros([K], dtype=tl.float32)
+    v_vec = tl.zeros([V], dtype=tl.float32)
+
+    # Linear base offsets for (b,h)
+    q_base = b * H * K + h * K
+    k_base = b * H * K + h * K
+    v_base = b * H * V + h * V
+
+    for j in range(0, K):
+        qj = tl.cast(tl.load(q_ptr + q_base + j), tl.float32)
+        kj = tl.cast(tl.load(k_ptr + k_base + j), tl.float32)
+        q_vec[j] = qj
+        k_vec[j] = kj
+
+    for v_idx in range(0, V):
+        vv = tl.cast(tl.load(v_ptr + v_base + v_idx), tl.float32)
+        v_vec[v_idx] = vv
+
+    # Load state_old as [V, K]
+    state_old = tl.zeros([V, K], dtype=tl.float32)
+    for v_idx in range(0, V):
+        row_base = b * H * V * K + h * V * K + v_idx * K  # linear offset for row v_idx
+        for k_idx in range(0, K):
+            state_old[v_idx, k_idx] = tl.cast(tl.load(state_ptr + row_base + k_idx), tl.float32)
+
+    # Compute old_v = k @ (g * state_old)  -> (K,)
+    old_v = tl.zeros([K], dtype=tl.float32)
+    for j in range(0, K):
+        # sum_v (g * state_old[j, :]) * k_vec
+        sum_val = tl.zeros([], dtype=tl.float32)
+        for v_idx in range(0, V):
+            s = state_old[v_idx, j]
+            sum_val += s * g_val  # g_val is scalar
+        old_v[j] = tl.sum(sum_val * k_vec[j], axis=0)  # k_vec[j] is scalar, so just multiply
+
+    # Compute new_v = beta * v + (1 - beta) * old_v
+    new_v = tl.zeros([V], dtype=tl.float32)
+    for v_idx in range(0, V):
+        new_v[v_idx] = beta_val * v_vec[v_idx] + (1.0 - beta_val) * old_v[v_idx]
+
+    # Compute state_remove and state_update as scalars: k @ old_v and k @ new_v
+    state_remove = tl.zeros([], dtype=tl.float32)
+    state_update = tl.zeros([], dtype=tl.float32)
+    for j in range(0, K):
+        state_remove += old_v[j] * k_vec[j]
+        state_update += new_v[j] * k_vec[j]
+
+    # Update h_state_new elementwise: h_state_new = (g * state_old) - state_remove + state_update
+    h_state_new = tl.zeros([V, K], dtype=tl.float32)
+    for v_idx in range(0, V):
+        for k_idx in range(0, K):
+            s_old = state_old[v_idx, k_idx]
+            h_state_new[v_idx, k_idx] = s_old * g_val - state_remove + state_update
+
+    # Compute output scalar: output = scale * (q_h @ h_state_new) / sqrt(K)
+    inv_sqrtK = 1.0 / tl.sqrt(K)
+    out_sum = tl.zeros([], dtype=tl.float32)
+    for j in range(0, K):
+        qj = q_vec[j]
+        for v_idx in range(0, V):
+            out_sum += qj * h_state_new[v_idx, j]
+    output_scalar = scale * inv_sqrtK * out_sum
+
+    # Store output[b, h]
+    tl.store(output_ptr + b * H + h, output_scalar)
+
+    # Store new_state[b, h, :, :]
+    for v_idx in range(0, V):
+        row_base = b * H * V * K + h * V * K + v_idx * K
+        for k_idx in range(0, K):
+            tl.store(new_state_ptr + row_base + k_idx, h_state_new[v_idx, k_idx])
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, q, k, v, state, A_log, a, dt_bias, b, scale):
+        """
+        Triton-only implementation of the gated delta net update.
+        q: [B, 1, Hq, K], k: [B, 1, Hk, K], v: [B, 1, Hv, V], state: [B, Hv, V, K]
+        Returns:
+          output: bfloat16, shape [B, 1, Hv]
+          new_state: float32, shape [B, Hv, V, K]
+        """
+        B = q.shape[0]
+        Hq, K = q.shape[2], q.shape[3]
+        Hk, K2 = k.shape[2], k.shape[3]
+        Hv, V = v.shape[2], v.shape[3]
+        # The original asserts enforce Hq=4, Hk=4, Hv=8, K=128, V=128, T=1.
+        # We keep these constraints in the implementation for correctness.
+        assert Hq == 4 and Hk == 4 and Hv == 8 and K == 128 and V == 128
+
+        device = q.device
+        dtype = q.dtype
+
+        # Ensure inputs are contiguous (Triton expects simple linear indexing)
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        state = state.contiguous()
+        A_log = A_log.contiguous().to(torch.float32)
+        a = a.contiguous()
+        dt_bias = dt_bias.contiguous().to(torch.float32)
+        b = b.contiguous()
+
+        # Compute gating and beta in Triton
+        H = Hv
+        g = torch.empty((B, 1, H), dtype=torch.float32, device=device)
+        beta = torch.empty((B, 1, H), dtype=torch.float32, device=device)
+
+        grid_g = (B * H,)
+        triton_gate_beta_kernel[grid_g](
+            A_log, a, dt_bias, b, g, beta, B, H
+        )
+
+        # Prepare output and new_state
+        output = torch.empty((B, H), dtype=torch.float32, device=device)
+        new_state = torch.empty((B, H, V, K), dtype=torch.float32, device=device)
+
+        # Handle scale (must be float32 scalar; Triton will receive it by value)
+        if scale is None or scale == 0.0:
+            scale_val = 1.0 / math.sqrt(K)
+        else:
+            scale_val = float(scale)
+
+        # Launch Triton update kernel: one program per (b,h)
+        grid_u = (B * H,)
+        triton_update_kernel[grid_u](
+            q, k, v, state, g, beta, output, new_state, B, H, V, K, scale_val
+        )
+
+        # Return outputs as expected: output as bfloat16 unsqueezed, new_state float32
+        output_bf16 = output.unsqueeze(1).to(torch.bfloat16)
+        return output_bf16, new_state
+
+
+def run(*args):
+    return ModelNew()(*args)

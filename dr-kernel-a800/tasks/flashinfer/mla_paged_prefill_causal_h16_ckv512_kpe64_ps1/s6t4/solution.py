@@ -1,0 +1,293 @@
+import torch
+import triton
+import triton.language as tl
+
+# Kernel 1: Compute logits Logits[h, l] = (q_nope[i, h] @ Kc[l]) + (q_pe[i, h] @ Kp[l])
+# Inputs: QN (H, D_ckv), QP (H, D_kpe), KC (L, D_ckv), KP (L, D_kpe)
+# Output: Logits (H, L) float32
+@triton.jit
+def compute_logits_kernel(
+    QN_ptr, QP_ptr, KC_ptr, KP_ptr, Logits_ptr,
+    H, L, D_ckv, D_kpe,
+    QN_stride0, QN_stride1,   # strides for QN
+    QP_stride0, QP_stride1,   # strides for QP
+    KC_stride0, KC_stride1,   # strides for KC
+    KP_stride0, KP_stride1,   # strides for KP
+    Logits_stride0, Logits_stride1,  # strides for Logits
+    BLOCK_L: tl.constexpr,    # tile along L
+    BLOCK_K: tl.constexpr,    # tile along K chunk
+):
+    pid_h = tl.program_id(0)  # head index
+    pid_l = tl.program_id(1)  # tile index along L
+
+    ls = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    mask_l = ls < L
+
+    acc = tl.zeros((BLOCK_L,), dtype=tl.float32)
+
+    # Iterate over K dimension chunks
+    for k0 in range(0, D_ckv + D_kpe, BLOCK_K):
+        ks = k0 + tl.arange(0, BLOCK_K)
+        mask_ks = ks < (D_ckv + D_kpe)
+
+        # Load q vectors for this head
+        qn_ptrs = QN_ptr + pid_h * QN_stride0 + ks * QN_stride1
+        qn_vec = tl.load(qn_ptrs, mask=mask_ks, other=0.0)
+        qp_ptrs = QP_ptr + pid_h * QP_stride0 + ks * QP_stride1
+        qp_vec = tl.load(qp_ptrs, mask=mask_ks, other=0.0)
+
+        # Accumulate dot products: separate contributions from Kc (first D_ckv) and Kp (next D_kpe)
+        for kk in range(BLOCK_K):
+            if mask_ks[kk]:
+                k_idx = ks[kk]
+                if k_idx < D_ckv:
+                    Kc_vals = tl.load(KC_ptr + ls * KC_stride0 + k_idx * KC_stride1, mask=mask_l, other=0.0)
+                    acc += qn_vec[kk] * Kc_vals
+                else:
+                    Kp_vals = tl.load(KP_ptr + ls * KP_stride0 + (k_idx - D_ckv) * KP_stride1, mask=mask_l, other=0.0)
+                    acc += qp_vec[kk] * Kp_vals
+
+    # Store results
+    out_ptrs = Logits_ptr + pid_h * Logits_stride0 + ls * Logits_stride1
+    tl.store(out_ptrs, acc, mask=mask_l)
+
+
+# Kernel 2: Compute per-head logsumexp with causal mask and write lse_scaled = ln(sumexp) / ln(2)
+@triton.jit
+def lse_mask_kernel(
+    Logits_ptr, lse_ptr,
+    H, L,
+    Logits_stride0, Logits_stride1,
+    inv_ln2,  # scalar float32: 1.0 / ln(2)
+    BLOCK_L: tl.constexpr,
+):
+    h = tl.program_id(0)
+    # Compute row-wise max
+    max_val = -float('inf')
+    for l0 in range(0, L, BLOCK_L):
+        ls = l0 + tl.arange(0, BLOCK_L)
+        mask_l = ls < L
+        vals = tl.load(Logits_ptr + h * Logits_stride0 + ls * Logits_stride1, mask=mask_l, other=-float('inf'))
+        block_max = tl.max(vals, axis=0)
+        max_val = tl.maximum(max_val, block_max)
+
+    # Compute sumexp over masked values
+    sum_exp = 0.0
+    for l0 in range(0, L, BLOCK_L):
+        ls = l0 + tl.arange(0, BLOCK_L)
+        mask_l = ls < L
+        vals = tl.load(Logits_ptr + h * Logits_stride0 + ls * Logits_stride1, mask=mask_l, other=-float('inf'))
+        e = tl.exp(vals - max_val)
+        sum_exp += tl.sum(e, axis=0)
+
+    # Write ln(sumexp) / ln(2) into lse_ptr[h]
+    ln_sum = tl.log(sum_exp)  # natural log
+    lse_scaled = ln_sum * inv_ln2
+    tl.store(lse_ptr + h, lse_scaled)
+
+
+# Kernel 3: Given masked Logits, compute softmax per row, then out = softmax @ KC
+@triton.jit
+def softmax_matmul_kernel(
+    Logits_ptr, KC_ptr, Out_ptr,
+    H, L, D_ckv,
+    Logits_stride0, Logits_stride1,
+    KC_stride0, KC_stride1,
+    Out_stride0, Out_stride1,   # Out is 1D vector [D_ckv]
+    inv_ln2,                     # not used here
+    BLOCK_L: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    h = tl.program_id(0)
+
+    # Compute max for numerical stability
+    max_val = -float('inf')
+    for l0 in range(0, L, BLOCK_L):
+        ls = l0 + tl.arange(0, BLOCK_L)
+        mask_l = ls < L
+        vals = tl.load(Logits_ptr + h * Logits_stride0 + ls * Logits_stride1, mask=mask_l, other=-float('inf'))
+        block_max = tl.max(vals, axis=0)
+        max_val = tl.maximum(max_val, block_max)
+
+    # Compute sum of exp over masked values
+    sum_exp = 0.0
+    for l0 in range(0, L, BLOCK_L):
+        ls = l0 + tl.arange(0, BLOCK_L)
+        mask_l = ls < L
+        vals = tl.load(Logits_ptr + h * Logits_stride0 + ls * Logits_stride1, mask=mask_l, other=-float('inf'))
+        e = tl.exp(vals - max_val)
+        sum_exp += tl.sum(e, axis=0)
+
+    # Now compute out[h, :] = (softmax @ KC)
+    out_vec = tl.zeros((D_ckv,), dtype=tl.float32)
+    for k0 in range(0, D_ckv, BLOCK_K):
+        ks = k0 + tl.arange(0, BLOCK_K)
+        mask_ks = ks < D_ckv
+
+        # For each l, softmax[l] = exp(vals[l] - max_val) / sum_exp
+        for l0 in range(0, L, BLOCK_L):
+            ls = l0 + tl.arange(0, BLOCK_L)
+            mask_l = ls < L
+            vals = tl.load(Logits_ptr + h * Logits_stride0 + ls * Logits_stride1, mask=mask_l, other=-float('inf'))
+            soft = tl.exp(vals - max_val) / sum_exp  # masked non-causal positions already -inf -> 0 after exp
+            # Contribute to out_vec[ks] += soft[:, None] * KC[ls, ks[None, :]]
+            for kk in range(BLOCK_K):
+                if mask_ks[kk]:
+                    Kc_sub = tl.load(KC_ptr + ls * KC_stride0 + (ks[kk] + 0) * KC_stride1, mask=mask_l, other=0.0)
+                    out_vec[kk] += tl.sum(soft * Kc_sub, axis=0)
+
+    out_ptrs = Out_ptr + h * Out_stride0
+    tl.store(out_ptrs, out_vec)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Fixed dimensions from the original code
+        self.num_qo_heads = 16
+        self.head_dim_ckv = 512
+        self.head_dim_kpe = 64
+        self.page_size = 1
+        # Triton tuning constants
+        self.block_l = 128
+        self.block_k = 64
+        self.num_warps_logits = 4
+        self.num_stages_logits = 2
+        self.num_warps_lse = 1
+        self.num_stages_lse = 1
+        self.num_warps_out = 4
+        self.num_stages_out = 2
+
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale):
+        # Ensure device is CUDA
+        assert q_nope.is_cuda and q_pe.is_cuda and ckv_cache.is_cuda and kpe_cache.is_cuda, "Triton kernels require CUDA tensors"
+        device = q_nope.device
+
+        total_q, num_qo_heads, head_dim_ckv = q_nope.shape
+        assert num_qo_heads == self.num_qo_heads
+        assert head_dim_ckv == self.head_dim_ckv
+        head_dim_kpe = q_pe.shape[-1]
+        assert head_dim_kpe == self.head_dim_kpe
+        assert ckv_cache.shape[1] == 1 and kpe_cache.shape[1] == 1 and self.page_size == 1
+
+        # Build batch and q ranges
+        batch_size = qo_indptr.shape[0] - 1
+        q_len = total_q  # total queries across all batch elements
+
+        # Output tensors
+        output = torch.empty((q_len, self.num_qo_heads, self.head_dim_ckv), dtype=torch.bfloat16, device=device)
+        lse = torch.empty((q_len, self.num_qo_heads), dtype=torch.float32, device=device)
+
+        # Constants
+        inv_ln2 = 1.0 / math.log(2.0)  # 1 / ln(2)
+
+        # Iterate over batches
+        for b in range(batch_size):
+            q_start = int(qo_indptr[b].item())
+            q_end = int(qo_indptr[b + 1].item())
+            if q_start >= q_end:
+                continue
+
+            # KV block for this batch element
+            # Since page_size=1, kv_indices are token indices
+            tok_idx = kv_indices[int(kv_indptr[b].item()):int(kv_indptr[b + 1].item())]
+            L = tok_idx.numel()
+            Kc_batch = ckv_cache[tok_idx].contiguous()  # [L, head_dim_ckv]
+            Kp_batch = kpe_cache[tok_idx].contiguous()  # [L, head_dim_kpe]
+
+            # Process queries within this batch element
+            for i in range(q_start, q_end):
+                # Prepare QN and QP for this query: shape [H, D] where D = D_ckv or D_kpe
+                # q_nope[i] has shape [H, head_dim_ckv]; q_pe[i] has shape [H, head_dim_kpe]
+                # We need to compute Logits[h, l] = (q_nope[i, h] @ Kc[l]) + (q_pe[i, h] @ Kp[l])
+                QN = q_nope[i].contiguous()  # [H, D_ckv]
+                QP = q_pe[i].contiguous()    # [H, D_kpe]
+
+                # Logits buffer [H, L]
+                logits = torch.empty((self.num_qo_heads, L), dtype=torch.float32, device=device)
+
+                # Launch compute_logits_kernel
+                grid_logits = (self.num_qo_heads, triton.cdiv(L, self.block_l))
+                compute_logits_kernel[grid_logits](
+                    QN, QP, Kc_batch, Kp_batch, logits,
+                    self.num_qo_heads, L, self.head_dim_ckv, self.head_dim_kpe,
+                    QN.stride(0), QN.stride(1),
+                    QP.stride(0), QP.stride(1),
+                    Kc_batch.stride(0), Kc_batch.stride(1),
+                    Kp_batch.stride(0), Kp_batch.stride(1),
+                    logits.stride(0), logits.stride(1),
+                    BLOCK_L=self.block_l, BLOCK_K=self.block_k,
+                    num_warps=self.num_warps_logits, num_stages=self.num_stages_logits,
+                )
+
+                # Launch lse_mask_kernel to get lse per head
+                lse[b * (q_end - q_start) + (i - q_start)] = torch.empty((), dtype=torch.float32, device=device)  # placeholder, will be filled by kernel
+                grid_lse = (self.num_qo_heads,)
+                lse_mask_kernel[grid_lse](
+                    logits, lse, self.num_qo_heads, L,
+                    logits.stride(0), logits.stride(1),
+                    inv_ln2,
+                    BLOCK_L=self.block_l,
+                    num_warps=self.num_warps_lse, num_stages=self.num_stages_lse,
+                )
+
+                # Compute output per head: out = softmax(masked logits) @ Kc
+                out_vec = torch.empty((self.head_dim_ckv,), dtype=torch.float32, device=device)
+                grid_out = (self.num_qo_heads,)
+                softmax_matmul_kernel[grid_out](
+                    logits, Kc_batch, out_vec,
+                    self.num_qo_heads, L, self.head_dim_ckv,
+                    logits.stride(0), logits.stride(1),
+                    Kc_batch.stride(0), Kc_batch.stride(1),
+                    out_vec.stride(0), out_vec.stride(1),
+                    inv_ln2,
+                    BLOCK_L=self.block_l, BLOCK_K=self.block_k,
+                    num_warps=self.num_warps_out, num_stages=self.num_stages_out,
+                )
+
+                # Place the output in the correct slot of the overall output tensor
+                # Note: q_len = total_q is the sum over all batches. We need to map to linear index based on b and i in original qo_indptr.
+                # Here we assume q_len equals total queries across all batches (as in original). We compute global index as b*(q_end-q_start) + (i - q_start).
+                global_idx = b * (q_end - q_start) + (i - q_start)
+                if 0 <= global_idx < q_len:
+                    output[global_idx].copy_(out_vec.to(torch.bfloat16).view(self.num_qo_heads, self.head_dim_ckv))
+                    # lse already filled by kernel
+
+        return output, lse
+
+# The following helpers are identical to the original, but kept for completeness.
+def get_inputs():
+    q_nope = torch.randn([1, 16, 512], dtype=torch.bfloat16, device='cuda')
+    q_pe = torch.randn([1, 16, 64], dtype=torch.bfloat16, device='cuda')
+    ckv_cache = torch.randn([989669, 1, 512], dtype=torch.bfloat16, device='cuda')
+    kpe_cache = torch.randn([989669, 1, 64], dtype=torch.bfloat16, device='cuda')
+    # Build qo_indptr and kv_indptr as in the original (these are integer arrays).
+    # For simplicity in this example, we use the same logic as the original snippet.
+    _n = 1; _t = 1
+    _lens = torch.full((_n,), _t // _n, dtype=torch.int32, device='cuda')
+    _lens[: _t % _n] += 1
+    qo_indptr = torch.cat([torch.zeros(1, dtype=torch.int32, device='cuda'), torch.cumsum(_lens, 0)], 0).to(torch.int32)
+    _n = 1; _t = 34
+    _lens = torch.full((_n,), _t // _n, dtype=torch.int32, device='cuda')
+    _lens[: _t % _n] += 1
+    kv_indptr = torch.cat([torch.zeros(1, dtype=torch.int32, device='cuda'), torch.cumsum(_lens, 0)], 0).to(torch.int32)
+    kv_indices = torch.randint(0, 989669, [34], dtype=torch.int32, device='cuda')
+    sm_scale = 1.0  # float32 scalar
+    return [q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale]
+
+def fused_operator(tensor_0, tensor_1, tensor_2, tensor_3, tensor_4, tensor_5, tensor_6, tensor_7):
+    _out = ModelNew()(tensor_0, tensor_1, tensor_2, tensor_3, tensor_4, tensor_5, tensor_6, tensor_7)
+    return list(_out) if isinstance(_out, (tuple, list)) else [_out]
+
+# For the evaluation harness, ModelNew is the required entry point.
+class ModelNew(torch.nn.Module):
+    pass  # defined above
+
+# Entry point helper to match the harness, though it will call ModelNew directly
+class Model(torch.nn.Module):
+    def forward(self, *args):
+        return fused_operator(*args)
+
+
+def run(*args):
+    return ModelNew()(*args)

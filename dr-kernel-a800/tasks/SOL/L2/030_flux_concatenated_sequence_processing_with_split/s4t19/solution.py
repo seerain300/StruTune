@@ -1,0 +1,204 @@
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def concat_rows_to_A_kernel(
+    enc_ptr,       # *ptr to [B, T, H]
+    img_ptr,       # *ptr to [B, I, H]
+    A_ptr,         # *ptr to [M, H], M = B*(T+I)
+    B, T, I, H,    # dimensions
+    stride_b_e, stride_t_e, stride_h_e,  # enc strides
+    stride_b_i, stride_i_i, stride_h_i,  # img strides
+    stride_m_a, stride_h_a,               # A strides
+):
+    # Each program handles one output row m in [0, M)
+    pid_m = tl.program_id(axis=0)
+    m = pid_m
+
+    # Compute batch and sequence index within the concatenated stream
+    total_seq = T + I
+    b_val = m // total_seq
+    seq_val = m % total_seq
+
+    # Determine source tensor: if seq_val < T -> encoder, else -> image
+    mask_encoder = seq_val < T
+
+    cols = tl.arange(0, H)
+    mask_cols = cols < H
+
+    if mask_encoder:
+        src_row_e = seq_val
+        # Load row from encoder_hidden_states[b, seq, :]
+        ptr_e = enc_ptr + b_val * stride_b_e + src_row_e * stride_t_e + cols * stride_h_e
+        vals = tl.load(ptr_e, mask=mask_cols, other=0.0)
+    else:
+        src_row_i = seq_val - T
+        ptr_i = img_ptr + b_val * stride_b_i + src_row_i * stride_i_i + cols * stride_h_i
+        vals = tl.load(ptr_i, mask=mask_cols, other=0.0)
+
+    # Store into A[m, :]
+    A_row_ptr = A_ptr + m * stride_m_a + cols * stride_h_a
+    tl.store(A_row_ptr, vals, mask=mask_cols)
+
+
+@triton.jit
+def batched_matmul_kernel(
+    A_ptr,     # *ptr to [M, H]
+    B_ptr,     # *ptr to [H, H] (process_weight.T)
+    C_ptr,     # *ptr to [M, H]
+    M, H,      # sizes
+    stride_m_a, stride_n_a,          # A strides: [M, H]
+    stride_m_b, stride_n_b,          # B strides: [H, H]
+    stride_m_c, stride_n_c,          # C strides: [M, H]
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,           # choose to cover H fully
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)  # tile over M
+    pid_n = tl.program_id(axis=1)  # tile over N=H
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, H, BLOCK_K):
+        offs_k = k + tl.arange(0, BLOCK_K)
+
+        # A tile: [BLOCK_M, BLOCK_K]
+        a_ptrs = A_ptr + offs_m[:, None] * stride_m_a + offs_k[None, :] * stride_n_a
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < H), other=0.0)
+
+        # B tile: [BLOCK_K, BLOCK_N], B is [H, H]
+        b_ptrs = B_ptr + offs_k[:, None] * stride_m_b + offs_n[None, :] * stride_n_b
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] < H) & (offs_n[None, :] < H), other=0.0)
+
+        acc += tl.dot(a, b)
+
+    # store C
+    c_ptrs = C_ptr + offs_m[:, None] * stride_m_c + offs_n[None, :] * stride_n_c
+    tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < H))
+
+
+@triton.jit
+def copy_rows_split_kernel(
+    C_ptr,       # *ptr to [M, H]
+    encoder_out_ptr,  # *ptr to [B, T, H]
+    hidden_out_ptr,   # *ptr to [B, I, H]
+    B, T, I, H,
+    stride_m_c, stride_h_c,
+    eb_stride_b, eb_stride_t, eb_stride_h,
+    ih_stride_b, ih_stride_i, ih_stride_h,
+    BLOCK_N: tl.constexpr,  # 128 for H>=128, else smaller
+):
+    # axis 0: row over M; axis 1: column tile over H
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < H
+
+    m = pid_m
+    # Determine if this row belongs to encoder (first B*T rows) or hidden (remaining)
+    belongs_encoder = m < (B * T)
+
+    if belongs_encoder:
+        b_val = m // T
+        s_val = m % T
+        src_row_ptr = C_ptr + m * stride_m_c + offs_n * stride_h_c
+        vals = tl.load(src_row_ptr, mask=mask_n, other=0.0)
+
+        dest_ptr = encoder_out_ptr + b_val * eb_stride_b + s_val * eb_stride_t + offs_n * eb_stride_h
+        tl.store(dest_ptr, vals, mask=mask_n)
+    else:
+        m_rel = m - (B * T)
+        b_val = m_rel // I
+        s_val = m_rel % I
+        src_row_ptr = C_ptr + m * stride_m_c + offs_n * stride_h_c
+        vals = tl.load(src_row_ptr, mask=mask_n, other=0.0)
+
+        dest_ptr = hidden_out_ptr + b_val * ih_stride_b + s_val * ih_stride_i + offs_n * ih_stride_h
+        tl.store(dest_ptr, vals, mask=mask_n)
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, process_weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Ensure inputs are contiguous and on same device
+        B = hidden_states.shape[0]
+        T = encoder_hidden_states.shape[1]
+        I = hidden_states.shape[1]
+        H = hidden_states.shape[2]
+        assert encoder_hidden_states.shape[2] == H
+        assert process_weight.shape[0] == H and process_weight.shape[1] == H
+
+        device = hidden_states.device
+
+        # Build A = concatenated rows [M, H], M = B*(T+I)
+        M = B * (T + I)
+
+        enc = encoder_hidden_states.contiguous()
+        img = hidden_states.contiguous()
+        A = torch.empty((M, H), dtype=enc.dtype, device=device)
+
+        # Launch concat kernel
+        grid_concat = (M,)
+        concat_rows_to_A_kernel[grid_concat](
+            enc, img, A,
+            B, T, I, H,
+            enc.stride(0), enc.stride(1), enc.stride(2),
+            img.stride(0), img.stride(1), img.stride(2),
+            A.stride(0), A.stride(1),
+            num_warps=1, num_stages=2,
+        )
+
+        # Prepare weight^T as [H, H], contiguous
+        weight_T = process_weight.t().contiguous()
+
+        # Allocate C = [M, H]
+        C = torch.empty((M, H), dtype=A.dtype, device=device)
+
+        # Choose tile sizes based on H for robustness (ensure BLOCK_N divides H when possible)
+        if H >= 256:
+            BLOCK_M, BLOCK_N, BLOCK_K = 128, 256, 64
+        elif H >= 128:
+            BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+        elif H >= 64:
+            BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+        else:
+            BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 32
+
+        grid_mm = (triton.cdiv(M, BLOCK_M), triton.cdiv(H, BLOCK_N))
+        batched_matmul_kernel[grid_mm](
+            A, weight_T, C,
+            M, H,
+            A.stride(0), A.stride(1),
+            weight_T.stride(0), weight_T.stride(1),
+            C.stride(0), C.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            num_warps=4, num_stages=2,
+        )
+
+        # Split C into encoder and hidden outputs
+        processed_encoder = torch.empty((B, T, H), dtype=C.dtype, device=device)
+        processed_hidden = torch.empty((B, I, H), dtype=C.dtype, device=device)
+
+        # Use BLOCK_N=128 for copy splitting; mask handles H < 128
+        grid_split = (M, triton.cdiv(H, 128))
+        copy_rows_split_kernel[grid_split](
+            C,
+            processed_encoder, processed_hidden,
+            B, T, I, H,
+            C.stride(0), C.stride(1),
+            processed_encoder.stride(0), processed_encoder.stride(1), processed_encoder.stride(2),
+            processed_hidden.stride(0), processed_hidden.stride(1), processed_hidden.stride(2),
+            BLOCK_N=128,
+            num_warps=1, num_stages=2,
+        )
+
+        return processed_encoder, processed_hidden
+
+
+def run(*args):
+    return ModelNew()(*args)

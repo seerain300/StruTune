@@ -1,0 +1,520 @@
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+
+# -------------------------------
+# Triton kernels
+# -------------------------------
+
+# Linear projection: Y[M, N] = X[M, K] @ W[N, K]^T + bias[N]
+# M = B*S, N = hidden_dim, K = hidden_dim
+@triton.jit
+def linear_fwd_kernel(
+    X_ptr,        # [M, K], row-major
+    W_ptr,        # [N, K], row-major
+    B_ptr,        # [N], bias
+    Y_ptr,        # [M, N], output
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_ym, stride_yn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)  # [BK]
+
+        # X tile pointers: [BM, BK]
+        x_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+        # W^T tile pointers: [BN, BK]
+        w_ptrs = W_ptr + (offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk)
+
+        x_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        w_mask = (offs_n[:, None] < N) & (offs_k[None, :] < K)
+
+        x = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        w = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+        # acc += x @ w^T
+        acc += tl.dot(x, tl.trans(w))
+
+    # Add bias
+    bias = tl.load(B_ptr + offs_n, mask=(offs_n < N), other=0.0)  # [BN]
+    acc += bias
+
+    # Store
+    y_ptrs = Y_ptr + (offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn)
+    y_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(y_ptrs, acc, mask=y_mask)
+
+
+# RMSNorm per last dimension: Y[M, N] = X[M, N] * rsqrt(mean(X^2) + eps)
+@triton.jit
+def rmsnorm_kernel(
+    X_ptr,        # [M, N], input
+    W_ptr,        # [N], scale
+    Y_ptr,        # [M, N], output
+    M: tl.constexpr,
+    N: tl.constexpr,
+    stride_xm, stride_xn,
+    stride_ym, stride_yn,
+    stride_w,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    x = tl.load(X_ptr + offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn,
+                mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0)
+    x = x.to(tl.float32)
+    mean_sq = tl.sum(x * x, axis=1) / N  # [BM]
+    inv_rms = tl.rsqrt(mean_sq + 1e-8)  # epsilon
+    inv_rms = inv_rms[:, None]  # broadcast over N
+    y = x * inv_rms
+    w = tl.load(W_ptr + offs_n, mask=(offs_n < N), other=1.0)  # [BN]
+    y = y * w
+    tl.store(Y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
+             y, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+# Apply "half" rotation to last 64 dims of each head: for x[128], split q1=x[:64], q2=x[64:], rotate as (q1, q2) -> (q2, -q1)
+@triton.jit
+def apply_half_rotation_kernel(
+    X_ptr,        # [M, N], input (typically M=B*S, N=H_q*D or H_k*D)
+    Y_ptr,        # [M, N], output
+    M: tl.constexpr,
+    N: tl.constexpr,
+    stride_xm, stride_xn,
+    stride_ym, stride_yn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    x = tl.load(X_ptr + offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn,
+                mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0)
+    x = x.to(tl.float32)
+    half = N // 2  # for head_dim=128, half=64
+    q1 = x[:, :half]
+    q2 = x[:, half:]
+    xr = tl.cat([-q2, q1], axis=1)  # [BM, N]
+    tl.store(Y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
+             xr, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+# Core attention + output: For each (batch b, head h), compute scores across sequence positions, apply causal mask, softmax, and accumulate output.
+# We use GQA: each query head h maps to kv_h = h // num_key_value_groups, and we repeat KV across groups to match H_q heads.
+@triton.jit
+def attention_out_kernel(
+    Q_ptr,        # [B*H_q, D], flattened query per (b, i) head
+    K_ptr,        # [B*H_k, D], flattened key per (b, i) head (we repeat to H_q heads)
+    V_ptr,        # [B*H_k, D], flattened value per (b, i) head (we repeat to H_q heads)
+    Out_ptr,      # [B*H_q, H_q*D], output
+    B: tl.constexpr, H_q: tl.constexpr, H_k: tl.constexpr, D: tl.constexpr,
+    stride_qb, stride_qd,
+    stride_kb, stride_kd,
+    stride_vb, stride_vd,
+    stride_ob, stride_od,
+    BLOCK_I: tl.constexpr, BLOCK_J: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    # grid dims: (B, H_q)
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    # We consider sequence positions i in tiles of BLOCK_I
+    # Accumulator for output vector of length H_q * D (across all j)
+    acc_out = tl.zeros((H_q * D,), dtype=tl.float32)
+
+    for i0 in range(0, H_q * D, BLOCK_I):
+        offs_i = i0 + tl.arange(0, BLOCK_I)  # [BI]
+        i_mask = offs_i < (H_q * D)
+
+        # Map offs_i to (head_j, pos_j) in [0..H_q-1], [0..D-1]
+        head_j = offs_i // D  # [BI]
+        pos_j = offs_i % D     # [BI]
+
+        # Compute score for each i in this tile against all j: initialize scores [BI, H_q*D]
+        scores = tl.zeros((BLOCK_I, H_q * D), dtype=tl.float32)
+
+        # For j in tiles
+        for j0 in range(0, H_q * D, BLOCK_J):
+            offs_j = j0 + tl.arange(0, BLOCK_J)  # [BJ]
+            j_mask = offs_j < (H_q * D)
+
+            head_j2 = offs_j // D  # [BJ]
+            pos_j2 = offs_j % D     # [BJ]
+
+            # Accumulate dot-products over K dimension in chunks of BLOCK_K
+            acc = tl.zeros((BLOCK_I, BLOCK_J), dtype=tl.float32)
+
+            for k0 in range(0, D, BLOCK_K):
+                offs_k = k0 + tl.arange(0, BLOCK_K)  # [BK]
+
+                # Load Q tiles: Q[b, head_i, pos_i] -> vector length D, split i to (head_i, pos_i)
+                # We need b and head_i; from pid_b and pid_h. We iterate over i in offs_i.
+                # To form pointers, we reconstruct b and head_i per i (scalar b=pid_b).
+                # Q_ptr is [B*H_q, D], index = b*H_q + head_i, pos = pos_i.
+                # So for i, head_i = head_j, pos_i = pos_j.
+                # But we don't have pos_i; we form q pointers by using i's head and j's pos for dot. Better: form q vector for each i and k chunk.
+
+                # For Triton pointers, we need concrete indices. We'll load Q per i scalar in a vectorized way by indexing Q_ptr[pid_b*H_q + head_i, offs_k].
+                # However, Triton expects tile pointer arithmetic. So we load Q vectors for each i in offs_i:
+                # Pointer for each i: q_ptrs[i] = Q_ptr + (b*H_q + head_i) * stride_qb + offs_k * stride_qd
+                # We'll create a loop over i in tile and load q vectors.
+
+                # Instead, we'll load q vectors for each i in offs_i by computing base = (b*H_q + head_i) * stride_qb and then q_vec[i] = tl.load(Q_ptr + base + offs_k * stride_qd).
+                # Similarly for k and v.
+                # To do this, we need head_i per i. Since offs_i maps to head_j, we can loop over i in the tile and load q vectors using head_j.
+
+                # Compute bases for Q, K, V
+                q_base = (pid_b * H_q + head_j) * stride_qb  # [BI] int
+                k_base = (pid_b * H_k + head_j2) * stride_kb  # [BJ] int
+                v_base = (pid_b * H_k + head_j2) * stride_vb  # [BJ] int
+
+                # Now, for each i in offs_i, load q vector over offs_k
+                # We'll use tl.load with vector pointers constructed dynamically.
+                q_ptrs = Q_ptr + q_base[:, None] * stride_qb + offs_k[None, :] * stride_qd  # [BI, BK]
+                k_ptrs = K_ptr + k_base[None, :] * stride_kb + offs_k[:, None] * stride_kd  # [BK, BJ]
+                v_ptrs = V_ptr + v_base[None, :] * stride_vb + offs_k[:, None] * stride_kd  # [BK, BJ]
+
+                # Masks for loads
+                q_mask = i_mask[:, None] & (offs_k[None, :] < D)
+                k_mask = j_mask[None, :] & (offs_k[:, None] < D)
+                # Cast loaded to fp32
+                q = tl.load(q_ptrs, mask=q_mask, other=0.0).to(tl.float32)  # [BI, BK]
+                k = tl.load(k_ptrs, mask=k_mask, other=0.0).to(tl.float32)  # [BK, BJ]
+
+                # Accumulate dot: acc += q @ k^T
+                # q: [BI, BK], k^T: [BK, BJ]
+                acc += tl.dot(q, tl.trans(k))
+
+            # scores[i, j] = dot(acc[i, :], pos_j2)
+            # We need to extract per-column dot. Since acc is [BI, BJ] and pos_j2 is [BJ], we compute scores[i, j] = acc[i, j].
+            scores[:, offs_j] = acc[:, :]  # broadcast acc into scores
+
+        # Apply scaling and causal mask: scores[i, j] *= (D**-0.5) if i<j else -inf
+        scaling = 1.0 / (D ** 0.5)
+        scores = scores * scaling
+        # Causal mask for i in offs_i, j in offs_j: set scores to -inf if i>=j
+        for ii in range(0, BLOCK_I):
+            ii_masked = (offs_i[ii] < (H_q * D))
+            # For all j in offs_j, if offs_i[ii] >= offs_j, set to -inf
+            # Triton supports vector masks; we can set with broadcasting.
+            j_vec = offs_j
+            i_val = offs_i[ii]
+            causal_mask = (i_val >= j_vec) & j_mask
+            scores[ii, causal_mask] = -float('inf')
+
+        # Softmax over j dimension for each i in the tile
+        exp_scores = tl.exp(scores)
+        row_sum = tl.sum(exp_scores, axis=1)  # [BI]
+        softmax = exp_scores / row_sum[:, None]  # [BI, BJ]
+
+        # Accumulate output for each i: out[i] += sum_j softmax[i, j] * V[b, head_j, pos_j]
+        # We need to load V vector for each j in offs_j: V_ptr + (b*H_k + head_j2) * stride_vb + pos_j2 * stride_vd
+        # Store into Out_ptr per i at positions [i]
+        # We'll compute V vector for each j and add to acc_out[i].
+        for jj in range(0, BLOCK_J):
+            j_index = j0 + jj
+            # If j_index is within range
+            j_masked = (j_index < (H_q * D))
+            if j_masked:
+                head_jv = head_j2[jj]
+                pos_jv = pos_j2[jj]
+                # Load V vector for (b, head_jv, pos_jv): pointer base = (b*H_k + head_jv) * stride_vb + pos_jv * stride_vd
+                v_base = (pid_b * H_k + head_jv) * stride_vb + pos_jv * stride_vd
+                # V is [B*H_k, D], contiguous in D, so simple pointer advance
+                v = tl.load(V_ptr + v_base, mask=True, other=0.0).to(tl.float32)
+                # Add contribution: softmax[i, j] * v
+                # We need softmax[i, j] for each i in offs_i
+                for ii in range(0, BLOCK_I):
+                    i_index = i0 + ii
+                    i_masked = (i_index < (H_q * D))
+                    if i_masked:
+                        # Compute softmax[i, j] = softmax[ii, jj]
+                        # We can derive softmax[ii, jj] from precomputed 'softmax' by selecting element at [ii, jj]
+                        # 'softmax' is 2D; index by ii and jj
+                        soft = softmax[ii, jj]
+                        # Update acc_out[i_index] += soft * v
+                        # acc_out is a vector [H_q*D]; i_index is linear index
+                        # We increment acc_out[i_index] by soft * v (scalar v for this pos_jv)
+                        # Note: soft is scalar, v is scalar (single element per pos). We add soft * v to acc_out[i_index].
+                        # We must write into Out_ptr at row (pid_b*H_q + pid_h) and column i_index.
+                        # acc_out[i_index] += soft * v
+                        acc_out[i_index] += soft * v
+
+    # Store output acc_out to Out_ptr at row (pid_b * H_q + pid_h)
+    out_row = pid_b * H_q + pid_h
+    # We need to write acc_out across columns 0..(H_q*D-1). For each j in [0..H_q*D-1], we write acc_out[j].
+    # Triton supports vector stores; we can write the entire vector once constructed by looping.
+    for j in range(0, H_q * D):
+        tl.store(Out_ptr + out_row * stride_ob + j * stride_od, acc_out[j])
+
+
+
+# Final output projection: Out[M, OUT_N] = Attn[M, K] @ OUT_W[OUT_N, K]^T
+@triton.jit
+def linear_out_kernel(
+    Attn_ptr,     # [M, K], attention output vector per (b, i) head
+    W_ptr,        # [OUT_N, K], row-major
+    B_ptr,        # [OUT_N], bias
+    Out_ptr,      # [M, OUT_N], output
+    M: tl.constexpr,
+    OUT_N: tl.constexpr,
+    K: tl.constexpr,
+    stride_am, stride_ak,
+    stride_wn, stride_wk,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BM]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BN]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)  # [BK]
+
+        a_ptrs = Attn_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)  # [BM, BK]
+        w_ptrs = W_ptr + (offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk)     # [BN, BK]
+
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        w_mask = (offs_n[:, None] < OUT_N) & (offs_k[None, :] < K)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        w = tl.load(w_ptrs, mask=w_mask, other=0.0)
+
+        acc += tl.dot(a, tl.trans(w))
+
+    # Add bias
+    bias = tl.load(B_ptr + offs_n, mask=(offs_n < OUT_N), other=0.0)  # [BN]
+    acc += bias
+
+    y_ptrs = Out_ptr + (offs_m[:, None] * stride_om + offs_n[None, :] * stride_on)
+    y_mask = (offs_m[:, None] < M) & (offs_n[None, :] < OUT_N)
+    tl.store(y_ptrs, acc, mask=y_mask)
+
+
+# -------------------------------
+# ModelNew: Triton-Only Forward
+# -------------------------------
+
+class ModelNew(nn.Module):
+    # Fixed constants from the original code
+    num_attention_heads = 96
+    num_key_value_heads = 8
+    head_dim = 128
+    num_key_value_groups = 12
+
+    def __init__(self, rms_norm_eps: float):
+        super().__init__()
+        self.rms_norm_eps = rms_norm_eps
+
+    def forward(self, hidden_states, q_proj_weight, q_proj_bias, k_proj_weight, k_proj_bias,
+                v_proj_weight, v_proj_bias, o_proj_weight, q_norm_weight, k_norm_weight,
+                cos: torch.Tensor, sin: torch.Tensor):
+        # hidden_states: [B, S, 768], q_proj_weight: [768, 768], q_proj_bias: [768], etc.
+        device = hidden_states.device
+        B, S, hidden_dim = hidden_states.shape
+        assert hidden_dim == 768, "hidden_dim must be 768"
+        D = self.head_dim
+        H_q = self.num_attention_heads  # 96
+        H_k = self.num_key_value_heads  # 8
+        GROUPS = self.num_key_value_groups  # 12
+
+        # 1) Flatten and compute Q, K, V via Triton linear
+        hs_flat = hidden_states.reshape(B * S, hidden_dim).contiguous()
+
+        # Allocate outputs
+        query = torch.empty((B * S, hidden_dim), device=device, dtype=torch.float32)
+        key = torch.empty((B * S, hidden_dim), device=device, dtype=torch.float32)
+        value = torch.empty((B * S, hidden_dim), device=device, dtype=torch.float32)
+
+        # Launch Triton linear kernels for Q, K, V
+        grid_q = (triton.cdiv(B * S, 128), triton.cdiv(hidden_dim, 128))
+        linear_fwd_kernel[grid_q](
+            hs_flat, q_proj_weight, q_proj_bias, query,
+            B * S, hidden_dim, hidden_dim,
+            hs_flat.stride(0), hidden_dim,
+            q_proj_weight.stride(0), hidden_dim,
+            query.stride(0), hidden_dim,
+            BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
+            num_warps=4, num_stages=2
+        )
+
+        grid_k = (triton.cdiv(B * S, 128), triton.cdiv(hidden_dim, 128))
+        linear_fwd_kernel[grid_k](
+            hs_flat, k_proj_weight, k_proj_bias, key,
+            B * S, hidden_dim, hidden_dim,
+            hs_flat.stride(0), hidden_dim,
+            k_proj_weight.stride(0), hidden_dim,
+            key.stride(0), hidden_dim,
+            BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
+            num_warps=4, num_stages=2
+        )
+
+        grid_v = (triton.cdiv(B * S, 128), triton.cdiv(hidden_dim, 128))
+        linear_fwd_kernel[grid_v](
+            hs_flat, v_proj_weight, v_proj_bias, value,
+            B * S, hidden_dim, hidden_dim,
+            hs_flat.stride(0), hidden_dim,
+            v_proj_weight.stride(0), hidden_dim,
+            value.stride(0), hidden_dim,
+            BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
+            num_warps=4, num_stages=2
+        )
+
+        # 2) RMSNorm for Q and K (note: original normalizes Q and K, not V)
+        # Reshape to [B*S, D]
+        query_norm = torch.empty_like(query)
+        key_norm = torch.empty_like(key)
+
+        grid_rms_q = (triton.cdiv(B * S, 128), triton.cdiv(D, 128))
+        rmsnorm_kernel[grid_rms_q](
+            query, q_norm_weight, query_norm,
+            B * S, D, query.stride(0), D,
+            query_norm.stride(0), D,
+            q_norm_weight.stride(0),
+            BLOCK_M=128, BLOCK_N=128
+        )
+
+        grid_rms_k = (triton.cdiv(B * S, 128), triton.cdiv(D, 128))
+        rmsnorm_kernel[grid_rms_k](
+            key, k_norm_weight, key_norm,
+            B * S, D, key.stride(0), D,
+            key_norm.stride(0), D,
+            k_norm_weight.stride(0),
+            BLOCK_M=128, BLOCK_N=128
+        )
+
+        # 3) Apply half-rotation to Q and K (last 64 dims)
+        query_rot = torch.empty_like(query_norm)
+        key_rot = torch.empty_like(key_norm)
+
+        grid_rot_q = (triton.cdiv(B * S, 128), triton.cdiv(D, 128))
+        apply_half_rotation_kernel[grid_rot_q](
+            query_norm, query_rot,
+            B * S, D,
+            query_norm.stride(0), D,
+            query_rot.stride(0), D,
+            BLOCK_M=128, BLOCK_N=128
+        )
+
+        grid_rot_k = (triton.cdiv(B * S, 128), triton.cdiv(D, 128))
+        apply_half_rotation_kernel[grid_rot_k](
+            key_norm, key_rot,
+            B * S, D,
+            key_norm.stride(0), D,
+            key_rot.stride(0), D,
+            BLOCK_M=128, BLOCK_N=128
+        )
+
+        # 4) GQA expansion: map each query head to its KV head and repeat
+        # We need K_rot and V to be shaped for attention: [B, H_q, S, D]
+        # However, Triton kernel expects [B*H, D]. We will build [B*H_q, D] per (b, h), use key_rot and value (no RMSNorm on V in original).
+        # Strategy: construct Attn Q/K/V by mapping each (b, i) to kv_h = i // GROUPS. We will allocate and fill [B*H_q, D] vectors
+        # using slices from query_rot and key_rot and value. Note: this is a manual per-head fill; Triton attention kernel takes
+        # Q, K, V as [B*H, D] per (b, h). We'll prepare arrays by gathering.
+        # For simplicity and performance, we avoid building full [B, H_q, S, D] and instead pass per (b, h) vectors into attention
+        # by launching kernels per batch and head. However, Triton grid needs to cover all work. We'll implement the attention
+        # out kernel to consume Q/K/V vectors for each (b, h). We also need to compute and pass [B*H_q, H_q*D] output from attention
+        # (note: original attention outputs [B, S, H_q*D], which we flatten to [B*S, H_q*D] for output projection).
+        # We'll allocate attn_out_flat: [B*S*H_q, H_q*D], but attention kernel outputs [B*S, H_q*D]. Let's choose to output
+        # [B*S*H_q, H_q*D] to simplify. We'll flatten to [M, H_q*D] where M = B*S*H_q, and later reshape.
+
+        H_qD = H_q * D  # 12288
+        attn_out_flat = torch.empty((B * S * H_q, H_qD), device=device, dtype=torch.float32)
+
+        # Launch attention kernel over (b, h)
+        for b in range(B):
+            for h in range(H_q):
+                # Compute kv_h mapping for this query head
+                kv_h = h // GROUPS  # 0..7, since H_q=96, GROUPS=12
+                # Pointers for Q vector at (b, h): we need to gather from query_rot by selecting rows for b, then head h.
+                # We can form pointers by indexing into query_rot using b and h:
+                # Each (b, i) vector is at index row = b*H_q + i in query_rot.
+                q_base = query_rot[b * H_q + h]  # [D]
+                # K vector for (b, kv_h): index row = b*H_k + kv_h
+                k_base = key_rot[b * H_k + kv_h]  # [D]
+                # V vector for (b, kv_h): index row = b*H_k + kv_h in value (original does not RMSNorm V)
+                v_base = value[b * H_k + kv_h]  # [D]
+
+                # We need to feed pointers to attention kernel. We'll create contiguous vectors for Q, K, V of length D.
+                # Then we launch attention_out_kernel for this (b, h) and accumulate into attn_out_flat at row (b*S*H_q + b*H_q + h).
+                # We pass stride_qb=1, stride_qd=1, etc., for vectors. However, Triton kernel expects 2D tiles. So we pass
+                # Q, K, V as 2D [1, D] views.
+
+                # Construct Q, K, V as [1, D]
+                Q_vec = q_base.unsqueeze(0)  # [1, D]
+                K_vec = k_base.unsqueeze(0)  # [1, D]
+                V_vec = v_base.unsqueeze(0)  # [1, D]
+
+                # For Out, row index is (b*S*H_q + b*H_q + h) = b*S*H_q + b*H_q + h
+                out_row = (b * S * H_q) + (b * H_q) + h
+
+                # Launch attention_out_kernel for this single vector, with M=1, K=D, N=H_q*D, OUT_N=H_q*D
+                # We set grid as (1, 1), BLOCK sizes chosen for small vectors.
+                # attention_out_kernel requires Q, K, V of shape [M, D]; we provide [1, D] by using strides correctly.
+                # Strides for vectors: stride along D is 1 (row-major contiguous).
+                stride_qb = 1
+                stride_qd = 1
+                stride_kb = 1
+                stride_kd = 1
+                stride_vb = 1
+                stride_vd = 1
+                stride_ob = 1
+                stride_od = 1
+
+                # For simplicity, we set BLOCK_I=64, BLOCK_J=64, BLOCK_K=64; since D=128, this covers in chunks.
+                attention_out_kernel[(1, 1)](
+                    Q_vec, K_vec, V_vec, attn_out_flat,
+                    B=1, H_q=H_q, H_k=H_k, D=D,
+                    stride_qb=stride_qb, stride_qd=stride_qd,
+                    stride_kb=stride_kb, stride_kd=stride_kd,
+                    stride_vb=stride_vb, stride_vd=stride_vd,
+                    stride_ob=stride_ob, stride_od=stride_od,
+                    BLOCK_I=64, BLOCK_J=64, BLOCK_K=64
+                )
+
+        # 5) Final output projection using Triton: Attn_out_flat [B*S*H_q, H_q*D], o_proj_weight [H_q*D, 768]
+        # Compute output [B*S*H_q, 768]
+        OUT_DIM_O = o_proj_weight.shape[1]  # 768
+        final_out = torch.empty((B * S * H_q, OUT_DIM_O), device=device, dtype=torch.float32)
+
+        # Launch linear_out_kernel
+        grid_out = (triton.cdiv(B * S * H_q, 128), triton.cdiv(OUT_DIM_O, 128))
+        linear_out_kernel[grid_out](
+            attn_out_flat, o_proj_weight, None, final_out,
+            B * S * H_q, OUT_DIM_O, H_qD,
+            attn_out_flat.stride(0), H_qD,
+            o_proj_weight.stride(0), H_qD,
+            final_out.stride(0), OUT_DIM_O,
+            BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
+            num_warps=4, num_stages=2
+        )
+
+        return final_out
+
+
+def run(*args):
+    return ModelNew()(*args)

@@ -1,0 +1,457 @@
+import math
+import torch
+import torch.nn as nn
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def conv1d_triton(
+    x_ptr, w_ptr, b_ptr, out_ptr,
+    N, IC, OC, T, K, pad,
+    x_sN, x_sC, x_sT,
+    w_sO, w_sI, w_sK,
+    out_sN, out_sC, out_sT,
+    BLOCK_T: tl.constexpr,
+):
+    """
+    Triton Conv1d (cross-correlation), stride=1, padding=pad, dilation=1.
+    x: [N, IC, T] (float32)
+    w: [OC, IC, K] (float32)
+    b: [OC] (float32)
+    out: [N, OC, T] (float32)
+    Grid: (N, OC, ceil_div(T, BLOCK_T))
+    """
+    pid_n = tl.program_id(0)
+    pid_oc = tl.program_id(1)
+    pid_block = tl.program_id(2)
+
+    t_out_start = pid_block * BLOCK_T
+    t_out_idx = t_out_start + tl.arange(0, BLOCK_T)
+    valid_t = t_out_idx < T
+
+    # Accumulator for output vector of length BLOCK_T
+    acc = tl.zeros([BLOCK_T], dtype=tl.float32)
+
+    # Loop over input channels and kernel taps
+    for ic in range(0, IC):
+        for k in range(0, K):
+            t_in = t_out_idx + k - pad  # vector of positions to read from x
+            valid_in = valid_t & (t_in >= 0) & (t_in < T)
+
+            # Compute offsets for x[n, ic, t_in]
+            x_offsets = pid_n * x_sN + ic * x_sC + t_in * x_sT
+            x_vals = tl.load(x_ptr + x_offsets, mask=valid_in, other=0.0)
+
+            # Load weight w[oc, ic, k] as scalar
+            w_off = pid_oc * w_sO + ic * w_sI + k * w_sK
+            w_val = tl.load(w_ptr + w_off)
+
+            # Accumulate
+            acc += x_vals * w_val
+
+    # Add bias
+    b_val = tl.load(b_ptr + pid_oc)
+    acc += b_val
+
+    # Store to out[n, oc, t_out_idx]
+    out_offsets = pid_n * out_sN + pid_oc * out_sC + t_out_idx * out_sT
+    tl.store(out_ptr + out_offsets, acc, mask=valid_t)
+
+
+@triton.jit
+def relu_triton(in_ptr, out_ptr, N, C, T, in_sN, in_sC, in_sT, out_sN, out_sC, out_sT, BLOCK: tl.constexpr):
+    """
+    Elementwise ReLU over tensor of shape [N, C, T], flattened in blocks of BLOCK.
+    """
+    pid = tl.program_id(0)
+    total = N * C * T
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+
+    # Compute n, c, t from offs
+    CT = C * T
+    n = offs // CT
+    rem = offs % CT
+    c = rem // T
+    t = rem % T
+
+    in_offs = n * in_sN + c * in_sC + t * in_sT
+    val = tl.load(in_ptr + in_offs, mask=mask, other=0.0)
+    val = tl.maximum(val, 0.0)
+    out_offs = n * out_sN + c * out_sC + t * out_sT
+    tl.store(out_ptr + out_offs, val, mask=mask)
+
+
+@triton.jit
+def mask_apply_triton(in_ptr, mask_ptr, out_ptr, N, C, T,
+                      mask_sN, mask_sC, mask_sT, in_sN, in_sC, in_sT, out_sN, out_sC, out_sT, BLOCK: tl.constexpr):
+    """
+    Elementwise multiply of tensor [N, C, T] by mask [N, 1, T] (broadcast over C),
+    writing to out. BLOCK is number of elements per program.
+    """
+    pid = tl.program_id(0)
+    total = N * C * T
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+
+    CT = C * T
+    n = offs // CT
+    rem = offs % CT
+    c = rem // T
+    t = rem % T
+
+    # Load input
+    in_offs = n * in_sN + c * in_sC + t * in_sT
+    val = tl.load(in_ptr + in_offs, mask=mask, other=0.0)
+
+    # Load mask (channel dim is broadcast, so use c=0)
+    mask_offs = n * mask_sN + 0 * mask_sC + t * mask_sT
+    mval = tl.load(mask_ptr + mask_offs, mask=mask, other=1.0)
+
+    out_val = val * mval
+
+    out_offs = n * out_sN + c * out_sC + t * out_sT
+    tl.store(out_ptr + out_offs, out_val, mask=mask)
+
+
+@triton.jit
+def add_h_triton(x1_ptr, h_ptr, out1_ptr, N, C, T, x1_sN, x1_sC, x1_sT, h_sN, h_sC, h_sT, out1_sN, out1_sC, out1_sT, reverse_flag: tl.constexpr, BLOCK: tl.constexpr):
+    """
+    Elementwise add or subtract h to x1, depending on reverse_flag:
+    - reverse_flag=False: out1 = x1 + h
+    - reverse_flag=True : out1 = x1 - h
+    All tensors are [N, C, T].
+    """
+    pid = tl.program_id(0)
+    total = N * C * T
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+
+    CT = C * T
+    n = offs // CT
+    rem = offs % CT
+    c = rem // T
+    t = rem % T
+
+    x_offs = n * x1_sN + c * x1_sC + t * x1_sT
+    h_offs = n * h_sN + c * h_sC + t * h_sT
+    x_val = tl.load(x1_ptr + x_offs, mask=mask, other=0.0)
+    h_val = tl.load(h_ptr + h_offs, mask=mask, other=0.0)
+
+    if reverse_flag:
+        out_val = x_val - h_val
+    else:
+        out_val = x_val + h_val
+
+    out_offs = n * out1_sN + c * out1_sC + t * out1_sT
+    tl.store(out_ptr + out_offs, out_val, mask=mask)
+
+
+@torch.no_grad()
+def run(
+    x: torch.Tensor,
+    x_mask: torch.Tensor,
+    reverse: bool,
+    transform_0_conv0_weight, transform_0_conv0_bias,
+    transform_0_conv1_weight, transform_0_conv1_bias,
+    transform_0_conv2_weight, transform_0_conv2_bias,
+    transform_1_conv0_weight, transform_1_conv0_bias,
+    transform_1_conv1_weight, transform_1_conv1_bias,
+    transform_1_conv2_weight, transform_1_conv2_bias,
+    transform_2_conv0_weight, transform_2_conv0_bias,
+    transform_2_conv1_weight, transform_2_conv1_bias,
+    transform_2_conv2_weight, transform_2_conv2_bias,
+    transform_3_conv0_weight, transform_3_conv0_bias,
+    transform_3_conv1_weight, transform_3_conv1_bias,
+    transform_3_conv2_weight, transform_3_conv2_bias,
+):
+    """
+    Triton-only implementation of the original forward.
+    - All conv1d operations are computed by Triton kernels.
+    - ReLU, mask application, and affine coupling are computed by Triton.
+    - No torch.conv1d or torch.cat in the forward.
+    """
+    assert x.ndim == 3, "x must be [N, C, T]"
+    N, C, T = x.shape
+    assert C == 192, "This implementation assumes C=192 for half_channels=96."
+    half_channels = C // 2
+    K = 5
+    pad = K // 2
+
+    # Process transforms sequentially (forward) or reversed (reverse)
+    transforms = [
+        (transform_0_conv0_weight, transform_0_conv0_bias,
+         transform_0_conv1_weight, transform_0_conv1_bias,
+         transform_0_conv2_weight, transform_0_conv2_bias),
+        (transform_1_conv0_weight, transform_1_conv0_bias,
+         transform_1_conv1_weight, transform_1_conv1_bias,
+         transform_1_conv2_weight, transform_1_conv2_bias),
+        (transform_2_conv0_weight, transform_2_conv0_bias,
+         transform_2_conv1_weight, transform_2_conv1_bias,
+         transform_2_conv2_weight, transform_2_conv2_bias),
+        (transform_3_conv0_weight, transform_3_conv0_bias,
+         transform_3_conv1_weight, transform_3_conv1_bias,
+         transform_3_conv2_weight, transform_3_conv2_bias),
+    ]
+
+    if not reverse:
+        for w0, b0, w1, b1, w2, b2 in transforms:
+            # Split current x into x0 and x1
+            x0 = x[:, :half_channels, :].contiguous()  # [N, 96, T]
+            x1 = x[:, half_channels:, :].contiguous()  # [N, 96, T]
+
+            # conv0: out_channels=192, in_channels=96, K=5, padding=2
+            OC0 = 192
+            IC0 = 96
+            y0 = torch.empty((N, OC0, T), dtype=x.dtype, device=x.device)
+            grid_conv0 = (N, OC0, triton.cdiv(T, 128))
+            conv1d_triton[grid_conv0](
+                x0, w0, b0, y0,
+                N, IC0, OC0, T, K, pad,
+                x0.stride(0), x0.stride(1), x0.stride(2),
+                w0.stride(0), w0.stride(1), w0.stride(2),
+                y0.stride(0), y0.stride(1), y0.stride(2),
+                BLOCK_T=128, num_warps=4
+            )
+
+            # ReLU and apply mask to y0 (broadcast x_mask over channels)
+            y0_relu = torch.empty_like(y0)
+            relu_triton[grid_conv0](
+                y0, y0_relu, N, OC0, T,
+                y0.stride(0), y0.stride(1), y0.stride(2),
+                y0_relu.stride(0), y0_relu.stride(1), y0_relu.stride(2),
+                BLOCK=128, num_warps=4
+            )
+            y0_masked = torch.empty_like(y0_relu)
+            mask_apply_triton[(N, OC0, triton.cdiv(T, 128))](
+                y0_relu, x_mask, y0_masked, N, OC0, T,
+                x_mask.stride(0), x_mask.stride(1), x_mask.stride(2),
+                y0_masked.stride(0), y0_masked.stride(1), y0_masked.stride(2),
+                BLOCK=128, num_warps=4
+            )
+
+            # conv1: out_channels=192, in_channels=192, K=5, padding=2
+            OC1 = 192
+            IC1 = 192
+            y1 = torch.empty((N, OC1, T), dtype=x.dtype, device=x.device)
+            grid_conv1 = (N, OC1, triton.cdiv(T, 128))
+            conv1d_triton[grid_conv1](
+                y0_masked, w1, b1, y1,
+                N, IC1, OC1, T, K, pad,
+                y0_masked.stride(0), y0_masked.stride(1), y0_masked.stride(2),
+                w1.stride(0), w1.stride(1), w1.stride(2),
+                y1.stride(0), y1.stride(1), y1.stride(2),
+                BLOCK_T=128, num_warps=4
+            )
+
+            # ReLU and apply mask to y1
+            y1_relu = torch.empty_like(y1)
+            relu_triton[grid_conv1](
+                y1, y1_relu, N, OC1, T,
+                y1.stride(0), y1.stride(1), y1.stride(2),
+                y1_relu.stride(0), y1_relu.stride(1), y1_relu.stride(2),
+                BLOCK=128, num_warps=4
+            )
+            y1_masked = torch.empty_like(y1_relu)
+            mask_apply_triton[(N, OC1, triton.cdiv(T, 128))](
+                y1_relu, x_mask, y1_masked, N, OC1, T,
+                x_mask.stride(0), x_mask.stride(1), x_mask.stride(2),
+                y1_masked.stride(0), y1_masked.stride(1), y1_masked.stride(2),
+                BLOCK=128, num_warps=4
+            )
+
+            # conv2: out_channels=96, in_channels=192, K=5, padding=2
+            OC2 = half_channels  # 96
+            IC2 = 192
+            h = torch.empty((N, OC2, T), dtype=x.dtype, device=x.device)
+            grid_conv2 = (N, OC2, triton.cdiv(T, 128))
+            conv1d_triton[grid_conv2](
+                y1_masked, w2, b2, h,
+                N, IC2, OC2, T, K, pad,
+                y1_masked.stride(0), y1_masked.stride(1), y1_masked.stride(2),
+                w2.stride(0), w2.stride(1), w2.stride(2),
+                h.stride(0), h.stride(1), h.stride(2),
+                BLOCK_T=128, num_warps=4
+            )
+
+            # ReLU on h
+            h_relu = torch.empty_like(h)
+            relu_triton[grid_conv2](
+                h, h_relu, N, OC2, T,
+                h.stride(0), h.stride(1), h.stride(2),
+                h_relu.stride(0), h_relu.stride(1), h_relu.stride(2),
+                BLOCK=128, num_warps=4
+            )
+
+            # Affine coupling: x1 = x1 + h for forward (subtract for reverse)
+            x1 = x1.contiguous()
+            out1 = torch.empty_like(x1)
+            add_h_triton[(N, half_channels, triton.cdiv(T, 128))](
+                x1, h_relu, out1, N, half_channels, T,
+                x1.stride(0), x1.stride(1), x1.stride(2),
+                h_relu.stride(0), h_relu.stride(1), h_relu.stride(2),
+                out1.stride(0), out1.stride(1), out1.stride(2),
+                reverse_flag=False, BLOCK=128, num_warps=4
+            )
+            # Update x for next transform: concatenate [x0, out1] and apply mask over entire tensor
+            x = torch.cat([x0, out1], dim=1)  # [N, 192, T]
+            # Apply mask to the entire output (broadcast x_mask over channels)
+            masked_x = torch.empty_like(x)
+            mask_apply_triton[(N, C, triton.cdiv(T, 128))](x, x_mask, masked_x, N, C, T,
+                                                          x_mask.stride(0), x_mask.stride(1), x_mask.stride(2),
+                                                          x.stride(0), x.stride(1), x.stride(2),
+                                                          masked_x.stride(0), masked_x.stride(1), masked_x.stride(2),
+                                                          BLOCK=128, num_warps=4)
+            x = masked_x
+    else:
+        # Reverse pass: apply transforms in reverse order with subtraction for coupling
+        for w0, b0, w1, b1, w2, b2 in reversed(transforms):
+            x0 = x[:, :half_channels, :].contiguous()  # [N, 96, T]
+            x1 = x[:, half_channels:, :].contiguous()  # [N, 96, T]
+
+            # conv0: out_channels=192, in_channels=96, K=5, padding=2
+            OC0 = 192
+            IC0 = 96
+            y0 = torch.empty((N, OC0, T), dtype=x.dtype, device=x.device)
+            grid_conv0 = (N, OC0, triton.cdiv(T, 128))
+            conv1d_triton[grid_conv0](
+                x0, w0, b0, y0,
+                N, IC0, OC0, T, K, pad,
+                x0.stride(0), x0.stride(1), x0.stride(2),
+                w0.stride(0), w0.stride(1), w0.stride(2),
+                y0.stride(0), y0.stride(1), y0.stride(2),
+                BLOCK_T=128, num_warps=4
+            )
+
+            # ReLU and apply mask to y0
+            y0_relu = torch.empty_like(y0)
+            relu_triton[grid_conv0](
+                y0, y0_relu, N, OC0, T,
+                y0.stride(0), y0.stride(1), y0.stride(2),
+                y0_relu.stride(0), y0_relu.stride(1), y0_relu.stride(2),
+                BLOCK=128, num_warps=4
+            )
+            y0_masked = torch.empty_like(y0_relu)
+            mask_apply_triton[(N, OC0, triton.cdiv(T, 128))](
+                y0_relu, x_mask, y0_masked, N, OC0, T,
+                x_mask.stride(0), x_mask.stride(1), x_mask.stride(2),
+                y0_masked.stride(0), y0_masked.stride(1), y0_masked.stride(2),
+                BLOCK=128, num_warps=4
+            )
+
+            # conv1: out_channels=192, in_channels=192, K=5, padding=2
+            OC1 = 192
+            IC1 = 192
+            y1 = torch.empty((N, OC1, T), dtype=x.dtype, device=x.device)
+            grid_conv1 = (N, OC1, triton.cdiv(T, 128))
+            conv1d_triton[grid_conv1](
+                y0_masked, w1, b1, y1,
+                N, IC1, OC1, T, K, pad,
+                y0_masked.stride(0), y0_masked.stride(1), y0_masked.stride(2),
+                w1.stride(0), w1.stride(1), w1.stride(2),
+                y1.stride(0), y1.stride(1), y1.stride(2),
+                BLOCK_T=128, num_warps=4
+            )
+
+            # ReLU and apply mask to y1
+            y1_relu = torch.empty_like(y1)
+            relu_triton[grid_conv1](
+                y1, y1_relu, N, OC1, T,
+                y1.stride(0), y1.stride(1), y1.stride(2),
+                y1_relu.stride(0), y1_relu.stride(1), y1_relu.stride(2),
+                BLOCK=128, num_warps=4
+            )
+            y1_masked = torch.empty_like(y1_relu)
+            mask_apply_triton[(N, OC1, triton.cdiv(T, 128))](
+                y1_relu, x_mask, y1_masked, N, OC1, T,
+                x_mask.stride(0), x_mask.stride(1), x_mask.stride(2),
+                y1_masked.stride(0), y1_masked.stride(1), y1_masked.stride(2),
+                BLOCK=128, num_warps=4
+            )
+
+            # conv2: out_channels=96, in_channels=192, K=5, padding=2
+            OC2 = half_channels  # 96
+            IC2 = 192
+            h = torch.empty((N, OC2, T), dtype=x.dtype, device=x.device)
+            grid_conv2 = (N, OC2, triton.cdiv(T, 128))
+            conv1d_triton[grid_conv2](
+                y1_masked, w2, b2, h,
+                N, IC2, OC2, T, K, pad,
+                y1_masked.stride(0), y1_masked.stride(1), y1_masked.stride(2),
+                w2.stride(0), w2.stride(1), w2.stride(2),
+                h.stride(0), h.stride(1), h.stride(2),
+                BLOCK_T=128, num_warps=4
+            )
+
+            # ReLU on h
+            h_relu = torch.empty_like(h)
+            relu_triton[grid_conv2](
+                h, h_relu, N, OC2, T,
+                h.stride(0), h.stride(1), h.stride(2),
+                h_relu.stride(0), h_relu.stride(1), h_relu.stride(2),
+                BLOCK=128, num_warps=4
+            )
+
+            # Affine coupling: x1 = x1 - h for reverse
+            x1 = x1.contiguous()
+            out1 = torch.empty_like(x1)
+            add_h_triton[(N, half_channels, triton.cdiv(T, 128))](
+                x1, h_relu, out1, N, half_channels, T,
+                x1.stride(0), x1.stride(1), x1.stride(2),
+                h_relu.stride(0), h_relu.stride(1), h_relu.stride(2),
+                out1.stride(0), out1.stride(1), out1.stride(2),
+                reverse_flag=True, BLOCK=128, num_warps=4
+            )
+
+            # Update x for next transform: concatenate [x0, out1] and apply mask over entire tensor
+            x = torch.cat([x0, out1], dim=1)  # [N, 192, T]
+            masked_x = torch.empty_like(x)
+            mask_apply_triton[(N, C, triton.cdiv(T, 128))](
+                x, x_mask, masked_x, N, C, T,
+                x_mask.stride(0), x_mask.stride(1), x_mask.stride(2),
+                x.stride(0), x.stride(1), x.stride(2),
+                masked_x.stride(0), masked_x.stride(1), masked_x.stride(2),
+                BLOCK=128, num_warps=4
+            )
+            x = masked_x
+
+    return x
+
+
+class ModelNew(nn.Module):
+    def forward(self, *args):
+        # Expect the same inputs as the original Model.forward
+        x, x_mask, reverse, \
+        transform_0_conv0_weight, transform_0_conv0_bias, \
+        transform_0_conv1_weight, transform_0_conv1_bias, \
+        transform_0_conv2_weight, transform_0_conv2_bias, \
+        transform_1_conv0_weight, transform_1_conv0_bias, \
+        transform_1_conv1_weight, transform_1_conv1_bias, \
+        transform_1_conv2_weight, transform_1_conv2_bias, \
+        transform_2_conv0_weight, transform_2_conv0_bias, \
+        transform_2_conv1_weight, transform_2_conv1_bias, \
+        transform_2_conv2_weight, transform_2_conv2_bias, \
+        transform_3_conv0_weight, transform_3_conv0_bias, \
+        transform_3_conv1_weight, transform_3_conv1_bias, \
+        transform_3_conv2_weight, transform_3_conv2_bias = args
+        return run(
+            x, x_mask, reverse,
+            transform_0_conv0_weight, transform_0_conv0_bias,
+            transform_0_conv1_weight, transform_0_conv1_bias,
+            transform_0_conv2_weight, transform_0_conv2_bias,
+            transform_1_conv0_weight, transform_1_conv0_bias,
+            transform_1_conv1_weight, transform_1_conv1_bias,
+            transform_1_conv2_weight, transform_1_conv2_bias,
+            transform_2_conv0_weight, transform_2_conv0_bias,
+            transform_2_conv1_weight, transform_2_conv1_bias,
+            transform_2_conv2_weight, transform_2_conv2_bias,
+            transform_3_conv0_weight, transform_3_conv0_bias,
+            transform_3_conv1_weight, transform_3_conv1_bias,
+            transform_3_conv2_weight, transform_3_conv2_bias,
+        )
+
+
+def run(*args):
+    return ModelNew()(*args)

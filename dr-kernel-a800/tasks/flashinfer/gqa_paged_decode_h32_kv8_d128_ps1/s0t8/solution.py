@@ -1,0 +1,271 @@
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+# Triton kernel: compute per-token logits for a given (b, h)
+# Grid: (num_tokens,)
+# Inputs:
+#   q_ptr:       *f32, [D] pointer to q[b, h, :]
+#   k_ptr:       *f32, [num_tokens, D] pointer to K gathered per token
+#   logits_ptr:  *f32, [num_tokens] output buffer
+#   num_tokens:  i32
+#   D:           i32
+#   sm_scale:    f32
+@triton.jit
+def _compute_logits_token_kernel(
+    q_ptr,               # *f32, [D]
+    k_ptr,               # *f32, [num_tokens, D]
+    logits_ptr,          # *f32, [num_tokens]
+    num_tokens,          # i32
+    D,                   # i32
+    sm_scale,            # f32
+    BLOCK_SIZE: tl.constexpr,
+):
+    t = tl.program_id(0)
+    if t >= num_tokens:
+        return
+    acc = 0.0
+    for offs in range(0, D, BLOCK_SIZE):
+        idx = offs + tl.arange(0, BLOCK_SIZE)
+        mask = idx < D
+        q_vec = tl.load(q_ptr + idx, mask=mask, other=0.0)
+        k_vec = tl.load(k_ptr + t * D + idx, mask=mask, other=0.0)
+        acc += tl.sum(q_vec * k_vec, axis=0)
+    tl.store(logits_ptr + t, acc * sm_scale)
+
+
+# Triton kernel: accumulate output vector for (b, h) using atomic adds
+# Grid: (num_tokens,)
+# Inputs:
+#   logits_ptr:    *f32, [num_tokens]
+#   kv_indptr:     *i32, [L]
+#   kv_indices:    *i32, [T]
+#   k_ptr:         *f32, [num_tokens, D]
+#   v_ptr:         *f32, [num_tokens, D]
+#   out_ptr:       *f32, [D]
+#   b_idx:         i32
+#   h_idx:         i32
+#   D:             i32
+#   Hk:            i32
+#   gqa_ratio:     i32
+@triton.jit
+def _accumulate_output_atomic_kernel(
+    logits_ptr,  # *f32, [num_tokens]
+    kv_indptr,   # *i32, [L]
+    kv_indices,  # *i32, [T]
+    k_ptr,       # *f32, [num_tokens, D]
+    v_ptr,       # *f32, [num_tokens, D]
+    out_ptr,     # *f32, [D]
+    b_idx,       # i32
+    h_idx,       # i32
+    D,           # i32
+    Hk,          # i32
+    gqa_ratio,   # i32
+):
+    # Each program handles one token 't'
+    t = tl.program_id(0)
+    if t >= tl.num_programs(0):
+        return
+
+    # We need to know range of tokens for batch b_idx: [kv_indptr[b_idx], kv_indptr[b_idx+1))
+    L = tl.load(kv_indptr + (b_idx + 1))
+    b_start = tl.load(kv_indptr + b_idx)
+    num_tokens_b = L - b_start
+
+    # If t is outside this range, exit (grid ensures t < total_tokens, but num_tokens_b guards token count)
+    if t >= num_tokens_b:
+        return
+
+    # kv_head for GQA: kv_head = h_idx // gqa_ratio
+    kv_head = h_idx // gqa_ratio
+
+    # Read logits for this token
+    x_t = tl.load(logits_ptr + t)
+
+    # Compute softmax over all tokens by first computing sum_exp
+    sum_exp = 0.0
+    tt = 0
+    while tt < num_tokens_b:
+        x_tt = tl.load(logits_ptr + tt)
+        sum_exp += tl.exp(x_tt)
+        tt += 1
+
+    attn_t = tl.exp(x_t) / sum_exp
+
+    # Gather k and v for this token and kv_head
+    # token index for this t: tk = kv_indices[b_start + t]
+    tk = tl.load(kv_indices + b_start + t)
+    k_vec = tl.load(k_ptr + t * D + tl.arange(0, D))
+    v_vec = tl.load(v_ptr + tk * (Hk * D) + kv_head * D + tl.arange(0, D))
+
+    # Atomic add attn_t * v_vec to out_ptr
+    for i in range(0, D):
+        tl.atomic_add(out_ptr + i, attn_t * v_vec[i])
+
+
+# Triton kernel: compute lse[b, h] = logsumexp(logits_scaled) / ln(2)
+# Grid: (B, Hq)
+# Inputs:
+#   q_ptr:        *f32, [D] vector for current (b,h)
+#   k_ptr:        *f32, [num_tokens, D]
+#   kv_indptr:    *i32, [L]
+#   kv_indices:   *i32, [T]
+#   logits_ptr:   *f32, [num_tokens]
+#   lse_ptr:      *f32, [B*Hq]
+#   num_tokens:   i32
+#   D:            i32
+#   L:            i32
+#   sm_scale:     f32
+#   Hk:           i32
+#   gqa_ratio:    i32
+@triton.jit
+def _lse_per_bh_kernel(
+    q_ptr,              # *f32, [D]
+    k_ptr,              # *f32, [num_tokens, D]
+    kv_indptr,          # *i32, [L]
+    kv_indices,         # *i32, [T]
+    logits_ptr,         # *f32, [num_tokens]
+    lse_ptr,            # *f32, [B*Hq]
+    b_idx,              # i32
+    h_idx,              # i32
+    num_tokens,         # i32
+    D,                  # i32
+    L,                  # i32
+    sm_scale,           # f32
+    Hk,                 # i32
+    gqa_ratio,          # i32
+):
+    # Online logsumexp over logits_ptr[0:num_tokens]
+    max_val = -float('inf')
+    sum_exp = 0.0
+    tt = 0
+    while tt < num_tokens:
+        x = tl.load(logits_ptr + tt)
+        # Note: x here is logits[t]*sm_scale which was precomputed by _compute_logits_token_kernel
+        if x > max_val:
+            # rescale previous sum
+            sum_exp = sum_exp * tl.exp(max_val - x) + 1.0
+            max_val = x
+        else:
+            sum_exp += tl.exp(x - max_val)
+        tt += 1
+    lse = max_val + tl.log(sum_exp) / tl.log(2.0)
+    out_index = b_idx * Hq + h_idx
+    tl.store(lse_ptr + out_index, lse)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, head_dim=128, num_qo_heads=32, num_kv_heads=8):
+        super().__init__()
+        self.head_dim = head_dim
+        self.num_qo_heads = num_qo_heads
+        self.num_kv_heads = num_kv_heads
+        self.gqa_ratio = num_qo_heads // num_kv_heads
+        self.BLOCK_SIZE = 128  # matches head_dim
+
+    def forward(self, q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale):
+        # q: [B, Hq, D], k_cache, v_cache: [P, 1, Hk, D]
+        B, Hq, D = q.shape
+        P = k_cache.shape[0]
+        Hk = k_cache.shape[2]
+        assert Hq == 32 and Hk == 8, "This implementation expects Hq=32, Hk=8"
+        # Ensure dtypes and contiguity
+        q_f32 = q.contiguous().to(torch.float32)  # [B, Hq, D]
+        k_cache_f32 = k_cache.contiguous().to(torch.float32)  # [P, 1, Hk, D]
+        v_cache_f32 = v_cache.contiguous().to(torch.float32)  # [P, 1, Hk, D]
+        kv_indptr_f32 = kv_indptr.contiguous().to(torch.int32)
+        kv_indices_f32 = kv_indices.contiguous().to(torch.int32)
+
+        # We will compute per (b, h). For Triton kernels, avoid dynamic loops:
+        # 1) For each (b, h), determine token range, compute lse via Triton.
+        # 2) Compute per-token logits via Triton kernel.
+        # 3) Accumulate output vector via Triton atomic kernel.
+
+        output = torch.empty((B, Hq, D), dtype=torch.float32, device=q.device)
+        lse = torch.empty((B, Hq), dtype=torch.float32, device=q.device).fill_(-float('inf'))
+
+        for b in range(B):
+            b_start = int(kv_indptr_f32[b].item())
+            b_end = int(kv_indptr_f32[b + 1].item())
+            num_tokens_b = b_end - b_start
+            if num_tokens_b <= 0:
+                # No tokens for this batch element -> zero output and skip lse
+                lse[b, :] = -float('inf')
+                continue
+
+            # Allocate logits buffer for this batch element (not used for accumulation, only for lse kernel)
+            logits_bh = torch.empty(num_tokens_b, dtype=torch.float32, device=q.device)
+
+            # Launch Triton lse kernel for (b, h) over all heads
+            for h in range(Hq):
+                # Prepare q_vec for this head
+                q_vec = q_f32[b, h, :].contiguous()  # [D], float32
+                # Compute per-token logits with Triton
+                k_batch = k_cache_f32[:, 0, :, :]  # [P, Hk, D]
+                v_batch = v_cache_f32[:, 0, :, :]  # [P, Hk, D]
+                kv_head = h // self.gqa_ratio
+
+                # Gather k and v for tokens in this batch element
+                # k_ptr is [num_tokens_b, D], v_ptr is [num_tokens_b, D]
+                k_ptr = torch.empty((num_tokens_b, D), dtype=torch.float32, device=q.device)
+                v_ptr = torch.empty((num_tokens_b, D), dtype=torch.float32, device=q.device)
+                for i in range(num_tokens_b):
+                    tk = int(kv_indices_f32[b_start + i].item())
+                    k_ptr[i, :] = k_batch[tk, kv_head, :]
+                    v_ptr[i, :] = v_batch[tk, kv_head, :]
+
+                # Launch _compute_logits_token_kernel: grid size = num_tokens_b
+                grid = (num_tokens_b,)
+                _compute_logits_token_kernel[grid](
+                    q_vec, k_ptr.contiguous(), logits_bh, num_tokens_b, D, float(sm_scale), self.BLOCK_SIZE
+                )
+
+                # lse for (b, h)
+                grid_bh = (1,)
+                _lse_per_bh_kernel[grid_bh](
+                    q_vec, k_ptr.contiguous(), kv_indptr_f32, kv_indices_f32, logits_bh, lse, b, h, num_tokens_b, D, (b_end - b_start), float(sm_scale), Hk, self.gqa_ratio
+                )
+
+            # Accumulate output for all heads using Triton atomic kernel
+            # We need to run it once per head to write into output[b, h, :]
+            for h in range(Hq):
+                q_vec = q_f32[b, h, :].contiguous()  # [D]
+                out_vec = torch.zeros(D, dtype=torch.float32, device=q.device)  # output[b, h, :]
+                for i in range(num_tokens_b):
+                    tk = int(kv_indices_f32[b_start + i].item())
+                    k_ptr_i = k_cache_f32[tk, 0, kv_head, :].contiguous()
+                    v_ptr_i = v_cache_f32[tk, 0, kv_head, :].contiguous()
+                    # Compute logits for this token using q_vec and k_ptr_i
+                    logit = 0.0
+                    for offs in range(0, D, self.BLOCK_SIZE):
+                        idx = offs + tl.arange(0, self.BLOCK_SIZE)
+                        mask = idx < D
+                        q_sub = tl.load(q_vec + idx, mask=mask, other=0.0)
+                        k_sub = tl.load(k_ptr_i + idx, mask=mask, other=0.0)
+                        logit += tl.sum(q_sub * k_sub, axis=0)
+                    x_t = logit * float(sm_scale)
+                    # Compute softmax contribution
+                    sum_exp = 0.0
+                    tt = 0
+                    while tt < num_tokens_b:
+                        # read logits of all tokens: we need to access x_tt from logits_bh
+                        x_tt = tl.load(logits_bh + tt)
+                        sum_exp += tl.exp(x_tt)
+                        tt += 1
+                    attn_t = tl.exp(x_t) / sum_exp
+                    v_vec = v_ptr_i
+                    # Atomic add attn_t * v_vec to out_vec
+                    for j in range(0, D):
+                        tl.atomic_add(out_vec + j, attn_t * v_vec[j])
+                # Store out_vec to output[b, h, :]
+                output[b, h, :] = out_vec
+
+        # Cast output to bfloat16 to match original
+        output_bf16 = output.to(torch.bfloat16)
+        return output_bf16, lse
+
+
+def run(*args):
+    return ModelNew()(*args)

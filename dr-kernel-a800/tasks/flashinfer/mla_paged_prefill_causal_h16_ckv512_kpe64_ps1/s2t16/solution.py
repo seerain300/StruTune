@@ -1,0 +1,179 @@
+import torch
+import math
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _forward_single_query_kernel(
+    # Input pointers (original dtype)
+    q_nope_ptr,       # *bf16, shape [Q_total, 16, 512], row-major
+    q_pe_ptr,         # *bf16, shape [Q_total, 16, 64], row-major
+    Kc_sel_ptr,       # *bf16, shape [kv_len, 512], row-major
+    Kp_sel_ptr,       # *bf16, shape [kv_len, 64], row-major
+    output_ptr,       # *bf16, shape [Q_total, 16, 512], row-major
+    lse_ptr,          # *fp32, shape [Q_total, 16]
+    # runtime scalars as torch tensors
+    q_start,          # *int32, 0-dim tensor on device
+    sm_scale,         # *fp32, 0-dim tensor on device
+    ln2_inv,          # *fp32, 0-dim tensor on device
+    # constexpr meta-parameters (specialize per program)
+    q_len: tl.constexpr,      # number of queries in this batch element
+    kv_len: tl.constexpr,     # number of selected KV tokens
+    NUM_HEADS: tl.constexpr,  # 16
+    HEAD_DIM_CKV: tl.constexpr,  # 512
+    HEAD_DIM_KPE: tl.constexpr,  # 64
+):
+    # Each program handles one specific query i within one batch element b.
+    # Grid is (batch_size, q_len): second dim enumerates i in [0, q_len).
+    i = tl.program_id(1)  # query index within this batch element
+
+    # Absolute query index in global q_nope
+    q_abs = q_start + i  # int32 scalar
+
+    # Prepare vectors for indexing
+    h_vec = tl.arange(0, NUM_HEADS)       # [16]
+    k_vec = tl.arange(0, HEAD_DIM_CKV)    # [512]
+    kpe_vec = tl.arange(0, HEAD_DIM_KPE)  # [64]
+    j_vec = tl.arange(0, kv_len)          # [kv_len]
+
+    # Load qn[h, :] and cast to float32
+    qn = tl.zeros((NUM_HEADS, HEAD_DIM_CKV), dtype=tl.float32)
+    for h in h_vec:
+        base_qn = q_abs * (NUM_HEADS * HEAD_DIM_CKV) + h * HEAD_DIM_CKV
+        qn[h, :] = tl.load(q_nope_ptr + base_qn + k_vec, mask=k_vec < HEAD_DIM_CKV, other=0.0).to(tl.float32)
+
+    # Load qp[h, :] and cast to float32
+    qp = tl.zeros((NUM_HEADS, HEAD_DIM_KPE), dtype=tl.float32)
+    for h in h_vec:
+        base_qp = q_abs * (NUM_HEADS * HEAD_DIM_KPE) + h * HEAD_DIM_KPE
+        qp[h, :] = tl.load(q_pe_ptr + base_qp + kpe_vec, mask=kpe_vec < HEAD_DIM_KPE, other=0.0).to(tl.float32)
+
+    # Compute logits per head: logits[h, j] = (qn[h] · Kc_sel[j]) + (qp[h] · Kp_sel[j])
+    logits = tl.zeros((NUM_HEADS, kv_len), dtype=tl.float32)
+    for j in range(kv_len):
+        Kc_j = tl.load(Kc_sel_ptr + j * HEAD_DIM_CKV + k_vec, mask=k_vec < HEAD_DIM_CKV, other=0.0).to(tl.float32)  # [512]
+        Kp_j = tl.load(Kp_sel_ptr + j * HEAD_DIM_KPE + kpe_vec, mask=kpe_vec < HEAD_DIM_KPE, other=0.0).to(tl.float32)  # [64]
+        dot_qn = tl.zeros((kv_len,), dtype=tl.float32)
+        for h in h_vec:
+            dot_qn += qn[h, :] * Kc_j  # scalar
+        dot_qp = tl.zeros((kv_len,), dtype=tl.float32)
+        for h in h_vec:
+            dot_qp += qp[h, :] * Kp_j  # scalar
+        logits[:, j] = dot_qn + dot_qp
+
+    # Scale logits
+    logits = logits * sm_scale
+
+    # Apply causal mask: valid positions j >= prefix_len + i + 1, where prefix_len = kv_len - q_len
+    prefix_len = kv_len - q_len
+    valid_start = prefix_len + i + 1
+    causal_mask = j_vec >= valid_start
+    neg_inf = -float("inf")
+    for j in range(kv_len):
+        if not causal_mask[j]:
+            logits[:, j] = neg_inf
+
+    # Compute logsumexp in log2 per head: lse = logsumexp(logits) / ln(2.0)
+    m = tl.max(logits, axis=1)                          # [NUM_HEADS]
+    exp_logits = tl.exp(logits - m[:, None])           # [NUM_HEADS, kv_len]
+    sumexp = tl.sum(exp_logits, axis=1)                # [NUM_HEADS]
+    lse_val = m + tl.log(sumexp) * ln2_inv             # [NUM_HEADS]
+
+    # Store lse[q_abs, h] as float32
+    for h in h_vec:
+        lse_base = q_abs * NUM_HEADS + h
+        tl.store(lse_ptr + lse_base, lse_val[h])
+
+    # Softmax over j (stable)
+    logits_stable = logits - m[:, None]                # [NUM_HEADS, kv_len]
+    exp_logits = tl.exp(logits_stable)
+    sumexp = tl.sum(exp_logits, axis=1)               # [NUM_HEADS]
+    softmax = exp_logits / sumexp[:, None]            # [NUM_HEADS, kv_len]
+
+    # Output: out[h, :] = sum_j softmax[h, j] * Kc_sel[j, :]
+    out_vec = tl.zeros((HEAD_DIM_CKV,), dtype=tl.float32)
+    for h in h_vec:
+        for j in range(kv_len):
+            Kc_j = tl.load(Kc_sel_ptr + j * HEAD_DIM_CKV + k_vec, mask=k_vec < HEAD_DIM_CKV, other=0.0).to(tl.float32)
+            out_vec += softmax[h, j] * Kc_j
+        # Store output vector for this query and head as bfloat16
+        out_store = out_vec.to(tl.bfloat16)
+        base_out = q_abs * (NUM_HEADS * HEAD_DIM_CKV) + h * HEAD_DIM_CKV
+        for k in range(HEAD_DIM_CKV):
+            tl.store(output_ptr + base_out + k, out_store[k])
+
+
+class ModelNew(torch.nn.Module):
+    def forward(self, q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale):
+        # Shape assertions matching original assumptions
+        assert q_nope.shape[1] == 16 and q_nope.shape[2] == 512, "q_nope must be [Q_total, 16, 512]"
+        assert q_pe.shape[1] == 16 and q_pe.shape[2] == 64, "q_pe must be [Q_total, 16, 64]"
+        assert ckv_cache.shape[1] == 1 and ckv_cache.shape[2] == 512, "ckv_cache must be [num_pages, 1, 512]"
+        assert kpe_cache.shape[1] == 1 and kpe_cache.shape[2] == 64, "kpe_cache must be [num_pages, 1, 64]"
+        assert qo_indptr.dim() == 1 and kv_indptr.dim() == 1, "indptrs must be 1D"
+
+        device = q_nope.device
+        total_q, num_qo_heads, head_dim_ckv = q_nope.shape
+        head_dim_kpe = q_pe.shape[2]
+        len_indptr = qo_indptr.shape[0]
+        batch_size = len_indptr - 1
+
+        # Output and LSE buffers
+        output = torch.empty((total_q, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=device)
+        lse = torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=device)
+
+        # Precompute ln2_inv as torch scalar on device
+        ln2_inv = torch.tensor(1.0 / math.log(2.0), dtype=torch.float32, device=device)
+
+        # Loop over batch elements to compute tok_idx and launch kernel
+        for b in range(batch_size):
+            q_start_val = int(qo_indptr[b].item())
+            q_end_val = int(qo_indptr[b + 1].item())
+            q_len = q_end_val - q_start_val
+
+            # Compute tok_idx for this batch element
+            start = int(kv_indptr[b].item())
+            end = int(kv_indptr[b + 1].item())
+            tok_idx = kv_indices[start:end]  # [kv_len] int32 on device
+
+            # Select Kc_sel and Kp_sel from cache for this batch element
+            Kc_sel = ckv_cache[tok_idx].to(torch.bfloat16)  # [kv_len, 512]
+            Kp_sel = kpe_cache[tok_idx].to(torch.bfloat16)  # [kv_len, 64]
+
+            # Prepare scalar arguments as 0-d tensors on device with correct dtypes
+            q_start_t = torch.tensor(q_start_val, dtype=torch.int32, device=device)
+            sm_scale_t = torch.tensor(sm_scale, dtype=torch.float32, device=device)
+            ln2_inv_t = ln2_inv  # already on device
+
+            # Launch Triton kernel: grid = (1, q_len), each program handles one query i in this batch element
+            grid = (1, q_len)
+            _forward_single_query_kernel[grid](
+                q_nope, q_pe, Kc_sel, Kp_sel, output, lse,
+                q_start_t, sm_scale_t, ln2_inv_t,
+                q_len=q_len, kv_len=Kc_sel.shape[0],
+                NUM_HEADS=16, HEAD_DIM_CKV=512, HEAD_DIM_KPE=64,
+                num_warps=8,  # heuristic; can be tuned
+                num_stages=2  # heuristic; can be tuned
+            )
+
+        return output, lse
+
+
+# Optional: helper to generate inputs
+def get_inputs():
+    device = 'cuda'
+    q_nope = torch.randn([1, 16, 512], dtype=torch.bfloat16, device=device)
+    q_pe = torch.randn([1, 16, 64], dtype=torch.bfloat16, device=device)
+    num_pages = 989669
+    ckv_cache = torch.randn([num_pages, 1, 512], dtype=torch.bfloat16, device=device)
+    kpe_cache = torch.randn([num_pages, 1, 64], dtype=torch.bfloat16, device=device)
+    qo_indptr = torch.tensor([0, 1], dtype=torch.int32, device=device)  # len_indptr=2
+    kv_indptr = torch.tensor([0, 34], dtype=torch.int32, device=device)  # len_indptr=2
+    kv_indices = torch.randint(0, num_pages, [34], dtype=torch.int32, device=device)
+    sm_scale = 1.0
+    return [q_nope, q_pe, ckv_cache, kpe_cache, qo_indptr, kv_indptr, kv_indices, sm_scale]
+
+
+def run(*args):
+    return ModelNew()(*args)
