@@ -15,7 +15,7 @@
 | 13 | 007_hyena_fft_size_padding_rfft | SOL-L1 | ✅ | 16/16 | 1.375 | 1.386 | A·核心靠库(rfft×2) | 1.309 | 1,207,483 | formal_20260914 |
 | 14 | 008_expert_output_weighted_index_add_accumulation | SOL-L1 | ✅ | 16/16 | 2.695 | 2.876 | 干净(-) | 3.259 | 926,741 | formal_20260914 |
 | 15 | 018_fused_rope_with_qk_norm_and_kv_cache_update | SOL-L1 | ✅ | 13/13 | 21.241 | 22.435 | 干净(-) | 23.174 | 1,604,465 | formal_20260914 |
-| 16 | 020_vision_patch_merger_spatial_shuffle_mlp | SOL-L1 | ✅ | 15/15 | 2.160 | 2.246 | C·混合贡献(linear×2) | 2.923 | 2,255,698 | formal_20260914 |
+| 16 | 020_vision_patch_merger_spatial_shuffle_mlp | SOL-L1 | ✅ | 15/15 | 1.464 | 1.527 | 干净(消融替代‡) | 2.923 | 2,255,698 | formal_20260914 + ablation_strict_nolib |
 | 17 | 053_gaussian_topk_sparse_activation | SOL-L1 | ✅ | 12/12 | 31.807 | 49.519 | 干净(-) | 33.329 | 1,506,558 | formal_20260914 |
 | 18 | 058_moe_expert_token_radix_sort_with_prefix_sum | SOL-L1 | ✅ | 16/16 | 10.324 | 10.422 | 干净(-) | 11.307 | 1,205,494 | formal_20260914 + ablation_resume5 |
 | 19 | 070_mamba2_fused_intra_chunk_diagonal_computation | SOL-L1 | ✅ | 14/14 | 192.994 | 225.331 | 干净(-) | 375.506 | 1,779,550 | formal_20260914 |
@@ -35,3 +35,7 @@
 （B·自研为主，1.565x）；消融重跑 43 轮后全 Triton 解为 1.420x（-10%）。终评 JSON 两版均在
 `tasks/005_.../` 两个批次目录。反馈 best 1.559 为 formal 批口径（消融批 43 轮内 best 1.362，
 因守卫中止未满 100 轮，tokens 列为 formal 批消耗）。
+‡ 020 主行同样用强化守卫消融解替代展示：原 formal 解调 F.linear×2（C·混合贡献，2.160x，
+消融证明库贡献 32%）；全 Triton 消融解为 1.464x（51/100 轮中止，终评 15/15 valid）。
+终评 JSON 两版均在 `tasks/020_.../` 两个批次目录。反馈 best 2.923 为 formal 批口径
+（消融批 51 轮内 best 2.229，tokens 列为 formal 批消耗 2,255,698；消融批 948,286）。

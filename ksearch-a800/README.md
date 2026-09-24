@@ -74,7 +74,7 @@ Python 逐步循环被剔除、092 顶补；dsa_topk fp8 因 sm_80 无 fp8e4nv �
 | 13 | 007_hyena_fft_size_padding_rfft | SOL-L1 | ✅ | 16/16 | 1.38 | 1.39 | **A·核心靠库(rfft×2)** | 1.31 | 1.21M | formal |
 | 14 | 008_expert_weighted_index_add | SOL-L1 | ✅ | 16/16 | 2.70 | 2.88 | 干净 | 3.26 | 0.93M | formal |
 | 15 | 018_fused_rope_qk_norm_kv_cache | SOL-L1 | ✅ | 13/13 | 21.24 | 22.44 | 干净 | 23.2 | 1.60M | formal |
-| 16 | 020_patch_merger_spatial_shuffle | SOL-L1 | ✅ | 15/15 | 2.16 | 2.25 | **C·混合贡献(linear×2)** | 2.92 | 2.26M | formal |
+| 16 | 020_patch_merger_spatial_shuffle | SOL-L1 | ✅ | 15/15 | 1.46 | 1.53 | 干净(消融替代‡) | 2.92 | 2.26M | formal+strict‡ |
 | 17 | 053_gaussian_topk_sparse | SOL-L1 | ✅ | 12/12 | 31.81 | 49.52 | 干净 | 33.3 | 1.51M | formal |
 | 18 | 058_moe_radix_sort_prefix_sum | SOL-L1 | ✅ | **16/16** | 10.32 | 10.33 | 干净 | 11.3 | 1.21M | formal+resume5* |
 | 19 | 070_mamba2_intra_chunk | SOL-L1 | ✅ | 14/14 | 192.99 | 225.33 | 干净 | 375.5 | 1.78M | formal |
@@ -97,6 +97,10 @@ Python 逐步循环被剔除、092 顶补；dsa_topk fp8 因 sm_80 无 fp8e4nv �
 † 005 主行用强化守卫消融解（ablation_strict_nolib_20260917）替代展示：formal 解调
 F.linear×2（1.57x）；全 Triton 消融解终评 16/16 valid、1.42x（-10%）。两版 JSON 均在
 `tasks/005_.../` 下；formal 版源码保留于 `best_solutions/005_...@formal_linear.py`。
+‡ 020 主行同样用强化守卫消融解替代展示：formal 解调 F.linear×2（C·混合贡献，2.16x，
+消融证明库贡献 32%）；全 Triton 消融解终评 15/15 valid、1.46x（-32%，51/100 轮中止）。
+两版 JSON 均在 `tasks/020_.../` 下；formal 版源码保留于 `best_solutions/020_...@formal_linear.py`。
+反馈 best / tokens 列为 formal 主批口径。
 \* 094 反馈 best 18347x 为抽样口径（ref 为朴素 Python 循环），因评测成本 4h+/题于 manifest v3 剔除。
 
 **汇总**：valid 28/30（93%）；geomean 范围 0.84x~392.86x；全批 token 总消耗 ~54M
@@ -109,13 +113,15 @@ F.linear×2（1.57x）；全 Triton 消融解终评 16/16 valid、1.42x（-10%�
 
 | 分类 | 数量 | 题 | 特征 |
 |---|---|---|---|
-| 干净 | 20 | 005†(消融替代) | run() 零库调用，加速全部来自自研 Triton |
+| 干净 | 21 | 005†/020‡(消融替代) | run() 零库调用，加速全部来自自研 Triton |
 | B·自研为主 | 3 | 092/036/080 | 库只做投影/小 GEMM 辅助 |
-| C·混合/待消融 | 3 | 020/012/051 | 020 消融证明库贡献 32%（1.46x vs 2.16x） |
+| C·混合/待消融 | 2 | 012/051 | 020 消融证明库贡献 32%（1.46x vs 2.16x） |
 | A·核心靠库 | 4 | gemm/002/015/007 | 核心计算调 cuBLAS/cuDNN/cuFFT；终数全部 ≤1.39x |
 
 † 005 formal 解原判 B·自研为主（linear×2，1.57x）；消融去除 F.linear 后全 Triton 终评
 1.42x（-10%），主表按消融版展示，归入干净类。
+‡ 020 formal 解原判 C·混合贡献（linear×2，2.16x）；消融去除 F.linear 后全 Triton 终评
+1.46x（-32%），主表按消融版展示，归入干净类。
 
 A 类 4 题终数全部 ≤1.39x——加速上限被库调用封死；与 gemm 的"r1-59 自研全败、r60 起退化调库"
 行为史一致（见 `tasks/gemm_.../formal_20260914/campaign_stdout.log`）。
@@ -126,7 +132,7 @@ FlashInfer/SOL 路径无守卫——这是官方代码在本任务源上的原�
 
 | 实验 | 配置 | 结果 |
 |---|---|---|
-| 强化守卫（BANNED 清单+REJECTED 警告） | 005/020 重跑 | 成功消除 F.linear（全 Triton）：005 1.57→1.42x（-10%，**已替代进主表**）、020 2.16→1.46x（-32%）；002(conv2d)/007(rfft)/092(linear) LLM 无视守卫仍调库（写不出正确的 Triton conv/FFT），中止 |
+| 强化守卫（BANNED 清单+REJECTED 警告） | 005/020 重跑 | 成功消除 F.linear（全 Triton）：005 1.57→1.42x（-10%）、020 2.16→1.46x（-32%），**两题均已替代进主表**；002(conv2d)/007(rfft)/092(linear) LLM 无视守卫仍调库（写不出正确的 Triton conv/FFT），中止 |
 | 全量反馈（15wl 替代 5wl 抽样） | 020 从头 100 轮 | 2.16→2.20x（+2%），提升微弱 |
 | 全量反馈续跑 | 058 从主批 WM 续 5 轮 | **15/16 INVALID → 16/16 valid**：batch=1 抽样盲区 bug 5 轮修复——证明"不知道"≠"不会修" |
 
@@ -157,8 +163,8 @@ ksearch-a800/
 │   ├── results_table.md/.csv    ← §2 总表（脚本从原始 JSON 生成，勿手改）
 │   ├── ablations_table.md       ← 消融对照
 │   └── best_solutions/          ← 每 valid 题的最终解 .py（文件头注释含来源/指标/审计分类）
-│       ├── <题名>.py            ← 主批解（28 个；005 为消融替代版）
-│       └── <题名>@<批次>.py     ← 消融/对照代表解（5 个，含 005@formal_linear 调库版）
+│       ├── <题名>.py            ← 主批解（28 个；005/020 为消融替代版）
+│       └── <题名>@<批次>.py     ← 消融/对照代表解（6 个，含 005/020 的 @formal_linear 调库版）
 ├── tasks/<题名>/<批次名>/       ← 原始产物（按题目组织；同题多批次并存）
 │   ├── campaign_stdout.log      ← 完整搜索日志：WM 决策树状态 + 每轮反馈摘要（想看"模型被要求
 │   │                              做什么/判了什么"从这里追；FlashInfer 题的逐轮摘要也在此）
