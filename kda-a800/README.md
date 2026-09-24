@@ -95,3 +95,11 @@ experiment_manifest.json     题目清单（sha256 冻结）
    `scripts/reconcile_ledger.py` 维护；修复留痕在各题 control/reconciliation.jsonl。
 7. **评测 Python 环境绑定**：FlashInfer 用 ziming 用户的 conda env（mtmc）、SOL 用
    SOL-ExecBench 自带 venv——见 scripts/evaluate_candidate.py 顶部硬编码，换机需改。
+8. **评测错误信息不回传（L2-015 教训，3861 万 token 零产出的直接原因）**：SOL 评测器把
+   候选的 Python/Triton 异常笼统报成 `RUNTIME_ERROR`，per-workload 结果与 log 均不含
+   traceback，agent 无法看到错误内容。L2-015 的 14 个候选实际全部死于同一个
+   `NameError: Cannot access global variable HIDDEN from within @jit'ed function`
+   （Triton 要求全局常量用 `tl.constexpr(384)` 实例化），agent 只能盲二分排查。
+   **复现验证**：用评测器同款 venv + 官方 `get_inputs` 直接调用 c001/c005/c010/c014，
+   均在同一位置抛 CompilationError。修复建议：评测器把原始异常文本写入 per-workload
+   结果字段（几行改动），可杜绝整类盲二分烧钱。
