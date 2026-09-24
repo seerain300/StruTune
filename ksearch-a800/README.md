@@ -105,7 +105,8 @@ F.linear×2（1.57x）；全 Triton 消融解终评 16/16 valid、1.42x（-10%�
 
 **汇总**：valid 28/30（93%）；geomean 范围 0.84x~392.86x；全批 token 总消耗 ~54M
 （input 38.8M / cached 0.98M / output 15.3M / reasoning 4.4M，4,426 次调用）。
-机器可读版：`summary/results_table.csv`。
+机器可读版：`summary/results_table.csv`（全精度）；`summary/results_table_portable.csv`
+（搬运友好版：token 列均为 M 两位小数，speedup 三位小数）。
 
 ### 2.1 torch 回退审计（人工逐行读 run() 源码裁定）
 
